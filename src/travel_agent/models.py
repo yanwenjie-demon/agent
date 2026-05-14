@@ -137,6 +137,25 @@ class NotificationRecord:
     last_error: str | None = None
 
 
+@dataclass(frozen=True)
+class DeadLetterNotification:
+    session_id: str
+    state: str
+    notification: NotificationRecord
+
+
+@dataclass(frozen=True)
+class WorkerRunRecord:
+    run_id: str
+    started_at: str
+    finished_at: str
+    scanned: int
+    advanced: int
+    skipped: int
+    errors: dict[str, str]
+    session_ids: list[str]
+
+
 @dataclass
 class TravelContext:
     session_id: str

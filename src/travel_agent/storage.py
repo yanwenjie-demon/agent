@@ -11,6 +11,7 @@ from typing import Any, Protocol
 from .models import (
     ApprovalRecord,
     CompensationResult,
+    DeadLetterNotification,
     HotelOption,
     InventoryLock,
     ItineraryPlan,
@@ -22,6 +23,7 @@ from .models import (
     TravelContext,
     TravelOrder,
     TravelRequest,
+    WorkerRunRecord,
 )
 
 
@@ -35,10 +37,20 @@ class SessionStore(Protocol):
     def list_by_states(self, states: set[str], limit: int = 50) -> list[TravelContext]:
         ...
 
+    def record_worker_run(self, record: WorkerRunRecord) -> None:
+        ...
+
+    def list_worker_runs(self, limit: int = 20) -> list[WorkerRunRecord]:
+        ...
+
+    def list_dead_letter_notifications(self, limit: int = 50) -> list[DeadLetterNotification]:
+        ...
+
 
 class InMemorySessionStore:
     def __init__(self) -> None:
         self._sessions: dict[str, TravelContext] = {}
+        self._worker_runs: list[WorkerRunRecord] = []
 
     def save(self, context: TravelContext) -> None:
         self._sessions[context.session_id] = context
@@ -49,6 +61,20 @@ class InMemorySessionStore:
     def list_by_states(self, states: set[str], limit: int = 50) -> list[TravelContext]:
         matches = [context for context in self._sessions.values() if context.state in states]
         return matches[:limit]
+
+    def record_worker_run(self, record: WorkerRunRecord) -> None:
+        self._worker_runs.append(record)
+
+    def list_worker_runs(self, limit: int = 20) -> list[WorkerRunRecord]:
+        return list(reversed(self._worker_runs[-limit:]))
+
+    def list_dead_letter_notifications(self, limit: int = 50) -> list[DeadLetterNotification]:
+        records: list[DeadLetterNotification] = []
+        for context in self._sessions.values():
+            records.extend(_dead_letters_from_context(context))
+            if len(records) >= limit:
+                return records[:limit]
+        return records
 
 
 class SQLiteSessionStore:
@@ -97,6 +123,85 @@ class SQLiteSessionStore:
             rows = connection.execute(query, (*sorted(states), limit)).fetchall()
         return [context_from_dict(json.loads(row[0])) for row in rows]
 
+    def record_worker_run(self, record: WorkerRunRecord) -> None:
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            connection.execute(
+                """
+                INSERT INTO worker_runs(
+                    run_id,
+                    started_at,
+                    finished_at,
+                    scanned,
+                    advanced,
+                    skipped,
+                    errors,
+                    session_ids
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(run_id) DO UPDATE SET
+                    started_at = excluded.started_at,
+                    finished_at = excluded.finished_at,
+                    scanned = excluded.scanned,
+                    advanced = excluded.advanced,
+                    skipped = excluded.skipped,
+                    errors = excluded.errors,
+                    session_ids = excluded.session_ids
+                """,
+                (
+                    record.run_id,
+                    record.started_at,
+                    record.finished_at,
+                    record.scanned,
+                    record.advanced,
+                    record.skipped,
+                    json.dumps(record.errors, ensure_ascii=False),
+                    json.dumps(record.session_ids, ensure_ascii=False),
+                ),
+            )
+            connection.commit()
+
+    def list_worker_runs(self, limit: int = 20) -> list[WorkerRunRecord]:
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            rows = connection.execute(
+                """
+                SELECT run_id, started_at, finished_at, scanned, advanced, skipped, errors, session_ids
+                FROM worker_runs
+                ORDER BY finished_at DESC, started_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [
+            WorkerRunRecord(
+                run_id=row[0],
+                started_at=row[1],
+                finished_at=row[2],
+                scanned=int(row[3]),
+                advanced=int(row[4]),
+                skipped=int(row[5]),
+                errors=json.loads(row[6]),
+                session_ids=json.loads(row[7]),
+            )
+            for row in rows
+        ]
+
+    def list_dead_letter_notifications(self, limit: int = 50) -> list[DeadLetterNotification]:
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            rows = connection.execute(
+                """
+                SELECT payload
+                FROM travel_sessions
+                ORDER BY updated_at DESC
+                """
+            ).fetchall()
+
+        records: list[DeadLetterNotification] = []
+        for row in rows:
+            records.extend(_dead_letters_from_context(context_from_dict(json.loads(row[0]))))
+            if len(records) >= limit:
+                return records[:limit]
+        return records
+
     def _init_schema(self) -> None:
         with closing(sqlite3.connect(self.db_path)) as connection:
             connection.execute(
@@ -106,6 +211,20 @@ class SQLiteSessionStore:
                     state TEXT NOT NULL,
                     payload TEXT NOT NULL,
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS worker_runs (
+                    run_id TEXT PRIMARY KEY,
+                    started_at TEXT NOT NULL,
+                    finished_at TEXT NOT NULL,
+                    scanned INTEGER NOT NULL,
+                    advanced INTEGER NOT NULL,
+                    skipped INTEGER NOT NULL,
+                    errors TEXT NOT NULL,
+                    session_ids TEXT NOT NULL
                 )
                 """
             )
@@ -186,3 +305,15 @@ def _json_default(value: Any) -> str:
     if isinstance(value, date):
         return value.isoformat()
     raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable.")
+
+
+def _dead_letters_from_context(context: TravelContext) -> list[DeadLetterNotification]:
+    return [
+        DeadLetterNotification(
+            session_id=context.session_id,
+            state=context.state,
+            notification=notification,
+        )
+        for notification in context.notifications
+        if notification.status == "DEAD_LETTER"
+    ]
