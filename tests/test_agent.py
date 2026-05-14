@@ -11,9 +11,10 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from travel_agent.agent import build_default_agent
+from travel_agent.cli import render_dead_letters, render_metrics, render_worker_runs
 from travel_agent.config import IntegrationSettings
 from travel_agent.integrations import IntegrationError
-from travel_agent.models import TravelRequest
+from travel_agent.models import DeadLetterNotification, NotificationRecord, TravelRequest, WorkerRunRecord
 from travel_agent.state import TravelState
 from travel_agent.storage import InMemorySessionStore, SQLiteSessionStore
 from travel_agent.tools import ToolGateway, ToolValidationError
@@ -547,6 +548,47 @@ class SessionStoreTest(unittest.TestCase):
             self.assertEqual([context.session_id for context in approval_sessions], [approval_context.session_id])
             self.assertNotEqual(approval_sessions[0].session_id, completed_context.session_id)
 
+    def test_sqlite_session_store_records_worker_runs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "sessions.sqlite3"
+            store = SQLiteSessionStore(db_path)
+            agent = build_default_agent(session_store=store)
+            context = agent.run_to_order(_request())
+
+            result = WorkflowWorker(agent).run_once()
+            runs = SQLiteSessionStore(db_path).list_worker_runs()
+
+            self.assertEqual(len(runs), 1)
+            self.assertEqual(runs[0].run_id, result.run_id)
+            self.assertEqual(runs[0].scanned, 1)
+            self.assertIn(context.session_id, runs[0].session_ids)
+
+    def test_sqlite_session_store_lists_dead_letter_notifications(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "sessions.sqlite3"
+            store = SQLiteSessionStore(db_path)
+            settings = IntegrationSettings(
+                notification_api_url="https://notify.example/send",
+                notification_use_mock_fallback=False,
+            )
+            agent = build_default_agent(
+                settings=settings,
+                http_client=NotificationFailingHttpClient(),
+                session_store=store,
+            )
+            context = agent.run_to_order(_request())
+
+            worker = WorkflowWorker(agent)
+            worker.run_once()
+            worker.run_once()
+            worker.run_once()
+            dead_letters = SQLiteSessionStore(db_path).list_dead_letter_notifications()
+
+            self.assertEqual(len(dead_letters), 1)
+            self.assertEqual(dead_letters[0].session_id, context.session_id)
+            self.assertEqual(dead_letters[0].notification.event_type, "ORDER_COMPLETED")
+            self.assertEqual(dead_letters[0].notification.status, "DEAD_LETTER")
+
 
 class WorkflowWorkerTest(unittest.TestCase):
     def test_worker_advances_pending_approval_to_completed_order(self) -> None:
@@ -561,6 +603,19 @@ class WorkflowWorkerTest(unittest.TestCase):
         self.assertEqual(result.advanced, 1)
         self.assertEqual(updated.state, TravelState.COMPLETED.value)
         self.assertIsNotNone(updated.order)
+
+    def test_worker_records_run_summary_in_memory_store(self) -> None:
+        store = InMemorySessionStore()
+        agent = build_default_agent(session_store=store)
+        agent.run_to_order(_request())
+
+        result = WorkflowWorker(agent).run_once()
+        runs = store.list_worker_runs()
+
+        self.assertEqual(len(runs), 1)
+        self.assertEqual(runs[0].run_id, result.run_id)
+        self.assertEqual(runs[0].scanned, result.scanned)
+        self.assertEqual(runs[0].advanced, result.advanced)
 
     def test_worker_refreshes_completed_order_status(self) -> None:
         store = InMemorySessionStore()
@@ -650,6 +705,30 @@ class WorkflowWorkerTest(unittest.TestCase):
         self.assertEqual(updated.notifications[0].status, "DEAD_LETTER")
         self.assertEqual(updated.notifications[0].retry_count, 3)
 
+    def test_replay_dead_letter_notification_sends_again(self) -> None:
+        store = InMemorySessionStore()
+        settings = IntegrationSettings(
+            notification_api_url="https://notify.example/send",
+            notification_use_mock_fallback=False,
+        )
+        agent = build_default_agent(
+            settings=settings,
+            http_client=FlakyNotificationHttpClient(failures=3),
+            session_store=store,
+        )
+        context = agent.run_to_order(_request())
+
+        worker = WorkflowWorker(agent)
+        worker.run_once()
+        worker.run_once()
+        worker.run_once()
+        dead_letter_context = store.get(context.session_id)
+        replayed = agent.replay_dead_letter_notification(dead_letter_context, "ORDER_COMPLETED")
+
+        self.assertEqual(replayed.notifications[0].status, "SENT")
+        self.assertEqual(replayed.notifications[0].retry_count, 0)
+        self.assertIn(f"{context.session_id}:ORDER_COMPLETED", replayed.notification_keys)
+
     def test_worker_loop_aggregates_iterations(self) -> None:
         store = InMemorySessionStore()
         agent = build_default_agent(session_store=store)
@@ -660,6 +739,41 @@ class WorkflowWorkerTest(unittest.TestCase):
         self.assertEqual(result.iterations, 2)
         self.assertGreaterEqual(result.scanned, 1)
         self.assertGreaterEqual(result.advanced, 1)
+
+
+class CliRenderTest(unittest.TestCase):
+    def test_renders_worker_runs_dead_letters_and_metrics(self) -> None:
+        worker_run = WorkerRunRecord(
+            run_id="WRK-1",
+            started_at="2026-05-14T00:00:00+00:00",
+            finished_at="2026-05-14T00:00:01+00:00",
+            scanned=2,
+            advanced=1,
+            skipped=1,
+            errors={},
+            session_ids=["S-1"],
+        )
+        dead_letter = DeadLetterNotification(
+            session_id="S-1",
+            state=TravelState.COMPLETED.value,
+            notification=NotificationRecord(
+                notification_id="NTF-1",
+                event_type="ORDER_COMPLETED",
+                channel="im",
+                recipient_id="u-demo",
+                title="title",
+                message="message",
+                status="DEAD_LETTER",
+                payload={},
+                retry_count=3,
+                max_retries=3,
+                last_error="unavailable",
+            ),
+        )
+
+        self.assertIn("WRK-1", render_worker_runs([worker_run]))
+        self.assertIn("ORDER_COMPLETED", render_dead_letters([dead_letter]))
+        self.assertIn("- dead_letters: 1", render_metrics([worker_run], [dead_letter]))
 
 
 def _request(budget_per_night: int = 650) -> TravelRequest:
@@ -696,6 +810,31 @@ class NotificationFailingHttpClient:
         del payload, token
         if url == "https://notify.example/send":
             raise IntegrationError(f"{url} is unavailable")
+        return {}
+
+
+class FlakyNotificationHttpClient:
+    def __init__(self, failures: int) -> None:
+        self.failures = failures
+        self.calls = 0
+
+    def post_json(self, url: str, payload: dict[str, Any], token: str | None = None) -> dict[str, Any]:
+        del token
+        if url == "https://notify.example/send":
+            self.calls += 1
+            if self.calls <= self.failures:
+                raise IntegrationError(f"{url} is unavailable")
+            return {
+                "notification": {
+                    "notification_id": "REMOTE-NOTIFY-REPLAY",
+                    "event_type": payload["event_type"],
+                    "channel": payload["channel"],
+                    "recipient_id": payload["user_id"],
+                    "title": payload["title"],
+                    "message": payload["message"],
+                    "status": "SENT",
+                }
+            }
         return {}
 
 

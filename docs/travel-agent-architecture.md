@@ -27,6 +27,7 @@ Agent Runtime
   ├─ Tool Gateway：工具路由、鉴权、审计、幂等
   ├─ Workflow Engine：状态机与复杂流程编排
   ├─ Workflow Worker：扫描持久化会话并推进可自动执行的状态
+  ├─ Observability Store：记录 worker 执行摘要、死信通知和基础运行指标
   ├─ Memory：会话、用户偏好、任务状态
   └─ Guardrails：权限、风控、合规、敏感信息保护
       ↓
@@ -105,6 +106,8 @@ Order Tool 创建订单
 - `WorkflowWorker` 可扫描持久化会话并自动推进审批状态和订单状态。
 - 关键状态可触发通知/待办回调，并通过 `notification_keys` 幂等去重。
 - 通知失败不会阻断主流程，会记录失败、重试次数和死信状态。
+- worker 每轮执行会落库运行摘要，支持后续排查扫描数、推进数、跳过数和错误会话。
+- 达到重试上限的通知可查询并人工重放，重放失败后会重新进入可重试队列。
 
 第一阶段暂不包含：
 
@@ -252,6 +255,14 @@ USER_CANCELLED：用户取消，补偿动作已尽量执行
 - `DEAD_LETTER`：达到最大重试次数后停止自动重试，等待人工或运维重放。
 - 通知失败不会回滚审批、库存、订单等主流程状态。
 
+观测与运维：
+
+- 每次 worker `run_once` 生成 `WorkerRunRecord`，记录 `run_id`、起止时间、扫描数、推进数、跳过数、错误和涉及会话。
+- SQLite 存储会创建 `worker_runs` 表；生产环境可替换为数据库表、日志平台或工作流引擎历史表。
+- `list_dead_letter_notifications` 从持久化会话里查询 `DEAD_LETTER` 通知，保留会话状态和原通知内容。
+- `replay_dead_letter_notification` 使用原事件类型、标题、消息和通知渠道重新调用通知工具；成功后写入去重键，失败后回到 `FAILED` 状态继续由 worker 重试。
+- CLI 暴露 worker 历史、死信列表、死信重放和基础指标摘要，便于在真实监控系统接入前做运维验证。
+
 ## 8. 第一阶段开发落地
 
 当前仓库的阶段性实现：
@@ -296,6 +307,16 @@ python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --run-work
 ```powershell
 $env:PYTHONPATH = "src"
 python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --run-worker-once --worker-iterations 10 --worker-interval 5
+```
+
+查看运行历史、通知死信并重放：
+
+```powershell
+$env:PYTHONPATH = "src"
+python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --list-worker-runs
+python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --list-dead-letters
+python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --replay-dead-letter-session "<session-id>" --replay-dead-letter-event "ORDER_COMPLETED"
+python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --metrics
 ```
 
 测试方式：

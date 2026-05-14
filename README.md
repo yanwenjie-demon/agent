@@ -17,6 +17,7 @@
 - 异步 worker：扫描持久化会话，自动推进审批和订单状态
 - 通知/待办回调：关键成功、失败、待确认状态自动发送通知，支持真实 HTTP 系统和 Mock fallback
 - 通知重试/死信：通知失败不会阻断主流程，超过重试上限后进入 `DEAD_LETTER`
+- 生产化观测：worker 运行摘要落库、死信查询/重放、基础指标输出
 - SQLite 会话持久化，可从 session 恢复流程
 - 内存会话状态和确定性工作流状态机
 
@@ -98,6 +99,34 @@ worker 会自动处理：
 
 worker 不会自动接受价格变化；`PRICE_CHANGED` 必须由用户或策略显式确认。
 
+查看最近 worker 运行历史：
+
+```powershell
+$env:PYTHONPATH = "src"
+python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --list-worker-runs
+```
+
+查看通知死信：
+
+```powershell
+$env:PYTHONPATH = "src"
+python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --list-dead-letters
+```
+
+重放指定通知死信：
+
+```powershell
+$env:PYTHONPATH = "src"
+python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --replay-dead-letter-session "<session-id>" --replay-dead-letter-event "ORDER_COMPLETED"
+```
+
+输出基础运行指标：
+
+```powershell
+$env:PYTHONPATH = "src"
+python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --metrics
+```
+
 通知会在以下状态触发，并通过 `notification_keys` 去重：
 
 - `COMPLETED`：订单已创建
@@ -167,5 +196,6 @@ python -m unittest discover -s tests
 ## 下一阶段建议
 
 - 将 SQLite 会话存储替换为生产数据库或工作流引擎
-- 增加审批撤回、通知死信查询/重放、运行指标导出等生产化能力
+- 增加审批撤回、改签/退订、重新选酒店等异常恢复工作流
+- 将 CLI 指标升级为 Prometheus/OpenTelemetry 指标出口
 - 增加评测集，覆盖工具调用准确率、政策合规率、流程成功率

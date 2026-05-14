@@ -384,6 +384,34 @@ class TravelAgent:
     def get_session(self, session_id: str) -> TravelContext:
         return self.session_store.get(session_id)
 
+    def replay_dead_letter_notification(self, context: TravelContext, event_type: str) -> TravelContext:
+        existing = self._find_notification(context, event_type)
+        if existing is None:
+            raise ValueError(f"No notification found for event type: {event_type}")
+        if existing.status != "DEAD_LETTER":
+            raise ValueError(f"Notification {event_type} is not DEAD_LETTER: {existing.status}")
+
+        reset = replace(existing, status="FAILED", retry_count=0, last_error=None)
+        record = self._send_or_record_notification(
+            context=context,
+            event_type=event_type,
+            title=existing.title,
+            message=existing.message,
+            channel=existing.channel,
+            existing=reset,
+        )
+        self._upsert_notification(context, record)
+
+        dedupe_key = f"{context.session_id}:{event_type}"
+        if record.status in {"SENT", "DELIVERED", "DONE"} and dedupe_key not in context.notification_keys:
+            context.notification_keys.append(dedupe_key)
+        elif record.status not in {"SENT", "DELIVERED", "DONE"} and dedupe_key in context.notification_keys:
+            context.notification_keys.remove(dedupe_key)
+
+        context.append_event(f"Dead-letter replay {event_type} -> {record.status}.")
+        self.session_store.save(context)
+        return context
+
     def cancel_trip(self, context: TravelContext, reason: str = "user_cancelled") -> TravelContext:
         if context.order is not None and not self._compensation_done(context.order_cancellation):
             cancellation = self.gateway.call(

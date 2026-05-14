@@ -5,7 +5,7 @@ from datetime import date
 
 from .agent import build_default_agent
 from .config import IntegrationSettings
-from .models import TravelContext, TravelRequest
+from .models import DeadLetterNotification, TravelContext, TravelRequest, WorkerRunRecord
 from .worker import WorkflowLoopResult, WorkflowRunResult, WorkflowWorker
 
 
@@ -98,6 +98,37 @@ def parse_args() -> argparse.Namespace:
         default=0.0,
         help="Seconds to sleep between worker iterations.",
     )
+    parser.add_argument(
+        "--list-worker-runs",
+        action="store_true",
+        help="List recent worker run summaries from the session store.",
+    )
+    parser.add_argument(
+        "--list-dead-letters",
+        action="store_true",
+        help="List notification dead letters from persisted sessions.",
+    )
+    parser.add_argument(
+        "--replay-dead-letter-session",
+        default=None,
+        help="Session id whose notification dead letter should be replayed.",
+    )
+    parser.add_argument(
+        "--replay-dead-letter-event",
+        default=None,
+        help="Notification event type to replay for --replay-dead-letter-session.",
+    )
+    parser.add_argument(
+        "--observability-limit",
+        type=int,
+        default=20,
+        help="Maximum worker runs or dead letters to list.",
+    )
+    parser.add_argument(
+        "--metrics",
+        action="store_true",
+        help="Print a compact metrics summary from worker runs and dead letters.",
+    )
     return parser.parse_args()
 
 
@@ -108,9 +139,33 @@ def main() -> None:
         settings = _replace_session_db(settings, args.session_db)
 
     agent = build_default_agent(settings=settings)
+    if args.list_worker_runs:
+        _require_session_db(settings, "--list-worker-runs")
+        print(render_worker_runs(agent.session_store.list_worker_runs(args.observability_limit)))
+        return
+    if args.list_dead_letters:
+        _require_session_db(settings, "--list-dead-letters")
+        print(render_dead_letters(agent.session_store.list_dead_letter_notifications(args.observability_limit)))
+        return
+    if args.metrics:
+        _require_session_db(settings, "--metrics")
+        print(
+            render_metrics(
+                worker_runs=agent.session_store.list_worker_runs(args.observability_limit),
+                dead_letters=agent.session_store.list_dead_letter_notifications(args.observability_limit),
+            )
+        )
+        return
+    if args.replay_dead_letter_session or args.replay_dead_letter_event:
+        _require_session_db(settings, "--replay-dead-letter-session")
+        if not args.replay_dead_letter_session or not args.replay_dead_letter_event:
+            raise SystemExit("--replay-dead-letter-session requires --replay-dead-letter-event.")
+        context = agent.get_session(args.replay_dead_letter_session)
+        context = agent.replay_dead_letter_notification(context, args.replay_dead_letter_event)
+        print(render_context(context))
+        return
     if args.run_worker_once:
-        if not settings.session_db_path:
-            raise SystemExit("--run-worker-once requires --session-db or TRAVEL_SESSION_DB_PATH.")
+        _require_session_db(settings, "--run-worker-once")
         if args.worker_iterations <= 1:
             result = WorkflowWorker(agent).run_once(limit=args.worker_limit)
             print(render_worker_result(result))
@@ -172,11 +227,14 @@ def main() -> None:
 def render_worker_result(result: WorkflowRunResult) -> str:
     lines = [
         "Worker result:",
+        f"- run_id: {result.run_id or '-'}",
         f"- scanned: {result.scanned}",
         f"- advanced: {result.advanced}",
         f"- skipped: {result.skipped}",
         f"- errors: {len(result.errors)}",
     ]
+    if result.started_at and result.finished_at:
+        lines.append(f"- window: {result.started_at} -> {result.finished_at}")
     if result.session_ids:
         lines.append("- sessions: " + ", ".join(result.session_ids))
     for session_id, error in result.errors.items():
@@ -193,8 +251,59 @@ def render_worker_loop_result(result: WorkflowLoopResult) -> str:
         f"- skipped: {result.skipped}",
         f"- errors: {len(result.errors)}",
     ]
+    if result.run_ids:
+        lines.append("- run_ids: " + ", ".join(result.run_ids))
     for session_id, error in result.errors.items():
         lines.append(f"- error {session_id}: {error}")
+    return "\n".join(lines)
+
+
+def render_worker_runs(records: list[WorkerRunRecord]) -> str:
+    lines = ["Worker runs:"]
+    if not records:
+        lines.append("- none")
+        return "\n".join(lines)
+    for record in records:
+        lines.append(
+            f"- {record.run_id} | {record.finished_at} | scanned={record.scanned} "
+            f"advanced={record.advanced} skipped={record.skipped} errors={len(record.errors)}"
+        )
+        if record.session_ids:
+            lines.append("  sessions: " + ", ".join(record.session_ids))
+    return "\n".join(lines)
+
+
+def render_dead_letters(records: list[DeadLetterNotification]) -> str:
+    lines = ["Notification dead letters:"]
+    if not records:
+        lines.append("- none")
+        return "\n".join(lines)
+    for record in records:
+        notification = record.notification
+        lines.append(
+            f"- session={record.session_id} state={record.state} event={notification.event_type} "
+            f"retry={notification.retry_count}/{notification.max_retries} error={notification.last_error or '-'}"
+        )
+    return "\n".join(lines)
+
+
+def render_metrics(
+    worker_runs: list[WorkerRunRecord],
+    dead_letters: list[DeadLetterNotification],
+) -> str:
+    scanned = sum(record.scanned for record in worker_runs)
+    advanced = sum(record.advanced for record in worker_runs)
+    skipped = sum(record.skipped for record in worker_runs)
+    errors = sum(len(record.errors) for record in worker_runs)
+    lines = [
+        "Metrics:",
+        f"- worker_runs: {len(worker_runs)}",
+        f"- scanned: {scanned}",
+        f"- advanced: {advanced}",
+        f"- skipped: {skipped}",
+        f"- worker_errors: {errors}",
+        f"- dead_letters: {len(dead_letters)}",
+    ]
     return "\n".join(lines)
 
 
@@ -221,6 +330,11 @@ def _replace_session_db(settings: IntegrationSettings, session_db_path: str) -> 
         timeout_seconds=settings.timeout_seconds,
         session_db_path=session_db_path,
     )
+
+
+def _require_session_db(settings: IntegrationSettings, command_name: str) -> None:
+    if not settings.session_db_path:
+        raise SystemExit(f"{command_name} requires --session-db or TRAVEL_SESSION_DB_PATH.")
 
 
 def _validate_required_trip_args(args: argparse.Namespace) -> None:
