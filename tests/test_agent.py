@@ -1,0 +1,784 @@
+from __future__ import annotations
+
+import sys
+import tempfile
+import unittest
+from datetime import date
+from pathlib import Path
+from typing import Any
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+
+from travel_agent.agent import build_default_agent
+from travel_agent.config import IntegrationSettings
+from travel_agent.integrations import IntegrationError
+from travel_agent.models import TravelRequest
+from travel_agent.state import TravelState
+from travel_agent.storage import InMemorySessionStore, SQLiteSessionStore
+from travel_agent.tools import ToolGateway, ToolValidationError
+from travel_agent.worker import WorkflowWorker
+
+
+class TravelAgentFlowTest(unittest.TestCase):
+    def test_plan_stops_before_confirmation(self) -> None:
+        agent = build_default_agent()
+        context = agent.plan(_request())
+
+        self.assertEqual(context.state, TravelState.PLAN_GENERATED.value)
+        self.assertIsNotNone(context.policy_result)
+        self.assertIsNotNone(context.itinerary)
+        self.assertGreater(len(context.hotel_options), 0)
+        self.assertIsNone(context.approval)
+
+    def test_run_to_approval_creates_draft(self) -> None:
+        agent = build_default_agent()
+        context = agent.run_to_approval(_request())
+
+        self.assertEqual(context.state, TravelState.APPROVAL_CREATED.value)
+        self.assertIsNotNone(context.selected_hotel)
+        self.assertIsNotNone(context.approval)
+        self.assertEqual(context.approval.status, "PENDING_APPROVAL")
+        self.assertTrue(context.approval.approval_id.startswith("APP-"))
+
+    def test_run_to_order_completes_mock_flow(self) -> None:
+        agent = build_default_agent()
+        context = agent.run_to_order(_request())
+
+        self.assertEqual(context.state, TravelState.COMPLETED.value)
+        self.assertEqual(context.approval.status, "APPROVED")
+        self.assertIsNotNone(context.inventory_lock)
+        self.assertIsNotNone(context.order)
+        self.assertEqual(context.inventory_lock.status, "LOCKED")
+        self.assertEqual(context.order.status, "CREATED")
+        self.assertEqual(context.order.total_amount, 1240)
+
+    def test_refresh_order_status_updates_order(self) -> None:
+        agent = build_default_agent()
+        context = agent.run_to_order(_request())
+        context = agent.refresh_order_status(context)
+
+        self.assertEqual(context.order.status, "CONFIRMED")
+        self.assertEqual(context.order.total_amount, 1240)
+
+    def test_cancel_trip_compensates_order_and_inventory(self) -> None:
+        agent = build_default_agent()
+        context = agent.run_to_order(_request())
+        context = agent.cancel_trip(context, "meeting_cancelled")
+
+        self.assertEqual(context.state, TravelState.USER_CANCELLED.value)
+        self.assertIsNotNone(context.order_cancellation)
+        self.assertIsNotNone(context.inventory_release)
+        self.assertEqual(context.order_cancellation.status, "CANCELLED")
+        self.assertEqual(context.inventory_release.status, "RELEASED")
+
+    def test_notify_current_state_is_idempotent(self) -> None:
+        agent = build_default_agent()
+        context = agent.run_to_order(_request())
+
+        context = agent.notify_current_state(context)
+        context = agent.notify_current_state(context)
+
+        self.assertEqual(len(context.notifications), 1)
+        self.assertEqual(context.notifications[0].event_type, "ORDER_COMPLETED")
+
+    def test_policy_caps_hotel_budget(self) -> None:
+        agent = build_default_agent()
+        request = _request(budget_per_night=900)
+        context = agent.plan(request)
+
+        self.assertFalse(context.policy_result.compliant)
+        self.assertEqual(context.policy_result.approved_budget, 650)
+        self.assertTrue(all(hotel.nightly_price <= 650 for hotel in context.hotel_options if hotel.policy_compliant))
+
+
+class IntegrationAdapterTest(unittest.TestCase):
+    def test_uses_real_http_integrations_when_urls_are_configured(self) -> None:
+        http = StubHttpClient(
+            {
+                "https://policy.example/check": {
+                    "policy": {
+                        "policy_id": "REMOTE-POLICY-1",
+                        "max_hotel_price": 700,
+                        "approved_budget": 680,
+                        "compliant": True,
+                        "reasons": ["remote policy ok"],
+                    }
+                },
+                "https://hotel.example/search": {
+                    "hotels": [
+                        {
+                            "hotel_id": "REMOTE-HOTEL-1",
+                            "name": "Remote Hotel",
+                            "city": "上海",
+                            "address": "Remote Road",
+                            "nightly_price": 660,
+                            "distance_km": 0.6,
+                            "rating": 4.9,
+                            "refundable": True,
+                        }
+                    ]
+                },
+                "https://oa.example/create": {
+                    "approval": {
+                        "approval_id": "REMOTE-APPROVAL-1",
+                        "status": "PENDING_APPROVAL",
+                    }
+                },
+            }
+        )
+        settings = IntegrationSettings(
+            policy_api_url="https://policy.example/check",
+            hotel_inventory_api_url="https://hotel.example/search",
+            oa_approval_api_url="https://oa.example/create",
+        )
+
+        context = build_default_agent(settings=settings, http_client=http).run_to_approval(_request())
+
+        self.assertEqual(context.policy_result.source, "real")
+        self.assertEqual(context.hotel_options[0].source, "real")
+        self.assertEqual(context.approval.source, "real")
+        self.assertEqual(context.approval.approval_id, "REMOTE-APPROVAL-1")
+
+    def test_uses_real_http_integrations_for_order_creation(self) -> None:
+        http = StubHttpClient(
+            {
+                "https://policy.example/check": {
+                    "policy": {
+                        "policy_id": "REMOTE-POLICY-1",
+                        "max_hotel_price": 700,
+                        "approved_budget": 680,
+                        "compliant": True,
+                    }
+                },
+                "https://hotel.example/search": {
+                    "hotels": [
+                        {
+                            "hotel_id": "REMOTE-HOTEL-1",
+                            "name": "Remote Hotel",
+                            "city": "上海",
+                            "address": "Remote Road",
+                            "nightly_price": 660,
+                            "distance_km": 0.6,
+                            "rating": 4.9,
+                            "refundable": True,
+                        }
+                    ]
+                },
+                "https://oa.example/create": {
+                    "approval": {
+                        "approval_id": "REMOTE-APPROVAL-1",
+                        "status": "PENDING_APPROVAL",
+                    }
+                },
+                "https://oa.example/status": {
+                    "approval": {
+                        "approval_id": "REMOTE-APPROVAL-1",
+                        "status": "APPROVED",
+                    }
+                },
+                "https://hotel.example/lock": {
+                    "inventory_lock": {
+                        "lock_id": "REMOTE-LOCK-1",
+                        "status": "LOCKED",
+                        "hotel_id": "REMOTE-HOTEL-1",
+                        "expires_at": "2026-06-03T10:00:00Z",
+                    }
+                },
+                "https://order.example/create": {
+                    "order": {
+                        "order_id": "REMOTE-ORDER-1",
+                        "status": "CREATED",
+                        "total_amount": 1320,
+                        "currency": "CNY",
+                    }
+                },
+            }
+        )
+        settings = IntegrationSettings(
+            policy_api_url="https://policy.example/check",
+            hotel_inventory_api_url="https://hotel.example/search",
+            oa_approval_api_url="https://oa.example/create",
+            oa_approval_status_api_url="https://oa.example/status",
+            hotel_inventory_lock_api_url="https://hotel.example/lock",
+            order_api_url="https://order.example/create",
+        )
+
+        context = build_default_agent(settings=settings, http_client=http).run_to_order(_request())
+
+        self.assertEqual(context.state, TravelState.COMPLETED.value)
+        self.assertEqual(context.approval.source, "real")
+        self.assertEqual(context.inventory_lock.source, "real")
+        self.assertEqual(context.order.source, "real")
+        self.assertEqual(context.order.order_id, "REMOTE-ORDER-1")
+
+    def test_price_change_pauses_until_user_confirmation(self) -> None:
+        http = StubHttpClient(
+            _remote_order_responses(
+                price_check={
+                    "price_check": {
+                        "hotel_id": "REMOTE-HOTEL-1",
+                        "status": "PRICE_CHANGED",
+                        "original_price": 660,
+                        "current_price": 680,
+                        "policy_compliant": True,
+                        "requires_confirmation": True,
+                    }
+                }
+            )
+        )
+        settings = _remote_order_settings()
+
+        agent = build_default_agent(settings=settings, http_client=http)
+        context = agent.run_to_order(_request())
+
+        self.assertEqual(context.state, TravelState.PRICE_CHANGED.value)
+        self.assertIsNotNone(context.price_check)
+        self.assertIsNone(context.order)
+
+        context = agent.confirm_price_change(context, accept=True)
+
+        self.assertEqual(context.state, TravelState.COMPLETED.value)
+        self.assertEqual(context.selected_hotel.nightly_price, 680)
+        self.assertEqual(context.order.payload["selected_hotel"]["nightly_price"], 680)
+
+    def test_reject_price_change_releases_inventory(self) -> None:
+        http = StubHttpClient(
+            _remote_order_responses(
+                price_check={
+                    "price_check": {
+                        "hotel_id": "REMOTE-HOTEL-1",
+                        "status": "PRICE_CHANGED",
+                        "original_price": 660,
+                        "current_price": 680,
+                        "policy_compliant": True,
+                        "requires_confirmation": True,
+                    }
+                }
+            )
+            | {
+                "https://hotel.example/release": {
+                    "compensation": {
+                        "action": "release_hotel_inventory",
+                        "target_id": "REMOTE-LOCK-1",
+                        "status": "RELEASED",
+                    }
+                }
+            }
+        )
+        settings = _remote_order_settings(hotel_inventory_release_api_url="https://hotel.example/release")
+
+        agent = build_default_agent(settings=settings, http_client=http)
+        context = agent.run_to_order(_request())
+        context = agent.confirm_price_change(context, accept=False)
+
+        self.assertEqual(context.state, TravelState.USER_CANCELLED.value)
+        self.assertIsNone(context.order)
+        self.assertEqual(context.inventory_release.status, "RELEASED")
+
+    def test_inventory_expired_stops_before_order_creation(self) -> None:
+        http = StubHttpClient(
+            _remote_order_responses(
+                price_check={
+                    "price_check": {
+                        "hotel_id": "REMOTE-HOTEL-1",
+                        "status": "SOLD_OUT",
+                        "original_price": 660,
+                        "current_price": None,
+                        "policy_compliant": False,
+                        "requires_confirmation": False,
+                    }
+                }
+            )
+        )
+        settings = _remote_order_settings()
+
+        context = build_default_agent(settings=settings, http_client=http).run_to_order(_request())
+
+        self.assertEqual(context.state, TravelState.INVENTORY_EXPIRED.value)
+        self.assertIsNotNone(context.inventory_lock)
+        self.assertIsNone(context.order)
+
+    def test_refreshes_real_order_status(self) -> None:
+        http = StubHttpClient(
+            _remote_order_responses()
+            | {
+                "https://order.example/status": {
+                    "order": {
+                        "order_id": "REMOTE-ORDER-1",
+                        "status": "CONFIRMED",
+                        "total_amount": 1320,
+                        "currency": "CNY",
+                    }
+                }
+            }
+        )
+        settings = _remote_order_settings(order_status_api_url="https://order.example/status")
+
+        agent = build_default_agent(settings=settings, http_client=http)
+        context = agent.run_to_order(_request())
+        context = agent.refresh_order_status(context)
+
+        self.assertEqual(context.order.status, "CONFIRMED")
+        self.assertEqual(context.order.source, "real")
+
+    def test_uses_real_http_integration_for_notifications(self) -> None:
+        http = StubHttpClient(
+            _remote_order_responses()
+            | {
+                "https://notify.example/send": {
+                    "notification": {
+                        "notification_id": "REMOTE-NOTIFY-1",
+                        "event_type": "ORDER_COMPLETED",
+                        "channel": "im",
+                        "recipient_id": "u-demo",
+                        "title": "remote title",
+                        "message": "remote message",
+                        "status": "SENT",
+                    }
+                }
+            }
+        )
+        settings = _remote_order_settings(notification_api_url="https://notify.example/send")
+        agent = build_default_agent(settings=settings, http_client=http)
+
+        context = agent.notify_current_state(agent.run_to_order(_request()))
+
+        self.assertEqual(context.notifications[0].source, "real")
+        self.assertEqual(context.notifications[0].notification_id, "REMOTE-NOTIFY-1")
+
+    def test_uses_real_http_integrations_for_compensation(self) -> None:
+        http = StubHttpClient(
+            {
+                "https://policy.example/check": {
+                    "policy": {
+                        "policy_id": "REMOTE-POLICY-1",
+                        "max_hotel_price": 700,
+                        "approved_budget": 680,
+                        "compliant": True,
+                    }
+                },
+                "https://hotel.example/search": {
+                    "hotels": [
+                        {
+                            "hotel_id": "REMOTE-HOTEL-1",
+                            "name": "Remote Hotel",
+                            "city": "上海",
+                            "address": "Remote Road",
+                            "nightly_price": 660,
+                            "distance_km": 0.6,
+                            "rating": 4.9,
+                            "refundable": True,
+                        }
+                    ]
+                },
+                "https://oa.example/create": {
+                    "approval": {
+                        "approval_id": "REMOTE-APPROVAL-1",
+                        "status": "PENDING_APPROVAL",
+                    }
+                },
+                "https://oa.example/status": {
+                    "approval": {
+                        "approval_id": "REMOTE-APPROVAL-1",
+                        "status": "APPROVED",
+                    }
+                },
+                "https://hotel.example/lock": {
+                    "inventory_lock": {
+                        "lock_id": "REMOTE-LOCK-1",
+                        "status": "LOCKED",
+                        "hotel_id": "REMOTE-HOTEL-1",
+                        "expires_at": "2026-06-03T10:00:00Z",
+                    }
+                },
+                "https://order.example/create": {
+                    "order": {
+                        "order_id": "REMOTE-ORDER-1",
+                        "status": "CREATED",
+                        "total_amount": 1320,
+                        "currency": "CNY",
+                    }
+                },
+                "https://order.example/cancel": {
+                    "compensation": {
+                        "action": "cancel_order",
+                        "target_id": "REMOTE-ORDER-1",
+                        "status": "CANCELLED",
+                    }
+                },
+                "https://hotel.example/release": {
+                    "compensation": {
+                        "action": "release_hotel_inventory",
+                        "target_id": "REMOTE-LOCK-1",
+                        "status": "RELEASED",
+                    }
+                },
+            }
+        )
+        settings = IntegrationSettings(
+            policy_api_url="https://policy.example/check",
+            hotel_inventory_api_url="https://hotel.example/search",
+            oa_approval_api_url="https://oa.example/create",
+            oa_approval_status_api_url="https://oa.example/status",
+            hotel_inventory_lock_api_url="https://hotel.example/lock",
+            hotel_inventory_release_api_url="https://hotel.example/release",
+            order_api_url="https://order.example/create",
+            order_cancel_api_url="https://order.example/cancel",
+        )
+
+        agent = build_default_agent(settings=settings, http_client=http)
+        context = agent.cancel_trip(agent.run_to_order(_request()), "meeting_cancelled")
+
+        self.assertEqual(context.state, TravelState.USER_CANCELLED.value)
+        self.assertEqual(context.order_cancellation.source, "real")
+        self.assertEqual(context.inventory_release.source, "real")
+
+    def test_rejected_approval_stops_before_booking(self) -> None:
+        http = StubHttpClient(
+            {
+                "https://policy.example/check": {
+                    "policy": {
+                        "policy_id": "REMOTE-POLICY-1",
+                        "max_hotel_price": 700,
+                        "approved_budget": 680,
+                        "compliant": True,
+                    }
+                },
+                "https://hotel.example/search": {
+                    "hotels": [
+                        {
+                            "hotel_id": "REMOTE-HOTEL-1",
+                            "name": "Remote Hotel",
+                            "city": "上海",
+                            "address": "Remote Road",
+                            "nightly_price": 660,
+                            "distance_km": 0.6,
+                            "rating": 4.9,
+                            "refundable": True,
+                        }
+                    ]
+                },
+                "https://oa.example/create": {
+                    "approval": {
+                        "approval_id": "REMOTE-APPROVAL-1",
+                        "status": "PENDING_APPROVAL",
+                    }
+                },
+                "https://oa.example/status": {
+                    "approval": {
+                        "approval_id": "REMOTE-APPROVAL-1",
+                        "status": "REJECTED",
+                    }
+                },
+            }
+        )
+        settings = IntegrationSettings(
+            policy_api_url="https://policy.example/check",
+            hotel_inventory_api_url="https://hotel.example/search",
+            oa_approval_api_url="https://oa.example/create",
+            oa_approval_status_api_url="https://oa.example/status",
+        )
+
+        context = build_default_agent(settings=settings, http_client=http).run_to_order(_request())
+
+        self.assertEqual(context.state, TravelState.APPROVAL_REJECTED.value)
+        self.assertIsNone(context.inventory_lock)
+        self.assertIsNone(context.order)
+
+    def test_falls_back_to_mock_when_real_system_fails(self) -> None:
+        settings = IntegrationSettings(
+            policy_api_url="https://policy.example/check",
+            hotel_inventory_api_url="https://hotel.example/search",
+            oa_approval_api_url="https://oa.example/create",
+            use_mock_fallback=True,
+        )
+
+        context = build_default_agent(settings=settings, http_client=FailingHttpClient()).run_to_approval(_request())
+
+        self.assertEqual(context.policy_result.source, "mock_fallback")
+        self.assertEqual(context.hotel_options[0].source, "mock_fallback")
+        self.assertEqual(context.approval.source, "mock_fallback")
+
+    def test_raises_when_real_system_missing_and_fallback_disabled(self) -> None:
+        settings = IntegrationSettings(use_mock_fallback=False)
+
+        with self.assertRaises(IntegrationError):
+            build_default_agent(settings=settings).plan(_request())
+
+
+class ToolGatewayTest(unittest.TestCase):
+    def test_validates_required_parameters(self) -> None:
+        gateway = ToolGateway()
+        gateway.register("echo", "Echo one value.", ("value",), lambda value: value)
+
+        with self.assertRaises(ToolValidationError):
+            gateway.call("echo")
+        self.assertEqual(len(gateway.call_logs), 1)
+        self.assertFalse(gateway.call_logs[0].ok)
+
+
+class SessionStoreTest(unittest.TestCase):
+    def test_sqlite_session_store_round_trips_context(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "sessions.sqlite3"
+            store = SQLiteSessionStore(db_path)
+            agent = build_default_agent(session_store=store)
+            context = agent.run_to_order(_request())
+
+            reloaded = SQLiteSessionStore(db_path).get(context.session_id)
+
+            self.assertEqual(reloaded.session_id, context.session_id)
+            self.assertEqual(reloaded.state, TravelState.COMPLETED.value)
+            self.assertEqual(reloaded.request.start_date, date(2026, 6, 3))
+            self.assertEqual(reloaded.selected_hotel.hotel_id, context.selected_hotel.hotel_id)
+            self.assertEqual(reloaded.order.order_id, context.order.order_id)
+
+    def test_sqlite_session_store_lists_by_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "sessions.sqlite3"
+            store = SQLiteSessionStore(db_path)
+            agent = build_default_agent(session_store=store)
+            approval_context = agent.run_to_approval(_request())
+            completed_context = agent.run_to_order(_request())
+
+            approval_sessions = store.list_by_states({TravelState.APPROVAL_CREATED.value})
+
+            self.assertEqual([context.session_id for context in approval_sessions], [approval_context.session_id])
+            self.assertNotEqual(approval_sessions[0].session_id, completed_context.session_id)
+
+
+class WorkflowWorkerTest(unittest.TestCase):
+    def test_worker_advances_pending_approval_to_completed_order(self) -> None:
+        store = InMemorySessionStore()
+        agent = build_default_agent(session_store=store)
+        context = agent.run_to_approval(_request())
+
+        result = WorkflowWorker(agent).run_once()
+        updated = store.get(context.session_id)
+
+        self.assertEqual(result.scanned, 1)
+        self.assertEqual(result.advanced, 1)
+        self.assertEqual(updated.state, TravelState.COMPLETED.value)
+        self.assertIsNotNone(updated.order)
+
+    def test_worker_refreshes_completed_order_status(self) -> None:
+        store = InMemorySessionStore()
+        agent = build_default_agent(session_store=store)
+        context = agent.run_to_order(_request())
+
+        result = WorkflowWorker(agent).run_once()
+        updated = store.get(context.session_id)
+
+        self.assertEqual(result.scanned, 1)
+        self.assertEqual(updated.order.status, "CONFIRMED")
+
+    def test_worker_stops_on_price_change(self) -> None:
+        store = InMemorySessionStore()
+        http = StubHttpClient(
+            _remote_order_responses(
+                price_check={
+                    "price_check": {
+                        "hotel_id": "REMOTE-HOTEL-1",
+                        "status": "PRICE_CHANGED",
+                        "original_price": 660,
+                        "current_price": 680,
+                        "policy_compliant": True,
+                        "requires_confirmation": True,
+                    }
+                }
+            )
+        )
+        agent = build_default_agent(settings=_remote_order_settings(), http_client=http, session_store=store)
+        context = agent.run_to_approval(_request())
+
+        result = WorkflowWorker(agent).run_once()
+        updated = store.get(context.session_id)
+
+        self.assertEqual(result.scanned, 1)
+        self.assertEqual(updated.state, TravelState.PRICE_CHANGED.value)
+        self.assertIsNone(updated.order)
+        self.assertEqual(updated.notifications[0].event_type, "PRICE_CHANGE_CONFIRMATION_REQUIRED")
+
+    def test_worker_sends_notification_once_for_completed_order(self) -> None:
+        store = InMemorySessionStore()
+        agent = build_default_agent(session_store=store)
+        context = agent.run_to_order(_request())
+
+        WorkflowWorker(agent).run_once()
+        WorkflowWorker(agent).run_once()
+        updated = store.get(context.session_id)
+
+        completed_notifications = [
+            notification
+            for notification in updated.notifications
+            if notification.event_type == "ORDER_COMPLETED"
+        ]
+        self.assertEqual(len(completed_notifications), 1)
+
+    def test_worker_records_failed_notification_without_blocking_flow(self) -> None:
+        store = InMemorySessionStore()
+        settings = IntegrationSettings(
+            notification_api_url="https://notify.example/send",
+            notification_use_mock_fallback=False,
+        )
+        agent = build_default_agent(settings=settings, http_client=NotificationFailingHttpClient(), session_store=store)
+        context = agent.run_to_order(_request())
+
+        result = WorkflowWorker(agent).run_once()
+        updated = store.get(context.session_id)
+
+        self.assertEqual(result.errors, {})
+        self.assertEqual(updated.notifications[0].status, "FAILED")
+        self.assertEqual(updated.notifications[0].retry_count, 1)
+
+    def test_worker_retries_failed_notification_and_marks_dead_letter(self) -> None:
+        store = InMemorySessionStore()
+        settings = IntegrationSettings(
+            notification_api_url="https://notify.example/send",
+            notification_use_mock_fallback=False,
+        )
+        agent = build_default_agent(settings=settings, http_client=NotificationFailingHttpClient(), session_store=store)
+        context = agent.run_to_order(_request())
+
+        worker = WorkflowWorker(agent)
+        worker.run_once()
+        worker.run_once()
+        worker.run_once()
+        updated = store.get(context.session_id)
+
+        self.assertEqual(updated.notifications[0].status, "DEAD_LETTER")
+        self.assertEqual(updated.notifications[0].retry_count, 3)
+
+    def test_worker_loop_aggregates_iterations(self) -> None:
+        store = InMemorySessionStore()
+        agent = build_default_agent(session_store=store)
+        agent.run_to_approval(_request())
+
+        result = WorkflowWorker(agent).run_loop(iterations=2, interval_seconds=0, limit=10)
+
+        self.assertEqual(result.iterations, 2)
+        self.assertGreaterEqual(result.scanned, 1)
+        self.assertGreaterEqual(result.advanced, 1)
+
+
+def _request(budget_per_night: int = 650) -> TravelRequest:
+    return TravelRequest(
+        user_id="u-demo",
+        origin_city="北京",
+        destination_city="上海",
+        start_date=date(2026, 6, 3),
+        end_date=date(2026, 6, 5),
+        purpose="客户会议",
+        venue="上海张江人工智能岛",
+        budget_per_night=budget_per_night,
+        preferences=["可取消"],
+    )
+
+
+class StubHttpClient:
+    def __init__(self, responses: dict[str, dict[str, Any]]) -> None:
+        self.responses = responses
+
+    def post_json(self, url: str, payload: dict[str, Any], token: str | None = None) -> dict[str, Any]:
+        del payload, token
+        return self.responses[url]
+
+
+class FailingHttpClient:
+    def post_json(self, url: str, payload: dict[str, Any], token: str | None = None) -> dict[str, Any]:
+        del payload, token
+        raise IntegrationError(f"{url} is unavailable")
+
+
+class NotificationFailingHttpClient:
+    def post_json(self, url: str, payload: dict[str, Any], token: str | None = None) -> dict[str, Any]:
+        del payload, token
+        if url == "https://notify.example/send":
+            raise IntegrationError(f"{url} is unavailable")
+        return {}
+
+
+def _remote_order_responses(price_check: dict[str, Any] | None = None) -> dict[str, dict[str, Any]]:
+    responses = {
+        "https://policy.example/check": {
+            "policy": {
+                "policy_id": "REMOTE-POLICY-1",
+                "max_hotel_price": 700,
+                "approved_budget": 680,
+                "compliant": True,
+            }
+        },
+        "https://hotel.example/search": {
+            "hotels": [
+                {
+                    "hotel_id": "REMOTE-HOTEL-1",
+                    "name": "Remote Hotel",
+                    "city": "上海",
+                    "address": "Remote Road",
+                    "nightly_price": 660,
+                    "distance_km": 0.6,
+                    "rating": 4.9,
+                    "refundable": True,
+                }
+            ]
+        },
+        "https://oa.example/create": {
+            "approval": {
+                "approval_id": "REMOTE-APPROVAL-1",
+                "status": "PENDING_APPROVAL",
+            }
+        },
+        "https://oa.example/status": {
+            "approval": {
+                "approval_id": "REMOTE-APPROVAL-1",
+                "status": "APPROVED",
+            }
+        },
+        "https://hotel.example/lock": {
+            "inventory_lock": {
+                "lock_id": "REMOTE-LOCK-1",
+                "status": "LOCKED",
+                "hotel_id": "REMOTE-HOTEL-1",
+                "expires_at": "2026-06-03T10:00:00Z",
+            }
+        },
+        "https://hotel.example/price": price_check
+        or {
+            "price_check": {
+                "hotel_id": "REMOTE-HOTEL-1",
+                "status": "UNCHANGED",
+                "original_price": 660,
+                "current_price": 660,
+                "policy_compliant": True,
+                "requires_confirmation": False,
+            }
+        },
+        "https://order.example/create": {
+            "order": {
+                "order_id": "REMOTE-ORDER-1",
+                "status": "CREATED",
+                "total_amount": 1320,
+                "currency": "CNY",
+            }
+        },
+    }
+    return responses
+
+
+def _remote_order_settings(**overrides: Any) -> IntegrationSettings:
+    values = {
+        "policy_api_url": "https://policy.example/check",
+        "hotel_inventory_api_url": "https://hotel.example/search",
+        "oa_approval_api_url": "https://oa.example/create",
+        "oa_approval_status_api_url": "https://oa.example/status",
+        "hotel_inventory_lock_api_url": "https://hotel.example/lock",
+        "hotel_price_check_api_url": "https://hotel.example/price",
+        "order_api_url": "https://order.example/create",
+    }
+    values.update(overrides)
+    return IntegrationSettings(**values)
+
+
+if __name__ == "__main__":
+    unittest.main()
