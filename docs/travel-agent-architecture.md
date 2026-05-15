@@ -72,11 +72,15 @@ Itinerary Tool 生成行程草案
   ↓
 Hotel Tool 查询酒店候选
   ↓
-用户确认酒店
+Transport Tool 查询机票/火车票候选
+  ↓
+用户确认酒店和交通
   ↓
 Approval Tool 创建审批记录
   ↓
 Approval Status Tool 查询审批状态
+  ↓
+Transport Order Tool 创建交通订单
   ↓
 Hotel Lock Tool 锁定库存
   ↓
@@ -95,11 +99,12 @@ Order Tool 创建订单
 第二阶段在第一阶段基础上补充真实系统接入层：
 
 - 差旅政策、酒店库存、OA 审批均通过 `TravelSystemIntegrations` 适配。
+- 交通政策、交通库存和交通订单通过同一接入层适配，可使用真实 HTTP JSON 或 mock fallback。
 - 默认使用 mock 数据，支持真实 HTTP JSON 接口。
 - 真实接口未配置或调用失败时，可按配置降级到 mock 数据。
 - 返回对象带 `source` 字段，便于审计真实来源和 fallback 来源。
-- 审批通过后进入库存锁定和订单创建，审批驳回则停止下单。
-- 下单后支持取消补偿：先取消订单，再释放酒店库存。
+- 审批通过后进入交通订单创建、酒店库存锁定和酒店订单创建，审批驳回则停止下单。
+- 下单后支持取消补偿：先取消交通订单和酒店订单，再释放酒店库存。
 - 会话可持久化到 SQLite，后续可替换为生产数据库或工作流引擎。
 - 锁库存后、下单前执行价格校验；价格变化时进入二次确认。
 - 订单创建后可刷新订单状态，便于后续接入异步轮询。
@@ -108,20 +113,16 @@ Order Tool 创建订单
 - 通知失败不会阻断主流程，会记录失败、重试次数和死信状态。
 - worker 每轮执行会落库运行摘要，支持后续排查扫描数、推进数、跳过数和错误会话。
 - 达到重试上限的通知可查询并人工重放，重放失败后会重新进入可重试队列。
+- 异常恢复会通过 `workflow_generation` 开启新一轮流程，避免重新提交时复用上一轮审批、库存、订单和通知幂等键。
 
-第一阶段暂不包含：
-
-- 真实酒店库存和价格锁定。
-- 真实 OA 审批提交。
-- 订单创建、支付、退改、取消。
-- 多 Agent 并行协作。
+第一阶段历史范围曾暂不包含真实库存、真实 OA、订单创建、补偿和多 Agent。当前实现已推进到真实系统适配、酒店 + 交通组合下单、异常恢复、通知死信和观测能力；剩余未完成的主线是多 Agent 协作雏形、改签/退订、日历同步和生产级指标出口。
 
 ## 4. 单 Agent 架构
 
 ```text
 TravelAgent
   ├─ SimpleTaskPlanner
-  │   └─ 将用户请求拆成 check_policy / plan_itinerary / search_hotels / create_approval_draft
+  │   └─ 将用户请求拆成 check_policy / check_transport_policy / plan_itinerary / search_hotels / search_transport / create_approval
   ├─ WorkflowStateMachine
   │   └─ 管理 DRAFT → POLICY_CHECKED → PLAN_GENERATED → USER_CONFIRMED → APPROVAL_CREATED
   ├─ ToolGateway
@@ -225,18 +226,42 @@ USER_CANCELLED：用户取消，补偿动作已尽量执行
 
 关键补偿：
 
-- 审批驳回：重新生成低价或更合规方案。
+- 审批驳回：重新生成低价或更合规方案，进入新一轮审批。
 - 价格变化：通知用户并二次确认。
 - 库存过期：重新查询并保留原筛选条件。
-- 下单失败：释放库存并回滚审批关联。
+- 下单失败：取消失败订单、释放库存、撤回审批关联，再重新规划。
 - 用户取消：终止流程并记录取消原因。
 - 完成后取消：取消订单，释放库存，并保留补偿结果用于审计。
 - 订单状态变化：刷新订单状态并保存到会话，后续可由调度器定时执行。
 
+恢复流程：
+
+```text
+APPROVAL_REJECTED / PRICE_CHANGED / INVENTORY_EXPIRED / ORDER_FAILED
+  ↓
+replan_after_exception
+  ├─ cancel_order（如已有订单）
+  ├─ release_hotel_inventory（如已有库存锁）
+  ├─ cancel_approval（如审批仍可撤回）
+  ├─ workflow_generation + 1
+  ├─ 重新查询酒店库存
+  └─ PLAN_GENERATED
+      ↓
+reselect_hotel_and_create_approval
+      ↓
+APPROVAL_CREATED
+```
+
+恢复记录：
+
+- `RecoveryRecord` 记录恢复动作、原因、原状态、新状态、补偿结果、酒店候选数和创建时间。
+- 新一轮审批、库存锁、订单和通知的 idempotency key 均包含 `workflow_generation`。
+- 旧轮次的通知记录会保留，通知去重按 `session_id + workflow_generation + event_type` 生效。
+
 自动推进边界：
 
 - `APPROVAL_CREATED`：可自动查询审批状态。
-- `APPROVAL_APPROVED`：可自动锁库存、校验价格、创建订单。
+- `APPROVAL_APPROVED`：可自动创建交通订单、锁酒店库存、校验价格、创建酒店订单。
 - `ORDER_CREATED` / `COMPLETED`：可自动刷新订单状态。
 - `PRICE_CHANGED`：必须等待用户或企业策略显式确认，worker 不自动接受。
 
@@ -281,6 +306,24 @@ src/travel_agent/
   └─ cli.py         CLI 演示入口
 ```
 
+当前组合下单顺序：
+
+```text
+APPROVAL_APPROVED
+  ↓
+create_transport_order
+  ↓
+lock_hotel_inventory
+  ↓
+verify_hotel_price
+  ↓
+create_order
+  ↓
+COMPLETED
+```
+
+交通订单先于酒店订单创建，因此价格变化、库存失效、用户取消或订单失败时，补偿逻辑会优先取消交通订单，再处理酒店订单和库存释放。
+
 运行方式：
 
 ```powershell
@@ -319,8 +362,36 @@ python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --replay-d
 python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --metrics
 ```
 
+异常恢复并重新提交审批：
+
+```powershell
+$env:PYTHONPATH = "src"
+python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --replan-session "<session-id>" --replan-reason "operator_replan"
+python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --reselect-hotel-session "<session-id>" --hotel-id "SHA-002"
+```
+
 测试方式：
 
 ```powershell
 python -m unittest discover -s tests
 ```
+
+## 9. 下一阶段推进
+
+下一阶段进入多 Agent 协作雏形，但会保持当前 CLI、状态机、Tool Gateway 和测试入口兼容。
+
+计划拆分：
+
+- `OrchestratorAgent`：负责总流程、状态推进和异常恢复决策。
+- `PolicyAgent`：负责酒店政策、交通政策和合规解释。
+- `HotelAgent`：负责酒店查询、库存锁定、价格校验和酒店补偿。
+- `TransportAgent`：负责机票/火车票查询、交通订单和交通补偿。
+- `ApprovalAgent`：负责 OA 审批创建、状态跟踪和撤回。
+- `BookingAgent`：负责组合下单顺序、订单状态同步和跨域补偿编排。
+
+落地原则：
+
+- 第一版多 Agent 先做代码模块边界，不引入外部框架。
+- 所有子 Agent 仍通过 `ToolGateway` 调用业务工具。
+- `TravelContext` 仍作为共享工作流上下文，避免引入不必要的数据迁移。
+- 保持现有 `TravelAgent` facade，确保 CLI 和测试不用大规模改造。

@@ -31,6 +31,11 @@ def parse_args() -> argparse.Namespace:
         help="Hotel id to confirm. Defaults to the top recommendation when --auto-confirm is set.",
     )
     parser.add_argument(
+        "--transport-id",
+        default=None,
+        help="Transport id to confirm. Defaults to the top recommendation when --auto-confirm is set.",
+    )
+    parser.add_argument(
         "--auto-confirm",
         action="store_true",
         help="Confirm the selected hotel and create an approval record.",
@@ -59,6 +64,21 @@ def parse_args() -> argparse.Namespace:
         "--cancel-reason",
         default="user_cancelled",
         help="Cancellation reason passed to compensation tools.",
+    )
+    parser.add_argument(
+        "--replan-session",
+        default=None,
+        help="Load a persisted exception session, run compensations, and regenerate hotel options.",
+    )
+    parser.add_argument(
+        "--replan-reason",
+        default="operator_replan",
+        help="Recovery reason passed to approval/order/inventory compensations.",
+    )
+    parser.add_argument(
+        "--reselect-hotel-session",
+        default=None,
+        help="Load a replanned session and create a new approval for the selected hotel.",
     )
     parser.add_argument(
         "--accept-price-change",
@@ -164,6 +184,18 @@ def main() -> None:
         context = agent.replay_dead_letter_notification(context, args.replay_dead_letter_event)
         print(render_context(context))
         return
+    if args.replan_session:
+        context = agent.get_session(args.replan_session)
+        context = agent.replan_after_exception(context, reason=args.replan_reason)
+        context = agent.notify_current_state(context)
+        print(render_context(context))
+        return
+    if args.reselect_hotel_session:
+        context = agent.get_session(args.reselect_hotel_session)
+        context = agent.reselect_hotel_and_create_approval(context, args.hotel_id, args.transport_id)
+        context = agent.notify_current_state(context)
+        print(render_context(context))
+        return
     if args.run_worker_once:
         _require_session_db(settings, "--run-worker-once")
         if args.worker_iterations <= 1:
@@ -212,11 +244,11 @@ def main() -> None:
     )
 
     if args.auto_book:
-        context = agent.run_to_order(request, args.hotel_id)
+        context = agent.run_to_order(request, args.hotel_id, args.transport_id)
     else:
         context = agent.plan(request)
-    if not args.auto_book and (args.auto_confirm or args.hotel_id):
-        context = agent.confirm_and_create_approval(context, args.hotel_id)
+    if not args.auto_book and (args.auto_confirm or args.hotel_id or args.transport_id):
+        context = agent.confirm_and_create_approval(context, args.hotel_id, args.transport_id)
     if args.cancel_after_book:
         context = agent.cancel_trip(context, args.cancel_reason)
     context = agent.notify_current_state(context)
@@ -310,17 +342,24 @@ def render_metrics(
 def _replace_session_db(settings: IntegrationSettings, session_db_path: str) -> IntegrationSettings:
     return IntegrationSettings(
         policy_api_url=settings.policy_api_url,
+        transport_policy_api_url=settings.transport_policy_api_url,
         hotel_inventory_api_url=settings.hotel_inventory_api_url,
         hotel_price_check_api_url=settings.hotel_price_check_api_url,
         hotel_inventory_lock_api_url=settings.hotel_inventory_lock_api_url,
         hotel_inventory_release_api_url=settings.hotel_inventory_release_api_url,
         oa_approval_api_url=settings.oa_approval_api_url,
         oa_approval_status_api_url=settings.oa_approval_status_api_url,
+        oa_approval_cancel_api_url=settings.oa_approval_cancel_api_url,
         order_api_url=settings.order_api_url,
         order_status_api_url=settings.order_status_api_url,
         order_cancel_api_url=settings.order_cancel_api_url,
+        transport_inventory_api_url=settings.transport_inventory_api_url,
+        transport_order_api_url=settings.transport_order_api_url,
+        transport_order_status_api_url=settings.transport_order_status_api_url,
+        transport_order_cancel_api_url=settings.transport_order_cancel_api_url,
         notification_api_url=settings.notification_api_url,
         policy_api_token=settings.policy_api_token,
+        transport_api_token=settings.transport_api_token,
         hotel_inventory_api_token=settings.hotel_inventory_api_token,
         oa_approval_api_token=settings.oa_approval_api_token,
         order_api_token=settings.order_api_token,
@@ -351,6 +390,7 @@ def render_context(context: TravelContext) -> str:
     lines = [
         f"会话: {context.session_id}",
         f"状态: {context.state}",
+        f"流程轮次: {context.workflow_generation}",
         f"目标: {context.task_plan.goal if context.task_plan else '-'}",
         "",
         "任务计划:",
@@ -374,6 +414,21 @@ def render_context(context: TravelContext) -> str:
         for reason in context.policy_result.reasons:
             lines.append(f"- 说明: {reason}")
 
+    if context.transport_policy_result:
+        lines.extend(
+            [
+                "",
+                "交通政策:",
+                f"- 政策: {context.transport_policy_result.policy_id}",
+                f"- 来源: {context.transport_policy_result.source}",
+                f"- 交通预算上限: {context.transport_policy_result.max_transport_price}",
+                f"- 允许舱等/座席: {', '.join(context.transport_policy_result.allowed_seat_classes)}",
+                f"- 是否合规: {context.transport_policy_result.compliant}",
+            ]
+        )
+        for reason in context.transport_policy_result.reasons:
+            lines.append(f"- 说明: {reason}")
+
     if context.itinerary:
         lines.extend(
             [
@@ -395,8 +450,26 @@ def render_context(context: TravelContext) -> str:
                 f"{hotel.distance_km}km | 评分 {hotel.rating} | 合规 {hotel.policy_compliant} | 来源 {hotel.source}"
             )
 
+    if context.transport_options:
+        lines.extend(["", "交通推荐:"])
+        for option in context.transport_options:
+            lines.append(
+                f"- {option.transport_id} {option.mode}/{option.provider} | {option.origin_city}->{option.destination_city} | "
+                f"{option.depart_at}->{option.arrive_at} | {option.seat_class} | {option.price} | "
+                f"合规 {option.policy_compliant} | 来源 {option.source}"
+            )
+
     if context.selected_hotel:
         lines.extend(["", "已确认酒店:", f"- {context.selected_hotel.hotel_id} {context.selected_hotel.name}"])
+
+    if context.selected_transport:
+        lines.extend(
+            [
+                "",
+                "已确认交通:",
+                f"- {context.selected_transport.transport_id} {context.selected_transport.mode}/{context.selected_transport.provider}",
+            ]
+        )
 
     if context.approval:
         lines.extend(
@@ -406,6 +479,18 @@ def render_context(context: TravelContext) -> str:
                 f"- 审批单: {context.approval.approval_id}",
                 f"- 状态: {context.approval.status}",
                 f"- 来源: {context.approval.source}",
+            ]
+        )
+
+    if context.approval_cancellation:
+        lines.extend(
+            [
+                "",
+                "审批补偿:",
+                f"- 动作: {context.approval_cancellation.action}",
+                f"- 目标: {context.approval_cancellation.target_id}",
+                f"- 状态: {context.approval_cancellation.status}",
+                f"- 来源: {context.approval_cancellation.source}",
             ]
         )
 
@@ -441,11 +526,23 @@ def render_context(context: TravelContext) -> str:
         lines.extend(
             [
                 "",
-                "订单:",
+                "酒店订单:",
                 f"- 订单号: {context.order.order_id}",
                 f"- 状态: {context.order.status}",
                 f"- 金额: {context.order.total_amount} {context.order.currency}",
                 f"- 来源: {context.order.source}",
+            ]
+        )
+
+    if context.transport_order:
+        lines.extend(
+            [
+                "",
+                "交通订单:",
+                f"- 订单号: {context.transport_order.order_id}",
+                f"- 状态: {context.transport_order.status}",
+                f"- 金额: {context.transport_order.total_amount} {context.transport_order.currency}",
+                f"- 来源: {context.transport_order.source}",
             ]
         )
 
@@ -458,6 +555,18 @@ def render_context(context: TravelContext) -> str:
                 f"- 目标: {context.order_cancellation.target_id}",
                 f"- 状态: {context.order_cancellation.status}",
                 f"- 来源: {context.order_cancellation.source}",
+            ]
+        )
+
+    if context.transport_order_cancellation:
+        lines.extend(
+            [
+                "",
+                "交通订单补偿:",
+                f"- 动作: {context.transport_order_cancellation.action}",
+                f"- 目标: {context.transport_order_cancellation.target_id}",
+                f"- 状态: {context.transport_order_cancellation.status}",
+                f"- 来源: {context.transport_order_cancellation.source}",
             ]
         )
 
@@ -479,6 +588,14 @@ def render_context(context: TravelContext) -> str:
             lines.append(
                 f"- {notification.event_type} | {notification.channel} | "
                 f"{notification.status} | {notification.title} | 来源 {notification.source}"
+            )
+
+    if context.recovery_records:
+        lines.extend(["", "恢复记录:"])
+        for record in context.recovery_records:
+            lines.append(
+                f"- {record.recovery_id} | {record.action} | {record.from_state}->{record.to_state} | "
+                f"原因 {record.reason} | 来源 {record.source}"
             )
 
     lines.extend(["", "事件:"])

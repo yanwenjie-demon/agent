@@ -48,6 +48,16 @@ class PolicyResult:
 
 
 @dataclass(frozen=True)
+class TransportPolicyResult:
+    policy_id: str
+    allowed_seat_classes: list[str]
+    max_transport_price: int
+    compliant: bool
+    reasons: list[str]
+    source: str = "mock"
+
+
+@dataclass(frozen=True)
 class ItineraryPlan:
     summary: str
     check_in: date
@@ -64,6 +74,22 @@ class HotelOption:
     nightly_price: int
     distance_km: float
     rating: float
+    refundable: bool
+    policy_compliant: bool
+    source: str = "mock"
+
+
+@dataclass(frozen=True)
+class TransportOption:
+    transport_id: str
+    mode: str
+    provider: str
+    origin_city: str
+    destination_city: str
+    depart_at: str
+    arrive_at: str
+    seat_class: str
+    price: int
     refundable: bool
     policy_compliant: bool
     source: str = "mock"
@@ -92,6 +118,16 @@ class InventoryLock:
 
 @dataclass(frozen=True)
 class TravelOrder:
+    order_id: str
+    status: str
+    total_amount: int
+    currency: str
+    payload: dict[str, Any]
+    source: str = "mock"
+
+
+@dataclass(frozen=True)
+class TransportOrder:
     order_id: str
     status: str
     total_amount: int
@@ -156,24 +192,44 @@ class WorkerRunRecord:
     session_ids: list[str]
 
 
+@dataclass(frozen=True)
+class RecoveryRecord:
+    recovery_id: str
+    action: str
+    reason: str
+    from_state: str
+    to_state: str
+    payload: dict[str, Any]
+    created_at: str
+    source: str = "local"
+
+
 @dataclass
 class TravelContext:
     session_id: str
     request: TravelRequest
     state: str
+    workflow_generation: int = 1
     task_plan: TaskPlan | None = None
     policy_result: PolicyResult | None = None
+    transport_policy_result: TransportPolicyResult | None = None
     itinerary: ItineraryPlan | None = None
     hotel_options: list[HotelOption] = field(default_factory=list)
+    transport_options: list[TransportOption] = field(default_factory=list)
     selected_hotel: HotelOption | None = None
+    selected_transport: TransportOption | None = None
     approval: ApprovalRecord | None = None
     price_check: PriceCheckResult | None = None
     inventory_lock: InventoryLock | None = None
     order: TravelOrder | None = None
+    transport_order: TransportOrder | None = None
+    approval_cancellation: CompensationResult | None = None
     order_cancellation: CompensationResult | None = None
+    transport_order_cancellation: CompensationResult | None = None
     inventory_release: CompensationResult | None = None
     notifications: list[NotificationRecord] = field(default_factory=list)
     notification_keys: list[str] = field(default_factory=list)
+    recovery_records: list[RecoveryRecord] = field(default_factory=list)
     events: list[str] = field(default_factory=list)
 
     def append_event(self, message: str) -> None:

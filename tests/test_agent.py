@@ -28,8 +28,10 @@ class TravelAgentFlowTest(unittest.TestCase):
 
         self.assertEqual(context.state, TravelState.PLAN_GENERATED.value)
         self.assertIsNotNone(context.policy_result)
+        self.assertIsNotNone(context.transport_policy_result)
         self.assertIsNotNone(context.itinerary)
         self.assertGreater(len(context.hotel_options), 0)
+        self.assertGreater(len(context.transport_options), 0)
         self.assertIsNone(context.approval)
 
     def test_run_to_approval_creates_draft(self) -> None:
@@ -38,9 +40,11 @@ class TravelAgentFlowTest(unittest.TestCase):
 
         self.assertEqual(context.state, TravelState.APPROVAL_CREATED.value)
         self.assertIsNotNone(context.selected_hotel)
+        self.assertIsNotNone(context.selected_transport)
         self.assertIsNotNone(context.approval)
         self.assertEqual(context.approval.status, "PENDING_APPROVAL")
         self.assertTrue(context.approval.approval_id.startswith("APP-"))
+        self.assertEqual(context.approval.payload["selected_transport"]["transport_id"], context.selected_transport.transport_id)
 
     def test_run_to_order_completes_mock_flow(self) -> None:
         agent = build_default_agent()
@@ -49,9 +53,12 @@ class TravelAgentFlowTest(unittest.TestCase):
         self.assertEqual(context.state, TravelState.COMPLETED.value)
         self.assertEqual(context.approval.status, "APPROVED")
         self.assertIsNotNone(context.inventory_lock)
+        self.assertIsNotNone(context.transport_order)
         self.assertIsNotNone(context.order)
         self.assertEqual(context.inventory_lock.status, "LOCKED")
+        self.assertEqual(context.transport_order.status, "CREATED")
         self.assertEqual(context.order.status, "CREATED")
+        self.assertEqual(context.transport_order.total_amount, context.selected_transport.price)
         self.assertEqual(context.order.total_amount, 1240)
 
     def test_refresh_order_status_updates_order(self) -> None:
@@ -60,6 +67,7 @@ class TravelAgentFlowTest(unittest.TestCase):
         context = agent.refresh_order_status(context)
 
         self.assertEqual(context.order.status, "CONFIRMED")
+        self.assertEqual(context.transport_order.status, "CONFIRMED")
         self.assertEqual(context.order.total_amount, 1240)
 
     def test_cancel_trip_compensates_order_and_inventory(self) -> None:
@@ -69,8 +77,10 @@ class TravelAgentFlowTest(unittest.TestCase):
 
         self.assertEqual(context.state, TravelState.USER_CANCELLED.value)
         self.assertIsNotNone(context.order_cancellation)
+        self.assertIsNotNone(context.transport_order_cancellation)
         self.assertIsNotNone(context.inventory_release)
         self.assertEqual(context.order_cancellation.status, "CANCELLED")
+        self.assertEqual(context.transport_order_cancellation.status, "CANCELLED")
         self.assertEqual(context.inventory_release.status, "RELEASED")
 
     def test_notify_current_state_is_idempotent(self) -> None:
@@ -120,6 +130,54 @@ class IntegrationAdapterTest(unittest.TestCase):
                         }
                     ]
                 },
+                "https://transport.example/policy": {
+                    "transport_policy": {
+                        "policy_id": "REMOTE-TRANSPORT-POLICY-1",
+                        "allowed_seat_classes": ["经济舱", "二等座"],
+                        "max_transport_price": 1600,
+                        "compliant": True,
+                    }
+                },
+                "https://transport.example/search": {
+                    "transports": [
+                        {
+                            "transport_id": "REMOTE-TRANSPORT-1",
+                            "mode": "flight",
+                            "provider": "Remote Air",
+                            "origin_city": "北京",
+                            "destination_city": "上海",
+                            "depart_at": "2026-06-03T09:00:00+08:00",
+                            "arrive_at": "2026-06-03T11:20:00+08:00",
+                            "seat_class": "经济舱",
+                            "price": 980,
+                            "refundable": True,
+                        }
+                    ]
+                },
+                "https://transport.example/policy": {
+                    "transport_policy": {
+                        "policy_id": "REMOTE-TRANSPORT-POLICY-1",
+                        "allowed_seat_classes": ["经济舱", "二等座"],
+                        "max_transport_price": 1600,
+                        "compliant": True,
+                    }
+                },
+                "https://transport.example/search": {
+                    "transports": [
+                        {
+                            "transport_id": "REMOTE-TRANSPORT-1",
+                            "mode": "flight",
+                            "provider": "Remote Air",
+                            "origin_city": "北京",
+                            "destination_city": "上海",
+                            "depart_at": "2026-06-03T09:00:00+08:00",
+                            "arrive_at": "2026-06-03T11:20:00+08:00",
+                            "seat_class": "经济舱",
+                            "price": 980,
+                            "refundable": True,
+                        }
+                    ]
+                },
                 "https://oa.example/create": {
                     "approval": {
                         "approval_id": "REMOTE-APPROVAL-1",
@@ -130,14 +188,18 @@ class IntegrationAdapterTest(unittest.TestCase):
         )
         settings = IntegrationSettings(
             policy_api_url="https://policy.example/check",
+            transport_policy_api_url="https://transport.example/policy",
             hotel_inventory_api_url="https://hotel.example/search",
+            transport_inventory_api_url="https://transport.example/search",
             oa_approval_api_url="https://oa.example/create",
         )
 
         context = build_default_agent(settings=settings, http_client=http).run_to_approval(_request())
 
         self.assertEqual(context.policy_result.source, "real")
+        self.assertEqual(context.transport_policy_result.source, "real")
         self.assertEqual(context.hotel_options[0].source, "real")
+        self.assertEqual(context.transport_options[0].source, "real")
         self.assertEqual(context.approval.source, "real")
         self.assertEqual(context.approval.approval_id, "REMOTE-APPROVAL-1")
 
@@ -186,6 +248,14 @@ class IntegrationAdapterTest(unittest.TestCase):
                         "expires_at": "2026-06-03T10:00:00Z",
                     }
                 },
+                "https://transport.example/order": {
+                    "transport_order": {
+                        "order_id": "REMOTE-TRANSPORT-ORDER-1",
+                        "status": "CREATED",
+                        "total_amount": 980,
+                        "currency": "CNY",
+                    }
+                },
                 "https://order.example/create": {
                     "order": {
                         "order_id": "REMOTE-ORDER-1",
@@ -198,10 +268,13 @@ class IntegrationAdapterTest(unittest.TestCase):
         )
         settings = IntegrationSettings(
             policy_api_url="https://policy.example/check",
+            transport_policy_api_url="https://transport.example/policy",
             hotel_inventory_api_url="https://hotel.example/search",
+            transport_inventory_api_url="https://transport.example/search",
             oa_approval_api_url="https://oa.example/create",
             oa_approval_status_api_url="https://oa.example/status",
             hotel_inventory_lock_api_url="https://hotel.example/lock",
+            transport_order_api_url="https://transport.example/order",
             order_api_url="https://order.example/create",
         )
 
@@ -209,8 +282,10 @@ class IntegrationAdapterTest(unittest.TestCase):
 
         self.assertEqual(context.state, TravelState.COMPLETED.value)
         self.assertEqual(context.approval.source, "real")
+        self.assertEqual(context.transport_order.source, "real")
         self.assertEqual(context.inventory_lock.source, "real")
         self.assertEqual(context.order.source, "real")
+        self.assertEqual(context.transport_order.order_id, "REMOTE-TRANSPORT-ORDER-1")
         self.assertEqual(context.order.order_id, "REMOTE-ORDER-1")
 
     def test_price_change_pauses_until_user_confirmation(self) -> None:
@@ -311,17 +386,30 @@ class IntegrationAdapterTest(unittest.TestCase):
                         "total_amount": 1320,
                         "currency": "CNY",
                     }
+                },
+                "https://transport.example/status": {
+                    "transport_order": {
+                        "order_id": "REMOTE-TRANSPORT-ORDER-1",
+                        "status": "CONFIRMED",
+                        "total_amount": 980,
+                        "currency": "CNY",
+                    }
                 }
             }
         )
-        settings = _remote_order_settings(order_status_api_url="https://order.example/status")
+        settings = _remote_order_settings(
+            order_status_api_url="https://order.example/status",
+            transport_order_status_api_url="https://transport.example/status",
+        )
 
         agent = build_default_agent(settings=settings, http_client=http)
         context = agent.run_to_order(_request())
         context = agent.refresh_order_status(context)
 
         self.assertEqual(context.order.status, "CONFIRMED")
+        self.assertEqual(context.transport_order.status, "CONFIRMED")
         self.assertEqual(context.order.source, "real")
+        self.assertEqual(context.transport_order.source, "real")
 
     def test_uses_real_http_integration_for_notifications(self) -> None:
         http = StubHttpClient(
@@ -408,6 +496,13 @@ class IntegrationAdapterTest(unittest.TestCase):
                         "status": "CANCELLED",
                     }
                 },
+                "https://transport.example/cancel": {
+                    "compensation": {
+                        "action": "cancel_transport_order",
+                        "target_id": "REMOTE-TRANSPORT-ORDER-1",
+                        "status": "CANCELLED",
+                    }
+                },
                 "https://hotel.example/release": {
                     "compensation": {
                         "action": "release_hotel_inventory",
@@ -426,6 +521,7 @@ class IntegrationAdapterTest(unittest.TestCase):
             hotel_inventory_release_api_url="https://hotel.example/release",
             order_api_url="https://order.example/create",
             order_cancel_api_url="https://order.example/cancel",
+            transport_order_cancel_api_url="https://transport.example/cancel",
         )
 
         agent = build_default_agent(settings=settings, http_client=http)
@@ -433,6 +529,7 @@ class IntegrationAdapterTest(unittest.TestCase):
 
         self.assertEqual(context.state, TravelState.USER_CANCELLED.value)
         self.assertEqual(context.order_cancellation.source, "real")
+        self.assertEqual(context.transport_order_cancellation.source, "real")
         self.assertEqual(context.inventory_release.source, "real")
 
     def test_rejected_approval_stops_before_booking(self) -> None:
@@ -487,6 +584,172 @@ class IntegrationAdapterTest(unittest.TestCase):
         self.assertIsNone(context.inventory_lock)
         self.assertIsNone(context.order)
 
+    def test_replans_after_rejected_approval_and_creates_new_approval(self) -> None:
+        http = StubHttpClient(
+            {
+                "https://policy.example/check": {
+                    "policy": {
+                        "policy_id": "REMOTE-POLICY-1",
+                        "max_hotel_price": 700,
+                        "approved_budget": 680,
+                        "compliant": True,
+                    }
+                },
+                "https://hotel.example/search": {
+                    "hotels": [
+                        {
+                            "hotel_id": "REMOTE-HOTEL-1",
+                            "name": "Remote Hotel",
+                            "city": "上海",
+                            "address": "Remote Road",
+                            "nightly_price": 660,
+                            "distance_km": 0.6,
+                            "rating": 4.9,
+                            "refundable": True,
+                        },
+                        {
+                            "hotel_id": "REMOTE-HOTEL-2",
+                            "name": "Remote Hotel 2",
+                            "city": "上海",
+                            "address": "Remote Road 2",
+                            "nightly_price": 620,
+                            "distance_km": 1.0,
+                            "rating": 4.7,
+                            "refundable": True,
+                        },
+                    ]
+                },
+                "https://oa.example/create": {
+                    "approval": {
+                        "approval_id": "REMOTE-APPROVAL-NEW",
+                        "status": "PENDING_APPROVAL",
+                    }
+                },
+                "https://oa.example/status": {
+                    "approval": {
+                        "approval_id": "REMOTE-APPROVAL-OLD",
+                        "status": "REJECTED",
+                    }
+                },
+            }
+        )
+        settings = IntegrationSettings(
+            policy_api_url="https://policy.example/check",
+            hotel_inventory_api_url="https://hotel.example/search",
+            oa_approval_api_url="https://oa.example/create",
+            oa_approval_status_api_url="https://oa.example/status",
+        )
+        agent = build_default_agent(settings=settings, http_client=http)
+        context = agent.run_to_order(_request())
+
+        replanned = agent.replan_after_exception(context, reason="approval_rejected_replan")
+        new_approval = agent.reselect_hotel_and_create_approval(replanned, "REMOTE-HOTEL-2")
+
+        self.assertEqual(replanned.workflow_generation, 2)
+        self.assertEqual(replanned.state, TravelState.APPROVAL_CREATED.value)
+        self.assertEqual(new_approval.approval.approval_id, "REMOTE-APPROVAL-NEW")
+        self.assertEqual(new_approval.approval.payload["workflow_generation"], 2)
+        self.assertEqual(new_approval.recovery_records[0].from_state, TravelState.APPROVAL_REJECTED.value)
+
+    def test_replans_after_price_change_releases_inventory(self) -> None:
+        http = StubHttpClient(
+            _remote_order_responses(
+                price_check={
+                    "price_check": {
+                        "hotel_id": "REMOTE-HOTEL-1",
+                        "status": "PRICE_CHANGED",
+                        "original_price": 660,
+                        "current_price": 680,
+                        "policy_compliant": True,
+                        "requires_confirmation": True,
+                    }
+                }
+            )
+            | {
+                "https://hotel.example/release": {
+                    "compensation": {
+                        "action": "release_hotel_inventory",
+                        "target_id": "REMOTE-LOCK-1",
+                        "status": "RELEASED",
+                    }
+                },
+                "https://oa.example/cancel": {
+                    "compensation": {
+                        "action": "cancel_approval",
+                        "target_id": "REMOTE-APPROVAL-1",
+                        "status": "CANCELLED",
+                    }
+                },
+            }
+        )
+        settings = _remote_order_settings(
+            hotel_inventory_release_api_url="https://hotel.example/release",
+            oa_approval_cancel_api_url="https://oa.example/cancel",
+        )
+        agent = build_default_agent(settings=settings, http_client=http)
+        context = agent.run_to_order(_request())
+
+        replanned = agent.replan_after_exception(context, reason="price_change_replan")
+
+        self.assertEqual(replanned.state, TravelState.PLAN_GENERATED.value)
+        self.assertEqual(replanned.workflow_generation, 2)
+        self.assertIsNone(replanned.inventory_lock)
+        self.assertIsNone(replanned.approval)
+        self.assertIn("inventory_release", replanned.recovery_records[0].payload["compensations"])
+        self.assertIn("approval_cancellation", replanned.recovery_records[0].payload["compensations"])
+
+    def test_replans_after_order_failed_cancels_order_and_uses_new_idempotency_key(self) -> None:
+        http = CapturingHttpClient(
+            _remote_order_responses(
+                order={
+                    "order": {
+                        "order_id": "REMOTE-ORDER-1",
+                        "status": "FAILED",
+                        "total_amount": 1320,
+                        "currency": "CNY",
+                    }
+                }
+            )
+            | {
+                "https://order.example/cancel": {
+                    "compensation": {
+                        "action": "cancel_order",
+                        "target_id": "REMOTE-ORDER-1",
+                        "status": "CANCELLED",
+                    }
+                },
+                "https://hotel.example/release": {
+                    "compensation": {
+                        "action": "release_hotel_inventory",
+                        "target_id": "REMOTE-LOCK-1",
+                        "status": "RELEASED",
+                    }
+                },
+                "https://oa.example/cancel": {
+                    "compensation": {
+                        "action": "cancel_approval",
+                        "target_id": "REMOTE-APPROVAL-1",
+                        "status": "CANCELLED",
+                    }
+                },
+            }
+        )
+        settings = _remote_order_settings(
+            order_cancel_api_url="https://order.example/cancel",
+            hotel_inventory_release_api_url="https://hotel.example/release",
+            oa_approval_cancel_api_url="https://oa.example/cancel",
+        )
+        agent = build_default_agent(settings=settings, http_client=http)
+        context = agent.run_to_order(_request())
+
+        replanned = agent.replan_after_exception(context, reason="order_failed_replan")
+        new_approval = agent.reselect_hotel_and_create_approval(replanned)
+
+        self.assertEqual(context.state, TravelState.APPROVAL_CREATED.value)
+        self.assertIn("order_cancellation", replanned.recovery_records[0].payload["compensations"])
+        self.assertIsNone(new_approval.order)
+        self.assertEqual(http.payloads["https://oa.example/create"][-1]["idempotency_key"], f"travel-approval:{context.session_id}:2:u-demo")
+
     def test_falls_back_to_mock_when_real_system_fails(self) -> None:
         settings = IntegrationSettings(
             policy_api_url="https://policy.example/check",
@@ -533,7 +796,9 @@ class SessionStoreTest(unittest.TestCase):
             self.assertEqual(reloaded.state, TravelState.COMPLETED.value)
             self.assertEqual(reloaded.request.start_date, date(2026, 6, 3))
             self.assertEqual(reloaded.selected_hotel.hotel_id, context.selected_hotel.hotel_id)
+            self.assertEqual(reloaded.selected_transport.transport_id, context.selected_transport.transport_id)
             self.assertEqual(reloaded.order.order_id, context.order.order_id)
+            self.assertEqual(reloaded.transport_order.order_id, context.transport_order.order_id)
 
     def test_sqlite_session_store_lists_by_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -727,7 +992,7 @@ class WorkflowWorkerTest(unittest.TestCase):
 
         self.assertEqual(replayed.notifications[0].status, "SENT")
         self.assertEqual(replayed.notifications[0].retry_count, 0)
-        self.assertIn(f"{context.session_id}:ORDER_COMPLETED", replayed.notification_keys)
+        self.assertIn(f"{context.session_id}:1:ORDER_COMPLETED", replayed.notification_keys)
 
     def test_worker_loop_aggregates_iterations(self) -> None:
         store = InMemorySessionStore()
@@ -799,6 +1064,17 @@ class StubHttpClient:
         return self.responses[url]
 
 
+class CapturingHttpClient(StubHttpClient):
+    def __init__(self, responses: dict[str, dict[str, Any]]) -> None:
+        super().__init__(responses)
+        self.payloads: dict[str, list[dict[str, Any]]] = {}
+
+    def post_json(self, url: str, payload: dict[str, Any], token: str | None = None) -> dict[str, Any]:
+        del token
+        self.payloads.setdefault(url, []).append(payload)
+        return self.responses[url]
+
+
 class FailingHttpClient:
     def post_json(self, url: str, payload: dict[str, Any], token: str | None = None) -> dict[str, Any]:
         del payload, token
@@ -838,7 +1114,10 @@ class FlakyNotificationHttpClient:
         return {}
 
 
-def _remote_order_responses(price_check: dict[str, Any] | None = None) -> dict[str, dict[str, Any]]:
+def _remote_order_responses(
+    price_check: dict[str, Any] | None = None,
+    order: dict[str, Any] | None = None,
+) -> dict[str, dict[str, Any]]:
     responses = {
         "https://policy.example/check": {
             "policy": {
@@ -858,6 +1137,30 @@ def _remote_order_responses(price_check: dict[str, Any] | None = None) -> dict[s
                     "nightly_price": 660,
                     "distance_km": 0.6,
                     "rating": 4.9,
+                    "refundable": True,
+                }
+            ]
+        },
+        "https://transport.example/policy": {
+            "transport_policy": {
+                "policy_id": "REMOTE-TRANSPORT-POLICY-1",
+                "allowed_seat_classes": ["经济舱", "二等座"],
+                "max_transport_price": 1600,
+                "compliant": True,
+            }
+        },
+        "https://transport.example/search": {
+            "transports": [
+                {
+                    "transport_id": "REMOTE-TRANSPORT-1",
+                    "mode": "flight",
+                    "provider": "Remote Air",
+                    "origin_city": "北京",
+                    "destination_city": "上海",
+                    "depart_at": "2026-06-03T09:00:00+08:00",
+                    "arrive_at": "2026-06-03T11:20:00+08:00",
+                    "seat_class": "经济舱",
+                    "price": 980,
                     "refundable": True,
                 }
             ]
@@ -893,7 +1196,16 @@ def _remote_order_responses(price_check: dict[str, Any] | None = None) -> dict[s
                 "requires_confirmation": False,
             }
         },
-        "https://order.example/create": {
+        "https://transport.example/order": {
+            "transport_order": {
+                "order_id": "REMOTE-TRANSPORT-ORDER-1",
+                "status": "CREATED",
+                "total_amount": 980,
+                "currency": "CNY",
+            }
+        },
+        "https://order.example/create": order
+        or {
             "order": {
                 "order_id": "REMOTE-ORDER-1",
                 "status": "CREATED",
@@ -908,11 +1220,14 @@ def _remote_order_responses(price_check: dict[str, Any] | None = None) -> dict[s
 def _remote_order_settings(**overrides: Any) -> IntegrationSettings:
     values = {
         "policy_api_url": "https://policy.example/check",
+        "transport_policy_api_url": "https://transport.example/policy",
         "hotel_inventory_api_url": "https://hotel.example/search",
+        "transport_inventory_api_url": "https://transport.example/search",
         "oa_approval_api_url": "https://oa.example/create",
         "oa_approval_status_api_url": "https://oa.example/status",
         "hotel_inventory_lock_api_url": "https://hotel.example/lock",
         "hotel_price_check_api_url": "https://hotel.example/price",
+        "transport_order_api_url": "https://transport.example/order",
         "order_api_url": "https://order.example/create",
     }
     values.update(overrides)

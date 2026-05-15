@@ -18,6 +18,9 @@ from .models import (
     PolicyResult,
     PriceCheckResult,
     TravelOrder,
+    TransportOption,
+    TransportOrder,
+    TransportPolicyResult,
 )
 
 
@@ -90,6 +93,32 @@ class TravelSystemIntegrations:
 
         return self._fallback_policy(user_id, destination_city, budget_per_night, None)
 
+    def check_transport_policy(
+        self,
+        user_id: str,
+        origin_city: str,
+        destination_city: str,
+        travel_date: date,
+    ) -> TransportPolicyResult:
+        payload = {
+            "user_id": user_id,
+            "origin_city": origin_city,
+            "destination_city": destination_city,
+            "travel_date": travel_date,
+        }
+        if self.settings.transport_policy_api_url:
+            try:
+                response = self.http_client.post_json(
+                    self.settings.transport_policy_api_url,
+                    payload,
+                    self.settings.transport_api_token,
+                )
+                return self._parse_transport_policy_response(response, source="real")
+            except Exception as exc:
+                return self._fallback_transport_policy(user_id, origin_city, destination_city, travel_date, exc)
+
+        return self._fallback_transport_policy(user_id, origin_city, destination_city, travel_date, None)
+
     def search_hotels(
         self,
         city: str,
@@ -120,6 +149,34 @@ class TravelSystemIntegrations:
 
         return self._fallback_hotels(city, check_in, check_out, venue, max_price, preferences, None)
 
+    def search_transport(
+        self,
+        origin_city: str,
+        destination_city: str,
+        travel_date: date,
+        max_price: int,
+        preferences: list[str] | None = None,
+    ) -> list[TransportOption]:
+        payload = {
+            "origin_city": origin_city,
+            "destination_city": destination_city,
+            "travel_date": travel_date,
+            "max_price": max_price,
+            "preferences": preferences or [],
+        }
+        if self.settings.transport_inventory_api_url:
+            try:
+                response = self.http_client.post_json(
+                    self.settings.transport_inventory_api_url,
+                    payload,
+                    self.settings.transport_api_token,
+                )
+                return self._parse_transport_response(response, max_price, source="real")
+            except Exception as exc:
+                return self._fallback_transport(origin_city, destination_city, travel_date, max_price, preferences, exc)
+
+        return self._fallback_transport(origin_city, destination_city, travel_date, max_price, preferences, None)
+
     def create_approval(
         self,
         session_id: str,
@@ -128,15 +185,21 @@ class TravelSystemIntegrations:
         policy: dict[str, Any],
         itinerary: dict[str, Any],
         selected_hotel: dict[str, Any],
+        transport_policy: dict[str, Any] | None = None,
+        selected_transport: dict[str, Any] | None = None,
+        workflow_generation: int = 1,
     ) -> ApprovalRecord:
         payload = {
             "session_id": session_id,
             "user_id": user_id,
             "request": request,
             "policy": policy,
+            "transport_policy": transport_policy or {},
             "itinerary": itinerary,
             "selected_hotel": selected_hotel,
-            "idempotency_key": f"travel-approval:{session_id}:{user_id}",
+            "selected_transport": selected_transport or {},
+            "workflow_generation": workflow_generation,
+            "idempotency_key": f"travel-approval:{session_id}:{workflow_generation}:{user_id}",
         }
         if self.settings.oa_approval_api_url:
             try:
@@ -169,6 +232,26 @@ class TravelSystemIntegrations:
 
         return self._fallback_approval_status(approval_id, user_id, None)
 
+    def cancel_approval(self, approval_id: str, user_id: str, reason: str) -> CompensationResult:
+        payload = {
+            "approval_id": approval_id,
+            "user_id": user_id,
+            "reason": reason,
+            "idempotency_key": f"cancel-approval:{approval_id}:{user_id}",
+        }
+        if self.settings.oa_approval_cancel_api_url:
+            try:
+                response = self.http_client.post_json(
+                    self.settings.oa_approval_cancel_api_url,
+                    payload,
+                    self.settings.oa_approval_api_token,
+                )
+                return self._parse_compensation_response(response, payload, "cancel_approval", approval_id, source="real")
+            except Exception as exc:
+                return self._fallback_cancel_approval(approval_id, user_id, reason, exc)
+
+        return self._fallback_cancel_approval(approval_id, user_id, reason, None)
+
     def lock_hotel_inventory(
         self,
         session_id: str,
@@ -176,6 +259,7 @@ class TravelSystemIntegrations:
         selected_hotel: dict[str, Any],
         check_in: date,
         check_out: date,
+        workflow_generation: int = 1,
     ) -> InventoryLock:
         payload = {
             "session_id": session_id,
@@ -183,7 +267,8 @@ class TravelSystemIntegrations:
             "selected_hotel": selected_hotel,
             "check_in": check_in,
             "check_out": check_out,
-            "idempotency_key": f"hotel-lock:{session_id}:{selected_hotel['hotel_id']}",
+            "workflow_generation": workflow_generation,
+            "idempotency_key": f"hotel-lock:{session_id}:{workflow_generation}:{selected_hotel['hotel_id']}",
         }
         if self.settings.hotel_inventory_lock_api_url:
             try:
@@ -194,9 +279,25 @@ class TravelSystemIntegrations:
                 )
                 return self._parse_inventory_lock_response(response, payload, source="real")
             except Exception as exc:
-                return self._fallback_inventory_lock(session_id, user_id, selected_hotel, check_in, check_out, exc)
+                return self._fallback_inventory_lock(
+                    session_id,
+                    user_id,
+                    selected_hotel,
+                    check_in,
+                    check_out,
+                    workflow_generation,
+                    exc,
+                )
 
-        return self._fallback_inventory_lock(session_id, user_id, selected_hotel, check_in, check_out, None)
+        return self._fallback_inventory_lock(
+            session_id,
+            user_id,
+            selected_hotel,
+            check_in,
+            check_out,
+            workflow_generation,
+            None,
+        )
 
     def verify_hotel_price(
         self,
@@ -233,6 +334,7 @@ class TravelSystemIntegrations:
         selected_hotel: dict[str, Any],
         approval: dict[str, Any],
         inventory_lock: dict[str, Any],
+        workflow_generation: int = 1,
     ) -> TravelOrder:
         payload = {
             "session_id": session_id,
@@ -242,7 +344,8 @@ class TravelSystemIntegrations:
             "selected_hotel": selected_hotel,
             "approval": approval,
             "inventory_lock": inventory_lock,
-            "idempotency_key": f"travel-order:{session_id}:{inventory_lock['lock_id']}",
+            "workflow_generation": workflow_generation,
+            "idempotency_key": f"travel-order:{session_id}:{workflow_generation}:{inventory_lock['lock_id']}",
         }
         if self.settings.order_api_url:
             try:
@@ -274,6 +377,81 @@ class TravelSystemIntegrations:
                 return self._fallback_order_status(order_id, user_id, exc)
 
         return self._fallback_order_status(order_id, user_id, None)
+
+    def create_transport_order(
+        self,
+        session_id: str,
+        user_id: str,
+        request: dict[str, Any],
+        selected_transport: dict[str, Any],
+        approval: dict[str, Any],
+        workflow_generation: int = 1,
+    ) -> TransportOrder:
+        payload = {
+            "session_id": session_id,
+            "user_id": user_id,
+            "request": request,
+            "selected_transport": selected_transport,
+            "approval": approval,
+            "workflow_generation": workflow_generation,
+            "idempotency_key": f"transport-order:{session_id}:{workflow_generation}:{selected_transport['transport_id']}",
+        }
+        if self.settings.transport_order_api_url:
+            try:
+                response = self.http_client.post_json(
+                    self.settings.transport_order_api_url,
+                    payload,
+                    self.settings.transport_api_token,
+                )
+                return self._parse_transport_order_response(response, payload, source="real")
+            except Exception as exc:
+                return self._fallback_transport_order(payload, exc)
+
+        return self._fallback_transport_order(payload, None)
+
+    def get_transport_order_status(self, order_id: str, user_id: str) -> TransportOrder:
+        payload = {
+            "order_id": order_id,
+            "user_id": user_id,
+        }
+        if self.settings.transport_order_status_api_url:
+            try:
+                response = self.http_client.post_json(
+                    self.settings.transport_order_status_api_url,
+                    payload,
+                    self.settings.transport_api_token,
+                )
+                return self._parse_transport_order_response(response, payload, source="real")
+            except Exception as exc:
+                return self._fallback_transport_order_status(order_id, user_id, exc)
+
+        return self._fallback_transport_order_status(order_id, user_id, None)
+
+    def cancel_transport_order(self, order_id: str, user_id: str, reason: str) -> CompensationResult:
+        payload = {
+            "order_id": order_id,
+            "user_id": user_id,
+            "reason": reason,
+            "idempotency_key": f"cancel-transport-order:{order_id}:{user_id}",
+        }
+        if self.settings.transport_order_cancel_api_url:
+            try:
+                response = self.http_client.post_json(
+                    self.settings.transport_order_cancel_api_url,
+                    payload,
+                    self.settings.transport_api_token,
+                )
+                return self._parse_compensation_response(
+                    response,
+                    payload,
+                    "cancel_transport_order",
+                    order_id,
+                    source="real",
+                )
+            except Exception as exc:
+                return self._fallback_cancel_transport_order(order_id, user_id, reason, exc)
+
+        return self._fallback_cancel_transport_order(order_id, user_id, reason, None)
 
     def cancel_order(self, order_id: str, user_id: str, reason: str) -> CompensationResult:
         payload = {
@@ -330,6 +508,7 @@ class TravelSystemIntegrations:
         message: str,
         channel: str,
         payload: dict[str, Any],
+        workflow_generation: int = 1,
     ) -> NotificationRecord:
         request_payload = {
             "session_id": session_id,
@@ -338,8 +517,9 @@ class TravelSystemIntegrations:
             "title": title,
             "message": message,
             "channel": channel,
+            "workflow_generation": workflow_generation,
             "payload": payload,
-            "idempotency_key": f"notification:{session_id}:{event_type}",
+            "idempotency_key": f"notification:{session_id}:{workflow_generation}:{event_type}",
         }
         if self.settings.notification_api_url:
             try:
@@ -371,6 +551,24 @@ class TravelSystemIntegrations:
             reasons=policy.reasons + [f"Policy system unavailable, used mock fallback: {exc}"],
         )
 
+    def _fallback_transport_policy(
+        self,
+        user_id: str,
+        origin_city: str,
+        destination_city: str,
+        travel_date: date,
+        exc: Exception | None,
+    ) -> TransportPolicyResult:
+        self._ensure_fallback_allowed("transport policy", exc)
+        policy = mock_tools.check_transport_policy(user_id, origin_city, destination_city, travel_date)
+        if exc is None:
+            return policy
+        return replace(
+            policy,
+            source="mock_fallback",
+            reasons=policy.reasons + [f"Transport policy system unavailable, used mock fallback: {exc}"],
+        )
+
     def _fallback_hotels(
         self,
         city: str,
@@ -387,6 +585,21 @@ class TravelSystemIntegrations:
             return hotels
         return [replace(hotel, source="mock_fallback") for hotel in hotels]
 
+    def _fallback_transport(
+        self,
+        origin_city: str,
+        destination_city: str,
+        travel_date: date,
+        max_price: int,
+        preferences: list[str] | None,
+        exc: Exception | None,
+    ) -> list[TransportOption]:
+        self._ensure_fallback_allowed("transport inventory", exc)
+        options = mock_tools.search_transport(origin_city, destination_city, travel_date, max_price, preferences)
+        if exc is None:
+            return options
+        return [replace(option, source="mock_fallback") for option in options]
+
     def _fallback_approval(self, payload: dict[str, Any], exc: Exception | None) -> ApprovalRecord:
         self._ensure_fallback_allowed("OA approval", exc)
         fallback_payload = dict(payload)
@@ -399,6 +612,9 @@ class TravelSystemIntegrations:
             policy=fallback_payload["policy"],
             itinerary=fallback_payload["itinerary"],
             selected_hotel=fallback_payload["selected_hotel"],
+            transport_policy=fallback_payload.get("transport_policy"),
+            selected_transport=fallback_payload.get("selected_transport"),
+            workflow_generation=int(fallback_payload.get("workflow_generation", 1)),
         )
         if exc is None:
             return approval
@@ -427,6 +643,26 @@ class TravelSystemIntegrations:
             },
         )
 
+    def _fallback_cancel_approval(
+        self,
+        approval_id: str,
+        user_id: str,
+        reason: str,
+        exc: Exception | None,
+    ) -> CompensationResult:
+        self._ensure_fallback_allowed("OA approval cancellation", exc)
+        result = mock_tools.cancel_approval(approval_id, user_id, reason)
+        if exc is None:
+            return result
+        return replace(
+            result,
+            source="mock_fallback",
+            payload={
+                **result.payload,
+                "fallback_reason": f"OA approval cancellation system unavailable, used mock fallback: {exc}",
+            },
+        )
+
     def _fallback_inventory_lock(
         self,
         session_id: str,
@@ -434,10 +670,18 @@ class TravelSystemIntegrations:
         selected_hotel: dict[str, Any],
         check_in: date,
         check_out: date,
+        workflow_generation: int,
         exc: Exception | None,
     ) -> InventoryLock:
         self._ensure_fallback_allowed("hotel inventory lock", exc)
-        lock = mock_tools.lock_hotel_inventory(session_id, user_id, selected_hotel, check_in, check_out)
+        lock = mock_tools.lock_hotel_inventory(
+            session_id,
+            user_id,
+            selected_hotel,
+            check_in,
+            check_out,
+            workflow_generation,
+        )
         if exc is None:
             return lock
         return replace(
@@ -483,6 +727,7 @@ class TravelSystemIntegrations:
             selected_hotel=fallback_payload["selected_hotel"],
             approval=fallback_payload["approval"],
             inventory_lock=fallback_payload["inventory_lock"],
+            workflow_generation=int(fallback_payload.get("workflow_generation", 1)),
         )
         if exc is None:
             return order
@@ -511,6 +756,46 @@ class TravelSystemIntegrations:
             },
         )
 
+    def _fallback_transport_order(self, payload: dict[str, Any], exc: Exception | None) -> TransportOrder:
+        self._ensure_fallback_allowed("transport order", exc)
+        fallback_payload = dict(payload)
+        if exc is not None:
+            fallback_payload["fallback_reason"] = f"Transport order system unavailable, used mock fallback: {exc}"
+        order = mock_tools.create_transport_order(
+            session_id=fallback_payload["session_id"],
+            user_id=fallback_payload["user_id"],
+            request=fallback_payload["request"],
+            selected_transport=fallback_payload["selected_transport"],
+            approval=fallback_payload["approval"],
+            workflow_generation=int(fallback_payload.get("workflow_generation", 1)),
+        )
+        if exc is None:
+            return order
+        return replace(
+            order,
+            source="mock_fallback",
+            payload={**order.payload, "fallback_reason": fallback_payload["fallback_reason"]},
+        )
+
+    def _fallback_transport_order_status(
+        self,
+        order_id: str,
+        user_id: str,
+        exc: Exception | None,
+    ) -> TransportOrder:
+        self._ensure_fallback_allowed("transport order status", exc)
+        result = mock_tools.get_transport_order_status(order_id, user_id)
+        if exc is None:
+            return result
+        return replace(
+            result,
+            source="mock_fallback",
+            payload={
+                **result.payload,
+                "fallback_reason": f"Transport order status system unavailable, used mock fallback: {exc}",
+            },
+        )
+
     def _fallback_cancel_order(
         self,
         order_id: str,
@@ -528,6 +813,26 @@ class TravelSystemIntegrations:
             payload={
                 **result.payload,
                 "fallback_reason": f"Order cancellation system unavailable, used mock fallback: {exc}",
+            },
+        )
+
+    def _fallback_cancel_transport_order(
+        self,
+        order_id: str,
+        user_id: str,
+        reason: str,
+        exc: Exception | None,
+    ) -> CompensationResult:
+        self._ensure_fallback_allowed("transport order cancellation", exc)
+        result = mock_tools.cancel_transport_order(order_id, user_id, reason)
+        if exc is None:
+            return result
+        return replace(
+            result,
+            source="mock_fallback",
+            payload={
+                **result.payload,
+                "fallback_reason": f"Transport order cancellation system unavailable, used mock fallback: {exc}",
             },
         )
 
@@ -569,6 +874,7 @@ class TravelSystemIntegrations:
             message=payload["message"],
             channel=payload["channel"],
             payload=payload["payload"],
+            workflow_generation=int(payload.get("workflow_generation", 1)),
         )
         if exc is None:
             return result
@@ -622,6 +928,30 @@ class TravelSystemIntegrations:
         )
 
     @staticmethod
+    def _parse_transport_policy_response(
+        response: dict[str, Any],
+        source: str,
+    ) -> TransportPolicyResult:
+        body = _unwrap(response, "transport_policy")
+        allowed = body.get("allowed_seat_classes") or body.get("seat_classes") or ["二等座", "经济舱"]
+        if isinstance(allowed, str):
+            allowed = [allowed]
+        cap = int(_first_present(body, "max_transport_price", "approved_transport_budget", "cap", default=1800))
+        reasons = body.get("reasons", [])
+        if isinstance(reasons, str):
+            reasons = [reasons]
+        if not reasons:
+            reasons = ["Transport policy returned by enterprise policy system."]
+        return TransportPolicyResult(
+            policy_id=str(body.get("policy_id") or body.get("id") or "TRANSPORT-POLICY-REMOTE"),
+            allowed_seat_classes=list(allowed),
+            max_transport_price=cap,
+            compliant=bool(body.get("compliant", True)),
+            reasons=list(reasons),
+            source=source,
+        )
+
+    @staticmethod
     def _parse_hotel_response(
         response: dict[str, Any],
         max_price: int,
@@ -655,6 +985,44 @@ class TravelSystemIntegrations:
                 hotel.distance_km,
                 -hotel.rating,
                 hotel.nightly_price,
+            ),
+        )
+
+    @staticmethod
+    def _parse_transport_response(
+        response: dict[str, Any],
+        max_price: int,
+        source: str,
+    ) -> list[TransportOption]:
+        records = _unwrap_list(response, "transports")
+        options = [
+            TransportOption(
+                transport_id=str(_first_present(record, "transport_id", "id", "offer_id")),
+                mode=str(record.get("mode") or record.get("type") or "flight"),
+                provider=str(record.get("provider") or record.get("carrier") or ""),
+                origin_city=str(_first_present(record, "origin_city", "origin")),
+                destination_city=str(_first_present(record, "destination_city", "destination")),
+                depart_at=str(_first_present(record, "depart_at", "departure_time", "depart_time")),
+                arrive_at=str(_first_present(record, "arrive_at", "arrival_time", "arrive_time")),
+                seat_class=str(_first_present(record, "seat_class", "cabin", "class", default="经济舱")),
+                price=int(_first_present(record, "price", "total_amount", "amount")),
+                refundable=bool(record.get("refundable", True)),
+                policy_compliant=bool(
+                    record.get(
+                        "policy_compliant",
+                        int(_first_present(record, "price", "total_amount", "amount")) <= max_price,
+                    )
+                ),
+                source=source,
+            )
+            for record in records
+        ]
+        return sorted(
+            options,
+            key=lambda option: (
+                not option.policy_compliant,
+                option.price,
+                option.depart_at,
             ),
         )
 
@@ -742,6 +1110,29 @@ class TravelSystemIntegrations:
         total_amount = int(body.get("total_amount") or _order_total(request_payload))
         currency = str(body.get("currency") or "CNY")
         return TravelOrder(
+            order_id=str(order_id),
+            status=status,
+            total_amount=total_amount,
+            currency=currency,
+            payload=body.get("payload") or request_payload,
+            source=source,
+        )
+
+    @staticmethod
+    def _parse_transport_order_response(
+        response: dict[str, Any],
+        request_payload: dict[str, Any],
+        source: str,
+    ) -> TransportOrder:
+        body = _unwrap(response, "transport_order")
+        order_id = body.get("order_id") or body.get("id") or body.get("order_no")
+        if not order_id:
+            raise IntegrationError("Transport order response is missing order_id.")
+        selected_transport = request_payload.get("selected_transport", {})
+        status = str(body.get("status") or body.get("order_status") or "CREATED")
+        total_amount = int(body.get("total_amount") or body.get("amount") or selected_transport.get("price", 0))
+        currency = str(body.get("currency") or "CNY")
+        return TransportOrder(
             order_id=str(order_id),
             status=status,
             total_amount=total_amount,

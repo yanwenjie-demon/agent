@@ -30,10 +30,11 @@ ALLOWED_TRANSITIONS = {
     TravelState.APPROVAL_CREATED: {
         TravelState.APPROVAL_APPROVED,
         TravelState.APPROVAL_REJECTED,
+        TravelState.PLAN_GENERATED,
         TravelState.USER_CANCELLED,
     },
-    TravelState.APPROVAL_REJECTED: {TravelState.USER_CANCELLED},
-    TravelState.APPROVAL_APPROVED: {TravelState.INVENTORY_LOCKED, TravelState.USER_CANCELLED},
+    TravelState.APPROVAL_REJECTED: {TravelState.PLAN_GENERATED, TravelState.USER_CANCELLED},
+    TravelState.APPROVAL_APPROVED: {TravelState.INVENTORY_LOCKED, TravelState.PLAN_GENERATED, TravelState.USER_CANCELLED},
     TravelState.INVENTORY_LOCKED: {
         TravelState.ORDER_CREATED,
         TravelState.PRICE_CHANGED,
