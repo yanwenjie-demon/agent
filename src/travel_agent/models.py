@@ -158,6 +158,44 @@ class CompensationResult:
 
 
 @dataclass(frozen=True)
+class RefundEstimate:
+    estimate_id: str
+    target_type: str
+    target_id: str
+    refundable_amount: int
+    penalty_amount: int
+    currency: str
+    rules: list[str]
+    payload: dict[str, Any]
+    source: str = "mock"
+
+
+@dataclass(frozen=True)
+class ChangeRecord:
+    change_id: str
+    target_type: str
+    target_id: str
+    status: str
+    penalty_amount: int
+    currency: str
+    payload: dict[str, Any]
+    source: str = "mock"
+
+
+@dataclass(frozen=True)
+class CalendarSyncRecord:
+    calendar_event_id: str
+    event_type: str
+    status: str
+    user_id: str
+    title: str
+    start_at: str
+    end_at: str
+    payload: dict[str, Any]
+    source: str = "mock"
+
+
+@dataclass(frozen=True)
 class NotificationRecord:
     notification_id: str
     event_type: str
@@ -204,6 +242,17 @@ class RecoveryRecord:
     source: str = "local"
 
 
+@dataclass(frozen=True)
+class AgentExecutionRecord:
+    agent_name: str
+    action: str
+    status: str
+    input_refs: dict[str, Any]
+    output_refs: dict[str, Any]
+    message: str
+    created_at: str
+
+
 @dataclass
 class TravelContext:
     session_id: str
@@ -227,9 +276,13 @@ class TravelContext:
     order_cancellation: CompensationResult | None = None
     transport_order_cancellation: CompensationResult | None = None
     inventory_release: CompensationResult | None = None
+    refund_estimates: list[RefundEstimate] = field(default_factory=list)
+    change_records: list[ChangeRecord] = field(default_factory=list)
+    calendar_syncs: list[CalendarSyncRecord] = field(default_factory=list)
     notifications: list[NotificationRecord] = field(default_factory=list)
     notification_keys: list[str] = field(default_factory=list)
     recovery_records: list[RecoveryRecord] = field(default_factory=list)
+    agent_executions: list[AgentExecutionRecord] = field(default_factory=list)
     events: list[str] = field(default_factory=list)
 
     def append_event(self, message: str) -> None:

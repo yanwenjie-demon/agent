@@ -9,7 +9,10 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from .models import (
+    AgentExecutionRecord,
     ApprovalRecord,
+    CalendarSyncRecord,
+    ChangeRecord,
     CompensationResult,
     DeadLetterNotification,
     HotelOption,
@@ -19,6 +22,7 @@ from .models import (
     PolicyResult,
     PriceCheckResult,
     RecoveryRecord,
+    RefundEstimate,
     Task,
     TaskPlan,
     TravelContext,
@@ -274,9 +278,13 @@ def context_from_dict(payload: dict[str, Any]) -> TravelContext:
         order_cancellation=_optional(CompensationResult, payload.get("order_cancellation")),
         transport_order_cancellation=_optional(CompensationResult, payload.get("transport_order_cancellation")),
         inventory_release=_optional(CompensationResult, payload.get("inventory_release")),
+        refund_estimates=[RefundEstimate(**item) for item in payload.get("refund_estimates", [])],
+        change_records=[ChangeRecord(**item) for item in payload.get("change_records", [])],
+        calendar_syncs=[CalendarSyncRecord(**item) for item in payload.get("calendar_syncs", [])],
         notifications=[NotificationRecord(**item) for item in payload.get("notifications", [])],
         notification_keys=list(payload.get("notification_keys", [])),
         recovery_records=[RecoveryRecord(**item) for item in payload.get("recovery_records", [])],
+        agent_executions=[AgentExecutionRecord(**item) for item in payload.get("agent_executions", [])],
         events=list(payload.get("events", [])),
     )
 

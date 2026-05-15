@@ -27,7 +27,7 @@ Agent Runtime
   ├─ Tool Gateway：工具路由、鉴权、审计、幂等
   ├─ Workflow Engine：状态机与复杂流程编排
   ├─ Workflow Worker：扫描持久化会话并推进可自动执行的状态
-  ├─ Observability Store：记录 worker 执行摘要、死信通知和基础运行指标
+  ├─ Observability Store：记录 worker 执行摘要、子 Agent 执行摘要、死信通知和基础运行指标
   ├─ Memory：会话、用户偏好、任务状态
   └─ Guardrails：权限、风控、合规、敏感信息保护
       ↓
@@ -105,6 +105,8 @@ Order Tool 创建订单
 - 返回对象带 `source` 字段，便于审计真实来源和 fallback 来源。
 - 审批通过后进入交通订单创建、酒店库存锁定和酒店订单创建，审批驳回则停止下单。
 - 下单后支持取消补偿：先取消交通订单和酒店订单，再释放酒店库存。
+- 改签/退订准备支持退款预估、交通改签、酒店改期和改签手续费记录；真实系统未配置时使用 mock fallback。
+- 日历同步支持订单完成、改签和取消后的企业日历更新；真实系统未配置时使用 mock fallback。
 - 会话可持久化到 SQLite，后续可替换为生产数据库或工作流引擎。
 - 锁库存后、下单前执行价格校验；价格变化时进入二次确认。
 - 订单创建后可刷新订单状态，便于后续接入异步轮询。
@@ -112,10 +114,11 @@ Order Tool 创建订单
 - 关键状态可触发通知/待办回调，并通过 `notification_keys` 幂等去重。
 - 通知失败不会阻断主流程，会记录失败、重试次数和死信状态。
 - worker 每轮执行会落库运行摘要，支持后续排查扫描数、推进数、跳过数和错误会话。
+- 子 Agent 每次执行会写入 `AgentExecutionRecord`，记录 Agent 名称、动作、状态、输入/输出引用、说明和时间，形成跨 Agent 审计视图。
 - 达到重试上限的通知可查询并人工重放，重放失败后会重新进入可重试队列。
 - 异常恢复会通过 `workflow_generation` 开启新一轮流程，避免重新提交时复用上一轮审批、库存、订单和通知幂等键。
 
-第一阶段历史范围曾暂不包含真实库存、真实 OA、订单创建、补偿和多 Agent。当前实现已推进到真实系统适配、酒店 + 交通组合下单、异常恢复、通知死信和观测能力；剩余未完成的主线是多 Agent 协作雏形、改签/退订、日历同步和生产级指标出口。
+第一阶段历史范围曾暂不包含真实库存、真实 OA、订单创建、补偿和多 Agent。当前实现已推进到真实系统适配、酒店 + 交通组合下单、异常恢复、通知死信、多 Agent 协作深化、改签/退订准备和日历同步；剩余未完成的主线是生产级指标出口、评测集和更深的改签审批联动。
 
 ## 4. 单 Agent 架构
 
@@ -232,6 +235,8 @@ USER_CANCELLED：用户取消，补偿动作已尽量执行
 - 下单失败：取消失败订单、释放库存、撤回审批关联，再重新规划。
 - 用户取消：终止流程并记录取消原因。
 - 完成后取消：取消订单，释放库存，并保留补偿结果用于审计。
+- 取消前退款预估：按酒店和交通订单分别调用退款预估工具，记录可退金额、手续费和规则说明。
+- 改签/改期：对已创建订单调用交通改签和酒店改期工具，记录 `ChangeRecord`，并在子 Agent 执行摘要中保留输入/输出引用。
 - 订单状态变化：刷新订单状态并保存到会话，后续可由调度器定时执行。
 
 恢复流程：
@@ -296,6 +301,7 @@ APPROVAL_CREATED
 src/travel_agent/
   ├─ agent.py       单 Agent 编排和任务规划
   ├─ config.py      真实系统接入配置
+  ├─ domain_agents.py 多 Agent 协作雏形，封装策略、酒店、交通、审批、预订等领域 Agent
   ├─ integrations.py 真实系统 HTTP 适配与 mock fallback
   ├─ models.py      请求、政策、酒店、审批、上下文数据模型
   ├─ state.py       工作流状态机
@@ -323,6 +329,31 @@ COMPLETED
 ```
 
 交通订单先于酒店订单创建，因此价格变化、库存失效、用户取消或订单失败时，补偿逻辑会优先取消交通订单，再处理酒店订单和库存释放。
+
+改签/退订准备链路：
+
+```text
+COMPLETED / ORDER_CREATED
+  ├─ estimate_refund(transport)
+  ├─ change_transport_order
+  ├─ estimate_refund(hotel)
+  └─ change_hotel_order
+```
+
+退款预估会生成 `RefundEstimate`，改签/改期会生成 `ChangeRecord`，两者均写入 `TravelContext` 并可持久化到 SQLite。
+
+日历同步链路：
+
+```text
+COMPLETED / ORDER_CREATED / USER_CANCELLED
+  ↓
+sync_calendar
+  ├─ TRIP_BOOKED
+  ├─ TRIP_CHANGED
+  └─ TRIP_CANCELLED
+```
+
+日历同步会生成 `CalendarSyncRecord`，记录事件类型、同步状态、日历事件 ID、时间范围和来源；改签后的日历时间优先使用最近一次酒店改期结果。
 
 运行方式：
 
@@ -376,18 +407,29 @@ python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --reselect
 python -m unittest discover -s tests
 ```
 
-## 9. 下一阶段推进
+## 9. 多 Agent 协作深化
 
-下一阶段进入多 Agent 协作雏形，但会保持当前 CLI、状态机、Tool Gateway 和测试入口兼容。
+当前已完成多 Agent 协作深化，并保持 CLI、状态机、Tool Gateway 和测试入口兼容。`TravelAgent` 仍是对外 facade，同时承担第一版 Orchestrator 职责；内部通过 `AgentTeam` 持有各领域子 Agent。
 
-计划拆分：
+已拆分：
 
-- `OrchestratorAgent`：负责总流程、状态推进和异常恢复决策。
-- `PolicyAgent`：负责酒店政策、交通政策和合规解释。
-- `HotelAgent`：负责酒店查询、库存锁定、价格校验和酒店补偿。
-- `TransportAgent`：负责机票/火车票查询、交通订单和交通补偿。
-- `ApprovalAgent`：负责 OA 审批创建、状态跟踪和撤回。
-- `BookingAgent`：负责组合下单顺序、订单状态同步和跨域补偿编排。
+- `TravelAgent`：对外 facade 和当前 Orchestrator，负责状态机、会话持久化、通知、恢复流程入口。
+- `PolicyAgent`：负责酒店政策和交通政策检查。
+- `ItineraryAgent`：负责行程草案生成。
+- `HotelAgent`：负责酒店查询、库存锁定、价格校验和库存补偿工具调用。
+- `TransportAgent`：负责机票/火车票查询、交通订单、状态刷新和交通补偿工具调用。
+- `ApprovalAgent`：负责 OA 审批创建、状态跟踪和撤回工具调用。
+- `BookingAgent`：负责酒店订单创建、订单状态同步和酒店订单补偿工具调用。
+
+已落地的深化点：
+
+- `TravelContext.agent_executions` 持久化子 Agent 执行摘要，SQLite round-trip 后仍可追踪。
+- CLI 输出 `Agent 执行摘要`，便于排查一次流程中各领域 Agent 的执行顺序和结果。
+- 价格变化拒绝、用户取消、异常恢复中的交通订单取消、酒店订单取消、库存释放和审批撤回，均由对应子 Agent 执行。
+- 订单状态刷新通过 `TransportAgent.refresh_order` 和 `BookingAgent.refresh_hotel_order` 完成，并保留旧订单金额，兼容只返回状态的真实系统。
+- 异常恢复重规划阶段通过 `PolicyAgent`、`ItineraryAgent`、`HotelAgent`、`TransportAgent` 重新补齐政策、行程和库存候选。
+- 改签和退订准备通过 `TransportAgent`、`BookingAgent` 生成退款预估与改签记录，保持与现有 Orchestrator/facade 兼容。
+- 日历同步通过 `TravelAgent.sync_calendar` 暴露，支持完成、改签和取消三类事件，并保留 mock/真实系统来源。
 
 落地原则：
 
@@ -395,3 +437,10 @@ python -m unittest discover -s tests
 - 所有子 Agent 仍通过 `ToolGateway` 调用业务工具。
 - `TravelContext` 仍作为共享工作流上下文，避免引入不必要的数据迁移。
 - 保持现有 `TravelAgent` facade，确保 CLI 和测试不用大规模改造。
+
+下一阶段主线：
+
+- 指标出口：将 worker 运行摘要、死信、Agent 执行摘要和日历同步状态导出到 Prometheus/OpenTelemetry。
+- 日历同步深化：将日历同步失败纳入独立重试/死信机制，并支持取消会议、更新参会人。
+- 改签/退订深化：改签审批联动、退款确认支付和供应商失败补偿。
+- 评测集：覆盖政策超标、审批驳回、价格变化、库存失效、订单失败、改签失败等场景。

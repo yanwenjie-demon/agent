@@ -96,6 +96,46 @@ def parse_args() -> argparse.Namespace:
         help="Load a persisted session id and refresh order status.",
     )
     parser.add_argument(
+        "--estimate-refund-session",
+        default=None,
+        help="Load a persisted session id and estimate hotel/transport refund before cancellation.",
+    )
+    parser.add_argument(
+        "--change-session",
+        default=None,
+        help="Load a persisted completed session id and change transport and/or hotel order.",
+    )
+    parser.add_argument(
+        "--new-depart-at",
+        default=None,
+        help="New transport departure time for --change-session.",
+    )
+    parser.add_argument(
+        "--new-check-in",
+        default=None,
+        help="New hotel check-in date yyyy-mm-dd for --change-session.",
+    )
+    parser.add_argument(
+        "--new-check-out",
+        default=None,
+        help="New hotel check-out date yyyy-mm-dd for --change-session.",
+    )
+    parser.add_argument(
+        "--change-reason",
+        default="user_change_requested",
+        help="Change reason passed to refund estimate and change tools.",
+    )
+    parser.add_argument(
+        "--sync-calendar-session",
+        default=None,
+        help="Load a persisted session id and sync booked/changed/cancelled travel to calendar.",
+    )
+    parser.add_argument(
+        "--calendar-event-type",
+        default=None,
+        help="Optional calendar event type override for --sync-calendar-session.",
+    )
+    parser.add_argument(
         "--run-worker-once",
         action="store_true",
         help="Scan persisted sessions and advance approval/order workflows once.",
@@ -221,6 +261,30 @@ def main() -> None:
         context = agent.get_session(args.refresh_order_session)
         context = agent.refresh_order_status(context)
         context = agent.notify_current_state(context)
+        print(render_context(context))
+        return
+    if args.estimate_refund_session:
+        context = agent.get_session(args.estimate_refund_session)
+        context = agent.estimate_cancellation_refund(context, args.cancel_reason)
+        print(render_context(context))
+        return
+    if args.change_session:
+        context = agent.get_session(args.change_session)
+        new_check_in = date.fromisoformat(args.new_check_in) if args.new_check_in else None
+        new_check_out = date.fromisoformat(args.new_check_out) if args.new_check_out else None
+        context = agent.change_trip(
+            context,
+            new_depart_at=args.new_depart_at,
+            new_check_in=new_check_in,
+            new_check_out=new_check_out,
+            reason=args.change_reason,
+        )
+        context = agent.notify_current_state(context)
+        print(render_context(context))
+        return
+    if args.sync_calendar_session:
+        context = agent.get_session(args.sync_calendar_session)
+        context = agent.sync_calendar(context, args.calendar_event_type)
         print(render_context(context))
         return
     if args.cancel_session:
@@ -353,17 +417,22 @@ def _replace_session_db(settings: IntegrationSettings, session_db_path: str) -> 
         order_api_url=settings.order_api_url,
         order_status_api_url=settings.order_status_api_url,
         order_cancel_api_url=settings.order_cancel_api_url,
+        refund_estimate_api_url=settings.refund_estimate_api_url,
+        hotel_change_api_url=settings.hotel_change_api_url,
         transport_inventory_api_url=settings.transport_inventory_api_url,
         transport_order_api_url=settings.transport_order_api_url,
         transport_order_status_api_url=settings.transport_order_status_api_url,
         transport_order_cancel_api_url=settings.transport_order_cancel_api_url,
+        transport_change_api_url=settings.transport_change_api_url,
         notification_api_url=settings.notification_api_url,
+        calendar_api_url=settings.calendar_api_url,
         policy_api_token=settings.policy_api_token,
         transport_api_token=settings.transport_api_token,
         hotel_inventory_api_token=settings.hotel_inventory_api_token,
         oa_approval_api_token=settings.oa_approval_api_token,
         order_api_token=settings.order_api_token,
         notification_api_token=settings.notification_api_token,
+        calendar_api_token=settings.calendar_api_token,
         use_mock_fallback=settings.use_mock_fallback,
         notification_use_mock_fallback=settings.notification_use_mock_fallback,
         timeout_seconds=settings.timeout_seconds,
@@ -582,6 +651,30 @@ def render_context(context: TravelContext) -> str:
             ]
         )
 
+    if context.refund_estimates:
+        lines.extend(["", "退款预估:"])
+        for estimate in context.refund_estimates:
+            lines.append(
+                f"- {estimate.target_type} {estimate.target_id} | 可退 {estimate.refundable_amount} "
+                f"{estimate.currency} | 手续费 {estimate.penalty_amount} | 来源 {estimate.source}"
+            )
+
+    if context.change_records:
+        lines.extend(["", "改签记录:"])
+        for record in context.change_records:
+            lines.append(
+                f"- {record.target_type} {record.target_id} | {record.status} | "
+                f"手续费 {record.penalty_amount} {record.currency} | 来源 {record.source}"
+            )
+
+    if context.calendar_syncs:
+        lines.extend(["", "日历同步:"])
+        for record in context.calendar_syncs:
+            lines.append(
+                f"- {record.event_type} | {record.calendar_event_id} | {record.status} | "
+                f"{record.start_at}->{record.end_at} | 来源 {record.source}"
+            )
+
     if context.notifications:
         lines.extend(["", "通知:"])
         for notification in context.notifications:
@@ -596,6 +689,14 @@ def render_context(context: TravelContext) -> str:
             lines.append(
                 f"- {record.recovery_id} | {record.action} | {record.from_state}->{record.to_state} | "
                 f"原因 {record.reason} | 来源 {record.source}"
+            )
+
+    if context.agent_executions:
+        lines.extend(["", "Agent 执行摘要:"])
+        for record in context.agent_executions:
+            lines.append(
+                f"- {record.agent_name}.{record.action} | {record.status} | "
+                f"轮次 {record.input_refs.get('workflow_generation', '-')} | {record.message}"
             )
 
     lines.extend(["", "事件:"])

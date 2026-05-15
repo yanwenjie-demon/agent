@@ -11,8 +11,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from travel_agent.agent import build_default_agent
-from travel_agent.cli import render_dead_letters, render_metrics, render_worker_runs
+from travel_agent.cli import render_context, render_dead_letters, render_metrics, render_worker_runs
 from travel_agent.config import IntegrationSettings
+from travel_agent.domain_agents import ApprovalAgent, BookingAgent, HotelAgent, PolicyAgent, TransportAgent
 from travel_agent.integrations import IntegrationError
 from travel_agent.models import DeadLetterNotification, NotificationRecord, TravelRequest, WorkerRunRecord
 from travel_agent.state import TravelState
@@ -83,6 +84,56 @@ class TravelAgentFlowTest(unittest.TestCase):
         self.assertEqual(context.transport_order_cancellation.status, "CANCELLED")
         self.assertEqual(context.inventory_release.status, "RELEASED")
 
+    def test_estimates_refund_before_cancellation(self) -> None:
+        agent = build_default_agent()
+        context = agent.estimate_cancellation_refund(agent.run_to_order(_request()), "meeting_cancelled")
+
+        self.assertEqual(len(context.refund_estimates), 2)
+        self.assertEqual({estimate.target_type for estimate in context.refund_estimates}, {"hotel", "transport"})
+        self.assertTrue(all(estimate.refundable_amount > 0 for estimate in context.refund_estimates))
+
+    def test_change_trip_records_transport_and_hotel_changes(self) -> None:
+        agent = build_default_agent()
+        context = agent.change_trip(
+            agent.run_to_order(_request()),
+            new_depart_at="2026-06-03T13:00:00+08:00",
+            new_check_in=date(2026, 6, 4),
+            new_check_out=date(2026, 6, 6),
+            reason="meeting_rescheduled",
+        )
+
+        self.assertEqual(len(context.change_records), 2)
+        self.assertEqual({record.target_type for record in context.change_records}, {"hotel", "transport"})
+        self.assertEqual({record.status for record in context.change_records}, {"CHANGED"})
+        actions = {(record.agent_name, record.action) for record in context.agent_executions}
+        self.assertIn(("TransportAgent", "change_transport_order"), actions)
+        self.assertIn(("BookingAgent", "change_hotel_order"), actions)
+
+    def test_syncs_calendar_for_completed_changed_and_cancelled_trip(self) -> None:
+        agent = build_default_agent()
+        completed = agent.sync_calendar(agent.run_to_order(_request()))
+
+        self.assertEqual(completed.calendar_syncs[-1].event_type, "TRIP_BOOKED")
+        self.assertEqual(completed.calendar_syncs[-1].status, "SYNCED")
+
+        changed = agent.change_trip(
+            completed,
+            new_depart_at="2026-06-03T13:00:00+08:00",
+            new_check_in=date(2026, 6, 4),
+            new_check_out=date(2026, 6, 6),
+            reason="meeting_rescheduled",
+        )
+        changed = agent.sync_calendar(changed)
+
+        self.assertEqual(changed.calendar_syncs[-1].event_type, "TRIP_CHANGED")
+        self.assertEqual(changed.calendar_syncs[-1].start_at, "2026-06-04")
+        self.assertEqual(changed.calendar_syncs[-1].end_at, "2026-06-06")
+
+        cancelled = agent.cancel_trip(changed, "meeting_cancelled")
+        cancelled = agent.sync_calendar(cancelled)
+
+        self.assertEqual(cancelled.calendar_syncs[-1].event_type, "TRIP_CANCELLED")
+
     def test_notify_current_state_is_idempotent(self) -> None:
         agent = build_default_agent()
         context = agent.run_to_order(_request())
@@ -101,6 +152,54 @@ class TravelAgentFlowTest(unittest.TestCase):
         self.assertFalse(context.policy_result.compliant)
         self.assertEqual(context.policy_result.approved_budget, 650)
         self.assertTrue(all(hotel.nightly_price <= 650 for hotel in context.hotel_options if hotel.policy_compliant))
+
+
+class MultiAgentStructureTest(unittest.TestCase):
+    def test_default_agent_uses_domain_agent_team(self) -> None:
+        agent = build_default_agent()
+
+        self.assertIsInstance(agent.agent_team.policy, PolicyAgent)
+        self.assertIsInstance(agent.agent_team.hotel, HotelAgent)
+        self.assertIsInstance(agent.agent_team.transport, TransportAgent)
+        self.assertIsInstance(agent.agent_team.approval, ApprovalAgent)
+        self.assertIsInstance(agent.agent_team.booking, BookingAgent)
+
+    def test_domain_agents_append_auditable_events(self) -> None:
+        agent = build_default_agent()
+        context = agent.run_to_order(_request())
+
+        self.assertTrue(any("PolicyAgent completed" in event for event in context.events))
+        self.assertTrue(any("HotelAgent searched" in event for event in context.events))
+        self.assertTrue(any("TransportAgent created transport order" in event for event in context.events))
+        self.assertTrue(any("ApprovalAgent created approval" in event for event in context.events))
+        self.assertTrue(any("BookingAgent created hotel order" in event for event in context.events))
+
+    def test_domain_agents_record_execution_summaries(self) -> None:
+        agent = build_default_agent()
+        context = agent.run_to_order(_request())
+
+        actions = {(record.agent_name, record.action) for record in context.agent_executions}
+
+        self.assertIn(("PolicyAgent", "check_policies"), actions)
+        self.assertIn(("ItineraryAgent", "plan_itinerary"), actions)
+        self.assertIn(("HotelAgent", "search_hotels"), actions)
+        self.assertIn(("TransportAgent", "create_transport_order"), actions)
+        self.assertIn(("ApprovalAgent", "create_approval"), actions)
+        self.assertIn(("BookingAgent", "create_order"), actions)
+        self.assertTrue(all(record.input_refs["workflow_generation"] == 1 for record in context.agent_executions))
+
+    def test_cancel_trip_records_compensation_execution_summaries(self) -> None:
+        agent = build_default_agent()
+        context = agent.cancel_trip(agent.run_to_order(_request()), "meeting_cancelled")
+
+        actions = {(record.agent_name, record.action) for record in context.agent_executions}
+
+        self.assertIn(("TransportAgent", "cancel_transport_order"), actions)
+        self.assertIn(("BookingAgent", "cancel_order"), actions)
+        self.assertIn(("HotelAgent", "release_hotel_inventory"), actions)
+        self.assertEqual(context.order_cancellation.status, "CANCELLED")
+        self.assertEqual(context.transport_order_cancellation.status, "CANCELLED")
+        self.assertEqual(context.inventory_release.status, "RELEASED")
 
 
 class IntegrationAdapterTest(unittest.TestCase):
@@ -411,6 +510,89 @@ class IntegrationAdapterTest(unittest.TestCase):
         self.assertEqual(context.order.source, "real")
         self.assertEqual(context.transport_order.source, "real")
 
+    def test_uses_real_http_integrations_for_refund_and_change(self) -> None:
+        http = StubHttpClient(
+            _remote_order_responses()
+            | {
+                "https://refund.example/estimate": {
+                    "refund_estimate": {
+                        "estimate_id": "REMOTE-RFD-1",
+                        "target_type": "hotel",
+                        "target_id": "REMOTE-ORDER-1",
+                        "refundable_amount": 1000,
+                        "penalty_amount": 320,
+                        "currency": "CNY",
+                        "rules": ["remote refund rule"],
+                    }
+                },
+                "https://transport.example/change": {
+                    "change": {
+                        "change_id": "REMOTE-TCHG-1",
+                        "target_type": "transport",
+                        "target_id": "REMOTE-TRANSPORT-ORDER-1",
+                        "status": "CHANGED",
+                        "penalty_amount": 120,
+                        "currency": "CNY",
+                    }
+                },
+                "https://hotel.example/change": {
+                    "change": {
+                        "change_id": "REMOTE-HCHG-1",
+                        "target_type": "hotel",
+                        "target_id": "REMOTE-ORDER-1",
+                        "status": "CHANGED",
+                        "penalty_amount": 80,
+                        "currency": "CNY",
+                    }
+                },
+            }
+        )
+        settings = _remote_order_settings(
+            refund_estimate_api_url="https://refund.example/estimate",
+            transport_change_api_url="https://transport.example/change",
+            hotel_change_api_url="https://hotel.example/change",
+        )
+
+        agent = build_default_agent(settings=settings, http_client=http)
+        context = agent.change_trip(
+            agent.run_to_order(_request()),
+            new_depart_at="2026-06-03T13:00:00+08:00",
+            new_check_in=date(2026, 6, 4),
+            new_check_out=date(2026, 6, 6),
+            reason="meeting_rescheduled",
+        )
+
+        self.assertEqual(context.refund_estimates[0].source, "real")
+        self.assertEqual(context.change_records[0].source, "real")
+        self.assertEqual(context.change_records[1].source, "real")
+        self.assertEqual(context.change_records[0].change_id, "REMOTE-TCHG-1")
+        self.assertEqual(context.change_records[1].change_id, "REMOTE-HCHG-1")
+
+    def test_uses_real_http_integration_for_calendar_sync(self) -> None:
+        http = StubHttpClient(
+            _remote_order_responses()
+            | {
+                "https://calendar.example/sync": {
+                    "calendar": {
+                        "calendar_event_id": "REMOTE-CAL-1",
+                        "event_type": "TRIP_BOOKED",
+                        "status": "SYNCED",
+                        "user_id": "u-demo",
+                        "title": "remote calendar",
+                        "start_at": "2026-06-03",
+                        "end_at": "2026-06-05",
+                    }
+                }
+            }
+        )
+        settings = _remote_order_settings(calendar_api_url="https://calendar.example/sync")
+
+        agent = build_default_agent(settings=settings, http_client=http)
+        context = agent.sync_calendar(agent.run_to_order(_request()))
+
+        self.assertEqual(context.calendar_syncs[-1].source, "real")
+        self.assertEqual(context.calendar_syncs[-1].calendar_event_id, "REMOTE-CAL-1")
+
     def test_uses_real_http_integration_for_notifications(self) -> None:
         http = StubHttpClient(
             _remote_order_responses()
@@ -697,6 +879,10 @@ class IntegrationAdapterTest(unittest.TestCase):
         self.assertIsNone(replanned.approval)
         self.assertIn("inventory_release", replanned.recovery_records[0].payload["compensations"])
         self.assertIn("approval_cancellation", replanned.recovery_records[0].payload["compensations"])
+        actions = {(record.agent_name, record.action) for record in replanned.agent_executions}
+        self.assertIn(("HotelAgent", "release_hotel_inventory"), actions)
+        self.assertIn(("ApprovalAgent", "cancel_approval"), actions)
+        self.assertIn(("HotelAgent", "search_hotels"), actions)
 
     def test_replans_after_order_failed_cancels_order_and_uses_new_idempotency_key(self) -> None:
         http = CapturingHttpClient(
@@ -799,6 +985,25 @@ class SessionStoreTest(unittest.TestCase):
             self.assertEqual(reloaded.selected_transport.transport_id, context.selected_transport.transport_id)
             self.assertEqual(reloaded.order.order_id, context.order.order_id)
             self.assertEqual(reloaded.transport_order.order_id, context.transport_order.order_id)
+            self.assertEqual(len(reloaded.agent_executions), len(context.agent_executions))
+            self.assertEqual(reloaded.agent_executions[-1].agent_name, "BookingAgent")
+            self.assertEqual(reloaded.agent_executions[-1].action, "create_order")
+
+            changed = agent.change_trip(
+                context,
+                new_depart_at="2026-06-03T13:00:00+08:00",
+                new_check_in=date(2026, 6, 4),
+                new_check_out=date(2026, 6, 6),
+                reason="meeting_rescheduled",
+            )
+            changed_reloaded = SQLiteSessionStore(db_path).get(changed.session_id)
+            self.assertEqual(len(changed_reloaded.refund_estimates), 2)
+            self.assertEqual(len(changed_reloaded.change_records), 2)
+
+            synced = agent.sync_calendar(changed)
+            synced_reloaded = SQLiteSessionStore(db_path).get(synced.session_id)
+            self.assertEqual(len(synced_reloaded.calendar_syncs), 1)
+            self.assertEqual(synced_reloaded.calendar_syncs[0].event_type, "TRIP_CHANGED")
 
     def test_sqlite_session_store_lists_by_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1007,6 +1212,31 @@ class WorkflowWorkerTest(unittest.TestCase):
 
 
 class CliRenderTest(unittest.TestCase):
+    def test_renders_agent_execution_summaries(self) -> None:
+        context = build_default_agent().run_to_order(_request())
+
+        rendered = render_context(context)
+
+        self.assertIn("Agent 执行摘要:", rendered)
+        self.assertIn("PolicyAgent.check_policies", rendered)
+        self.assertIn("BookingAgent.create_order", rendered)
+
+    def test_renders_refund_estimates_and_change_records(self) -> None:
+        agent = build_default_agent()
+        context = agent.change_trip(
+            agent.run_to_order(_request()),
+            new_depart_at="2026-06-03T13:00:00+08:00",
+            new_check_in=date(2026, 6, 4),
+            new_check_out=date(2026, 6, 6),
+        )
+        context = agent.sync_calendar(context)
+
+        rendered = render_context(context)
+
+        self.assertIn("退款预估:", rendered)
+        self.assertIn("改签记录:", rendered)
+        self.assertIn("日历同步:", rendered)
+
     def test_renders_worker_runs_dead_letters_and_metrics(self) -> None:
         worker_run = WorkerRunRecord(
             run_id="WRK-1",

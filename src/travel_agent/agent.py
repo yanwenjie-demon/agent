@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import asdict, replace
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Optional
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from .config import IntegrationSettings
+from .domain_agents import AgentTeam, build_agent_team
 from .integrations import HttpJsonClient, TravelSystemIntegrations
 from .mock_tools import plan_itinerary
 from .models import HotelOption, NotificationRecord, RecoveryRecord, Task, TaskPlan, TravelContext, TravelRequest, TransportOption
@@ -101,11 +102,13 @@ class TravelAgent:
         planner: Optional[SimpleTaskPlanner] = None,
         state_machine: Optional[WorkflowStateMachine] = None,
         session_store: Optional[SessionStore] = None,
+        agent_team: Optional[AgentTeam] = None,
     ) -> None:
         self.gateway = gateway
         self.planner = planner or SimpleTaskPlanner()
         self.state_machine = state_machine or WorkflowStateMachine()
         self.session_store = session_store or InMemorySessionStore()
+        self.agent_team = agent_team or build_agent_team(gateway)
 
     def plan(self, request: TravelRequest) -> TravelContext:
         context = TravelContext(
@@ -116,55 +119,16 @@ class TravelAgent:
         )
         context.append_event("Created travel planning session.")
 
-        policy = self.gateway.call(
-            "check_policy",
-            user_id=request.user_id,
-            destination_city=request.destination_city,
-            budget_per_night=request.budget_per_night,
-        )
-        context.policy_result = policy
+        context = self.agent_team.policy.check(context)
+        policy = context.policy_result
+        if policy is None:
+            raise ValueError("PolicyAgent did not return hotel policy.")
         self.state_machine.transition(context, TravelState.POLICY_CHECKED)
-
-        transport_policy = self.gateway.call(
-            "check_transport_policy",
-            user_id=request.user_id,
-            origin_city=request.origin_city,
-            destination_city=request.destination_city,
-            travel_date=request.start_date,
-        )
-        context.transport_policy_result = transport_policy
-
-        itinerary = self.gateway.call(
-            "plan_itinerary",
-            origin_city=request.origin_city,
-            destination_city=request.destination_city,
-            start_date=request.start_date,
-            end_date=request.end_date,
-            purpose=request.purpose,
-            venue=request.venue,
-        )
-        context.itinerary = itinerary
+        context = self.agent_team.itinerary.plan(context)
 
         max_price = self._effective_hotel_budget(request, policy.approved_budget)
-        hotels = self.gateway.call(
-            "search_hotels",
-            city=request.destination_city,
-            check_in=itinerary.check_in,
-            check_out=itinerary.check_out,
-            venue=request.venue,
-            max_price=max_price,
-            preferences=request.preferences,
-        )
-        context.hotel_options = hotels
-        transport_options = self.gateway.call(
-            "search_transport",
-            origin_city=request.origin_city,
-            destination_city=request.destination_city,
-            travel_date=request.start_date,
-            max_price=transport_policy.max_transport_price,
-            preferences=request.preferences,
-        )
-        context.transport_options = transport_options
+        context = self.agent_team.hotel.search(context, max_price)
+        context = self.agent_team.transport.search(context)
         self.state_machine.transition(context, TravelState.PLAN_GENERATED)
         self.session_store.save(context)
         return context
@@ -212,19 +176,7 @@ class TravelAgent:
         context.selected_transport = selected_transport
         self.state_machine.transition(context, TravelState.USER_CONFIRMED)
 
-        approval = self.gateway.call(
-            "create_approval",
-            session_id=context.session_id,
-            user_id=context.request.user_id,
-            request=asdict(context.request),
-            policy=asdict(context.policy_result) if context.policy_result else {},
-            transport_policy=asdict(context.transport_policy_result) if context.transport_policy_result else {},
-            itinerary=asdict(context.itinerary) if context.itinerary else {},
-            selected_hotel=asdict(selected_hotel),
-            selected_transport=asdict(selected_transport),
-            workflow_generation=context.workflow_generation,
-        )
-        context.approval = approval
+        context = self.agent_team.approval.create(context)
         self.state_machine.transition(context, TravelState.APPROVAL_CREATED)
         self.session_store.save(context)
         return context
@@ -242,12 +194,8 @@ class TravelAgent:
         if context.approval is None:
             raise ValueError("Approval must be created before status refresh.")
 
-        approval = self.gateway.call(
-            "get_approval_status",
-            approval_id=context.approval.approval_id,
-            user_id=context.request.user_id,
-        )
-        context.approval = approval
+        context = self.agent_team.approval.refresh(context)
+        approval = context.approval
         status = self._normalize_status(approval.status)
 
         if status in {"APPROVED", "PASS", "PASSED"}:
@@ -281,16 +229,8 @@ class TravelAgent:
             self.session_store.save(context)
             return context
 
-        inventory_lock = self.gateway.call(
-            "lock_hotel_inventory",
-            session_id=context.session_id,
-            user_id=context.request.user_id,
-            selected_hotel=asdict(context.selected_hotel),
-            check_in=context.itinerary.check_in,
-            check_out=context.itinerary.check_out,
-            workflow_generation=context.workflow_generation,
-        )
-        context.inventory_lock = inventory_lock
+        context = self.agent_team.hotel.lock_inventory(context)
+        inventory_lock = context.inventory_lock
         if self._normalize_status(inventory_lock.status) not in {"LOCKED", "HELD"}:
             raise ValueError(f"Hotel inventory was not locked: {inventory_lock.status}")
         self.state_machine.transition(context, TravelState.INVENTORY_LOCKED)
@@ -312,14 +252,8 @@ class TravelAgent:
         if context.policy_result is None:
             raise ValueError("Policy result is required before price verification.")
 
-        price_check = self.gateway.call(
-            "verify_hotel_price",
-            selected_hotel=asdict(context.selected_hotel),
-            max_price=context.policy_result.approved_budget,
-            check_in=context.itinerary.check_in,
-            check_out=context.itinerary.check_out,
-        )
-        context.price_check = price_check
+        context = self.agent_team.hotel.verify_price(context)
+        price_check = context.price_check
         price_status = self._normalize_status(price_check.status)
         if price_status in {"SOLD_OUT", "UNAVAILABLE", "INVENTORY_EXPIRED", "NO_INVENTORY"}:
             self.state_machine.transition(context, TravelState.INVENTORY_EXPIRED)
@@ -340,28 +274,18 @@ class TravelAgent:
             raise ValueError("Price check result is required.")
         if not accept:
             if context.transport_order is not None and not self._compensation_done(context.transport_order_cancellation):
-                transport_cancellation = self.gateway.call(
-                    "cancel_transport_order",
-                    order_id=context.transport_order.order_id,
-                    user_id=context.request.user_id,
-                    reason="price_change_rejected",
-                )
-                context.transport_order_cancellation = transport_cancellation
-                context.append_event(
-                    "Compensation completed: "
-                    f"cancel_transport_order {transport_cancellation.target_id} -> {transport_cancellation.status}."
-                )
+                transport_cancellation = self.agent_team.transport.cancel_order(context, "price_change_rejected")
+                if transport_cancellation is not None:
+                    context.append_event(
+                        "Compensation completed: "
+                        f"cancel_transport_order {transport_cancellation.target_id} -> {transport_cancellation.status}."
+                    )
             if context.inventory_lock is not None and not self._compensation_done(context.inventory_release):
-                release = self.gateway.call(
-                    "release_hotel_inventory",
-                    lock_id=context.inventory_lock.lock_id,
-                    user_id=context.request.user_id,
-                    reason="price_change_rejected",
-                )
-                context.inventory_release = release
-                context.append_event(
-                    f"Compensation completed: release_hotel_inventory {release.target_id} -> {release.status}."
-                )
+                release = self.agent_team.hotel.release_inventory(context, "price_change_rejected")
+                if release is not None:
+                    context.append_event(
+                        f"Compensation completed: release_hotel_inventory {release.target_id} -> {release.status}."
+                    )
             self.state_machine.transition(context, TravelState.USER_CANCELLED)
             self.session_store.save(context)
             return context
@@ -387,16 +311,10 @@ class TravelAgent:
             context.append_event("Transport booking skipped: no selected transport.")
             return context
 
-        transport_order = self.gateway.call(
-            "create_transport_order",
-            session_id=context.session_id,
-            user_id=context.request.user_id,
-            request=asdict(context.request),
-            selected_transport=asdict(context.selected_transport),
-            approval=asdict(context.approval),
-            workflow_generation=context.workflow_generation,
-        )
-        context.transport_order = transport_order
+        context = self.agent_team.transport.create_order(context)
+        transport_order = context.transport_order
+        if transport_order is None:
+            return context
         transport_status = self._normalize_status(transport_order.status)
         if transport_status not in {"CREATED", "CONFIRMED", "SUCCESS", "PAID"}:
             self.state_machine.transition(context, TravelState.ORDER_FAILED)
@@ -415,18 +333,8 @@ class TravelAgent:
         if context.inventory_lock is None:
             raise ValueError("Inventory lock is required before order creation.")
 
-        order = self.gateway.call(
-            "create_order",
-            session_id=context.session_id,
-            user_id=context.request.user_id,
-            request=asdict(context.request),
-            itinerary=asdict(context.itinerary),
-            selected_hotel=asdict(context.selected_hotel),
-            approval=asdict(context.approval),
-            inventory_lock=asdict(context.inventory_lock),
-            workflow_generation=context.workflow_generation,
-        )
-        context.order = order
+        context = self.agent_team.booking.create_hotel_order(context)
+        order = context.order
         order_status = self._normalize_status(order.status)
         if order_status in {"CREATED", "CONFIRMED", "SUCCESS", "PAID"}:
             self.state_machine.transition(context, TravelState.ORDER_CREATED)
@@ -441,14 +349,8 @@ class TravelAgent:
         if context.order is None:
             raise ValueError("Order must be created before status refresh.")
         if context.transport_order is not None:
-            refreshed_transport = self.gateway.call(
-                "get_transport_order_status",
-                order_id=context.transport_order.order_id,
-                user_id=context.request.user_id,
-            )
-            if refreshed_transport.total_amount == 0:
-                refreshed_transport = self._merge_transport_order_status(context.transport_order, refreshed_transport)
-            context.transport_order = refreshed_transport
+            context = self.agent_team.transport.refresh_order(context)
+            refreshed_transport = context.transport_order
             transport_status = self._normalize_status(refreshed_transport.status)
             if transport_status in {"CANCELLED", "CANCELED"}:
                 self.state_machine.transition(context, TravelState.USER_CANCELLED)
@@ -459,14 +361,8 @@ class TravelAgent:
                 self.session_store.save(context)
                 return context
 
-        refreshed = self.gateway.call(
-            "get_order_status",
-            order_id=context.order.order_id,
-            user_id=context.request.user_id,
-        )
-        if refreshed.total_amount == 0:
-            refreshed = self._merge_order_status(context.order, refreshed)
-        context.order = refreshed
+        context = self.agent_team.booking.refresh_hotel_order(context)
+        refreshed = context.order
         order_status = self._normalize_status(refreshed.status)
         if order_status in {"CANCELLED", "CANCELED"}:
             self.state_machine.transition(context, TravelState.USER_CANCELLED)
@@ -517,60 +413,40 @@ class TravelAgent:
             and context.transport_order is not None
             and not self._compensation_done(context.transport_order_cancellation)
         ):
-            transport_cancellation = self.gateway.call(
-                "cancel_transport_order",
-                order_id=context.transport_order.order_id,
-                user_id=context.request.user_id,
-                reason=reason,
-            )
-            context.transport_order_cancellation = transport_cancellation
-            compensation_payload["transport_order_cancellation"] = asdict(transport_cancellation)
-            context.append_event(
-                "Recovery compensation completed: "
-                f"cancel_transport_order {transport_cancellation.target_id} -> {transport_cancellation.status}."
-            )
+            transport_cancellation = self.agent_team.transport.cancel_order(context, reason)
+            if transport_cancellation is not None:
+                compensation_payload["transport_order_cancellation"] = asdict(transport_cancellation)
+                context.append_event(
+                    "Recovery compensation completed: "
+                    f"cancel_transport_order {transport_cancellation.target_id} -> {transport_cancellation.status}."
+                )
 
         if cancel_order and context.order is not None and not self._compensation_done(context.order_cancellation):
-            cancellation = self.gateway.call(
-                "cancel_order",
-                order_id=context.order.order_id,
-                user_id=context.request.user_id,
-                reason=reason,
-            )
-            context.order_cancellation = cancellation
-            compensation_payload["order_cancellation"] = asdict(cancellation)
-            context.append_event(
-                f"Recovery compensation completed: cancel_order {cancellation.target_id} -> {cancellation.status}."
-            )
+            cancellation = self.agent_team.booking.cancel_hotel_order(context, reason)
+            if cancellation is not None:
+                compensation_payload["order_cancellation"] = asdict(cancellation)
+                context.append_event(
+                    f"Recovery compensation completed: cancel_order {cancellation.target_id} -> {cancellation.status}."
+                )
 
         if release_inventory and context.inventory_lock is not None and not self._compensation_done(context.inventory_release):
-            release = self.gateway.call(
-                "release_hotel_inventory",
-                lock_id=context.inventory_lock.lock_id,
-                user_id=context.request.user_id,
-                reason=reason,
-            )
-            context.inventory_release = release
-            compensation_payload["inventory_release"] = asdict(release)
-            context.append_event(
-                f"Recovery compensation completed: release_hotel_inventory {release.target_id} -> {release.status}."
-            )
+            release = self.agent_team.hotel.release_inventory(context, reason)
+            if release is not None:
+                compensation_payload["inventory_release"] = asdict(release)
+                context.append_event(
+                    f"Recovery compensation completed: release_hotel_inventory {release.target_id} -> {release.status}."
+                )
 
         if cancel_approval and context.approval is not None and not self._compensation_done(context.approval_cancellation):
             approval_status = self._normalize_status(context.approval.status)
             if approval_status not in {"REJECTED", "DENIED", "REFUSED", "CANCELLED", "CANCELED"}:
-                approval_cancellation = self.gateway.call(
-                    "cancel_approval",
-                    approval_id=context.approval.approval_id,
-                    user_id=context.request.user_id,
-                    reason=reason,
-                )
-                context.approval_cancellation = approval_cancellation
-                compensation_payload["approval_cancellation"] = asdict(approval_cancellation)
-                context.append_event(
-                    "Recovery compensation completed: "
-                    f"cancel_approval {approval_cancellation.target_id} -> {approval_cancellation.status}."
-                )
+                approval_cancellation = self.agent_team.approval.cancel(context, reason)
+                if approval_cancellation is not None:
+                    compensation_payload["approval_cancellation"] = asdict(approval_cancellation)
+                    context.append_event(
+                        "Recovery compensation completed: "
+                        f"cancel_approval {approval_cancellation.target_id} -> {approval_cancellation.status}."
+                    )
 
         context.workflow_generation += 1
         context.selected_hotel = None
@@ -585,50 +461,14 @@ class TravelAgent:
         context.transport_order_cancellation = None
         context.inventory_release = None
 
-        if context.policy_result is None:
-            context.policy_result = self.gateway.call(
-                "check_policy",
-                user_id=context.request.user_id,
-                destination_city=context.request.destination_city,
-                budget_per_night=context.request.budget_per_night,
-            )
-        if context.transport_policy_result is None:
-            context.transport_policy_result = self.gateway.call(
-                "check_transport_policy",
-                user_id=context.request.user_id,
-                origin_city=context.request.origin_city,
-                destination_city=context.request.destination_city,
-                travel_date=context.request.start_date,
-            )
+        if context.policy_result is None or context.transport_policy_result is None:
+            context = self.agent_team.policy.check(context)
         if context.itinerary is None:
-            context.itinerary = self.gateway.call(
-                "plan_itinerary",
-                origin_city=context.request.origin_city,
-                destination_city=context.request.destination_city,
-                start_date=context.request.start_date,
-                end_date=context.request.end_date,
-                purpose=context.request.purpose,
-                venue=context.request.venue,
-            )
+            context = self.agent_team.itinerary.plan(context)
 
         max_price = self._effective_hotel_budget(context.request, context.policy_result.approved_budget)
-        context.hotel_options = self.gateway.call(
-            "search_hotels",
-            city=context.request.destination_city,
-            check_in=context.itinerary.check_in,
-            check_out=context.itinerary.check_out,
-            venue=context.request.venue,
-            max_price=max_price,
-            preferences=context.request.preferences,
-        )
-        context.transport_options = self.gateway.call(
-            "search_transport",
-            origin_city=context.request.origin_city,
-            destination_city=context.request.destination_city,
-            travel_date=context.request.start_date,
-            max_price=context.transport_policy_result.max_transport_price,
-            preferences=context.request.preferences,
-        )
+        context = self.agent_team.hotel.search(context, max_price)
+        context = self.agent_team.transport.search(context)
         self.state_machine.transition(context, TravelState.PLAN_GENERATED)
         context.recovery_records.append(
             RecoveryRecord(
@@ -690,43 +530,90 @@ class TravelAgent:
         self.session_store.save(context)
         return context
 
+    def estimate_cancellation_refund(
+        self,
+        context: TravelContext,
+        reason: str = "user_cancelled",
+    ) -> TravelContext:
+        if context.order is None and context.transport_order is None:
+            raise ValueError("Refund estimate requires at least one created order.")
+
+        self.agent_team.transport.estimate_refund(context, reason)
+        self.agent_team.booking.estimate_refund(context, reason)
+        self.session_store.save(context)
+        return context
+
+    def change_trip(
+        self,
+        context: TravelContext,
+        new_depart_at: str | None = None,
+        new_check_in: date | None = None,
+        new_check_out: date | None = None,
+        reason: str = "user_change_requested",
+    ) -> TravelContext:
+        if context.state not in {TravelState.ORDER_CREATED.value, TravelState.COMPLETED.value}:
+            raise ValueError("Trip change requires ORDER_CREATED or COMPLETED state.")
+        if new_depart_at is None and (new_check_in is None or new_check_out is None):
+            raise ValueError("Trip change requires transport or hotel change details.")
+
+        if new_depart_at is not None:
+            self.agent_team.transport.estimate_refund(context, reason)
+            self.agent_team.transport.change_order(context, new_depart_at, reason)
+        if new_check_in is not None or new_check_out is not None:
+            if new_check_in is None or new_check_out is None:
+                raise ValueError("Hotel change requires both new_check_in and new_check_out.")
+            if new_check_out <= new_check_in:
+                raise ValueError("new_check_out must be later than new_check_in.")
+            self.agent_team.booking.estimate_refund(context, reason)
+            self.agent_team.booking.change_hotel_order(context, new_check_in, new_check_out, reason)
+
+        self.session_store.save(context)
+        return context
+
+    def sync_calendar(self, context: TravelContext, event_type: str | None = None) -> TravelContext:
+        resolved_event_type = event_type or self._calendar_event_type(context)
+        if resolved_event_type is None:
+            raise ValueError(f"Calendar sync is not supported for state: {context.state}")
+
+        title, start_at, end_at, payload = self._calendar_payload(context, resolved_event_type)
+        record = self.gateway.call(
+            "sync_calendar_event",
+            session_id=context.session_id,
+            user_id=context.request.user_id,
+            event_type=resolved_event_type,
+            title=title,
+            start_at=start_at,
+            end_at=end_at,
+            payload=payload,
+            workflow_generation=context.workflow_generation,
+        )
+        context.calendar_syncs.append(record)
+        context.append_event(f"Calendar sync {resolved_event_type} -> {record.status}.")
+        self.session_store.save(context)
+        return context
+
     def cancel_trip(self, context: TravelContext, reason: str = "user_cancelled") -> TravelContext:
         if context.transport_order is not None and not self._compensation_done(context.transport_order_cancellation):
-            transport_cancellation = self.gateway.call(
-                "cancel_transport_order",
-                order_id=context.transport_order.order_id,
-                user_id=context.request.user_id,
-                reason=reason,
-            )
-            context.transport_order_cancellation = transport_cancellation
-            context.append_event(
-                "Compensation completed: "
-                f"cancel_transport_order {transport_cancellation.target_id} -> {transport_cancellation.status}."
-            )
+            transport_cancellation = self.agent_team.transport.cancel_order(context, reason)
+            if transport_cancellation is not None:
+                context.append_event(
+                    "Compensation completed: "
+                    f"cancel_transport_order {transport_cancellation.target_id} -> {transport_cancellation.status}."
+                )
 
         if context.order is not None and not self._compensation_done(context.order_cancellation):
-            cancellation = self.gateway.call(
-                "cancel_order",
-                order_id=context.order.order_id,
-                user_id=context.request.user_id,
-                reason=reason,
-            )
-            context.order_cancellation = cancellation
-            context.append_event(
-                f"Compensation completed: cancel_order {cancellation.target_id} -> {cancellation.status}."
-            )
+            cancellation = self.agent_team.booking.cancel_hotel_order(context, reason)
+            if cancellation is not None:
+                context.append_event(
+                    f"Compensation completed: cancel_order {cancellation.target_id} -> {cancellation.status}."
+                )
 
         if context.inventory_lock is not None and not self._compensation_done(context.inventory_release):
-            release = self.gateway.call(
-                "release_hotel_inventory",
-                lock_id=context.inventory_lock.lock_id,
-                user_id=context.request.user_id,
-                reason=reason,
-            )
-            context.inventory_release = release
-            context.append_event(
-                f"Compensation completed: release_hotel_inventory {release.target_id} -> {release.status}."
-            )
+            release = self.agent_team.hotel.release_inventory(context, reason)
+            if release is not None:
+                context.append_event(
+                    f"Compensation completed: release_hotel_inventory {release.target_id} -> {release.status}."
+                )
 
         if context.state != TravelState.USER_CANCELLED.value:
             self.state_machine.transition(context, TravelState.USER_CANCELLED)
@@ -890,6 +777,48 @@ class TravelAgent:
             "hotel_id": context.selected_hotel.hotel_id if context.selected_hotel else None,
             "transport_id": context.selected_transport.transport_id if context.selected_transport else None,
         }
+
+    @staticmethod
+    def _calendar_event_type(context: TravelContext) -> str | None:
+        if context.state == TravelState.USER_CANCELLED.value:
+            return "TRIP_CANCELLED"
+        if context.change_records:
+            return "TRIP_CHANGED"
+        if context.state == TravelState.COMPLETED.value:
+            return "TRIP_BOOKED"
+        return None
+
+    @staticmethod
+    def _calendar_payload(context: TravelContext, event_type: str) -> tuple[str, str, str, dict[str, object]]:
+        start_at = context.request.start_date.isoformat()
+        end_at = context.request.end_date.isoformat()
+        if context.itinerary is not None:
+            start_at = context.itinerary.check_in.isoformat()
+            end_at = context.itinerary.check_out.isoformat()
+        if context.change_records:
+            latest_hotel_change = next(
+                (record for record in reversed(context.change_records) if record.target_type == "hotel"),
+                None,
+            )
+            if latest_hotel_change is not None:
+                start_at = str(latest_hotel_change.payload.get("new_check_in") or start_at)
+                end_at = str(latest_hotel_change.payload.get("new_check_out") or end_at)
+
+        title = f"{context.request.destination_city}差旅"
+        if event_type == "TRIP_CHANGED":
+            title = f"{title}已改签"
+        elif event_type == "TRIP_CANCELLED":
+            title = f"{title}已取消"
+        else:
+            title = f"{title}已预订"
+
+        payload = {
+            **TravelAgent._notification_context_payload(context),
+            "event_type": event_type,
+            "change_ids": [record.change_id for record in context.change_records],
+            "calendar_source_state": context.state,
+        }
+        return title, start_at, end_at, payload
 
     def _send_or_record_notification(
         self,
@@ -1133,10 +1062,34 @@ def build_default_agent(
         handler=integrations.release_hotel_inventory,
     )
     gateway.register(
+        name="estimate_refund",
+        description="Estimate refund and penalty before cancellation or change.",
+        required=("target_type", "target_id", "user_id", "total_amount", "reason"),
+        handler=integrations.estimate_refund,
+    )
+    gateway.register(
+        name="change_transport_order",
+        description="Change a created flight or train order.",
+        required=("order_id", "user_id", "new_depart_at", "reason"),
+        handler=integrations.change_transport_order,
+    )
+    gateway.register(
+        name="change_hotel_order",
+        description="Change a created hotel order date range.",
+        required=("order_id", "user_id", "new_check_in", "new_check_out", "reason"),
+        handler=integrations.change_hotel_order,
+    )
+    gateway.register(
         name="send_notification",
         description="Send IM or task notification for workflow events.",
         required=("session_id", "user_id", "event_type", "title", "message", "channel", "payload"),
         handler=integrations.send_notification,
+    )
+    gateway.register(
+        name="sync_calendar_event",
+        description="Create or update a calendar event for booked, changed, or cancelled travel.",
+        required=("session_id", "user_id", "event_type", "title", "start_at", "end_at", "payload"),
+        handler=integrations.sync_calendar_event,
     )
     if session_store is None and resolved_settings.session_db_path:
         session_store = SQLiteSessionStore(resolved_settings.session_db_path)

@@ -6,6 +6,8 @@ from uuid import NAMESPACE_URL, uuid5
 
 from .models import (
     ApprovalRecord,
+    CalendarSyncRecord,
+    ChangeRecord,
     CompensationResult,
     HotelOption,
     InventoryLock,
@@ -13,6 +15,7 @@ from .models import (
     NotificationRecord,
     PolicyResult,
     PriceCheckResult,
+    RefundEstimate,
     TravelOrder,
     TransportOption,
     TransportOrder,
@@ -450,6 +453,98 @@ def cancel_transport_order(order_id: str, user_id: str, reason: str) -> Compensa
     )
 
 
+def estimate_refund(
+    target_type: str,
+    target_id: str,
+    user_id: str,
+    total_amount: int,
+    reason: str,
+) -> RefundEstimate:
+    normalized_target = target_type.strip().lower()
+    penalty_rate = 0.1 if normalized_target == "hotel" else 0.2
+    penalty_amount = int(total_amount * penalty_rate)
+    refundable_amount = max(total_amount - penalty_amount, 0)
+    estimate_id = "RFD-" + uuid5(
+        NAMESPACE_URL,
+        f"{target_type}:{target_id}:{user_id}:{total_amount}:{reason}",
+    ).hex[:10].upper()
+    return RefundEstimate(
+        estimate_id=estimate_id,
+        target_type=normalized_target,
+        target_id=target_id,
+        refundable_amount=refundable_amount,
+        penalty_amount=penalty_amount,
+        currency="CNY",
+        rules=[
+            "Mock refund estimate for travel workflow testing.",
+            f"{int(penalty_rate * 100)}% penalty is applied before final supplier confirmation.",
+        ],
+        payload={
+            "target_type": normalized_target,
+            "target_id": target_id,
+            "user_id": user_id,
+            "total_amount": total_amount,
+            "reason": reason,
+        },
+    )
+
+
+def change_transport_order(
+    order_id: str,
+    user_id: str,
+    new_depart_at: str,
+    reason: str,
+) -> ChangeRecord:
+    change_id = "TCHG-" + uuid5(
+        NAMESPACE_URL,
+        f"{order_id}:{user_id}:{new_depart_at}:{reason}",
+    ).hex[:10].upper()
+    return ChangeRecord(
+        change_id=change_id,
+        target_type="transport",
+        target_id=order_id,
+        status="CHANGED",
+        penalty_amount=80,
+        currency="CNY",
+        payload={
+            "order_id": order_id,
+            "user_id": user_id,
+            "new_depart_at": new_depart_at,
+            "reason": reason,
+        },
+    )
+
+
+def change_hotel_order(
+    order_id: str,
+    user_id: str,
+    new_check_in: date,
+    new_check_out: date,
+    reason: str,
+) -> ChangeRecord:
+    change_id = "HCHG-" + uuid5(
+        NAMESPACE_URL,
+        f"{order_id}:{user_id}:{new_check_in}:{new_check_out}:{reason}",
+    ).hex[:10].upper()
+    nights = _nights(new_check_in, new_check_out)
+    return ChangeRecord(
+        change_id=change_id,
+        target_type="hotel",
+        target_id=order_id,
+        status="CHANGED",
+        penalty_amount=50,
+        currency="CNY",
+        payload={
+            "order_id": order_id,
+            "user_id": user_id,
+            "new_check_in": new_check_in,
+            "new_check_out": new_check_out,
+            "new_nights": nights,
+            "reason": reason,
+        },
+    )
+
+
 def release_hotel_inventory(lock_id: str, user_id: str, reason: str) -> CompensationResult:
     return CompensationResult(
         action="release_hotel_inventory",
@@ -492,6 +587,41 @@ def send_notification(
             "title": title,
             "message": message,
             "channel": channel,
+            "workflow_generation": workflow_generation,
+            "payload": payload,
+        },
+    )
+
+
+def sync_calendar_event(
+    session_id: str,
+    user_id: str,
+    event_type: str,
+    title: str,
+    start_at: str,
+    end_at: str,
+    payload: dict[str, Any],
+    workflow_generation: int = 1,
+) -> CalendarSyncRecord:
+    calendar_event_id = "CAL-" + uuid5(
+        NAMESPACE_URL,
+        f"{session_id}:{workflow_generation}:{user_id}:{event_type}:{start_at}:{end_at}",
+    ).hex[:10].upper()
+    return CalendarSyncRecord(
+        calendar_event_id=calendar_event_id,
+        event_type=event_type,
+        status="SYNCED",
+        user_id=user_id,
+        title=title,
+        start_at=start_at,
+        end_at=end_at,
+        payload={
+            "session_id": session_id,
+            "user_id": user_id,
+            "event_type": event_type,
+            "title": title,
+            "start_at": start_at,
+            "end_at": end_at,
             "workflow_generation": workflow_generation,
             "payload": payload,
         },
