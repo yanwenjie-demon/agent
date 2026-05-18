@@ -27,7 +27,7 @@ Agent Runtime
   ├─ Tool Gateway：工具路由、鉴权、审计、幂等
   ├─ Workflow Engine：状态机与复杂流程编排
   ├─ Workflow Worker：扫描持久化会话并推进可自动执行的状态
-  ├─ Observability Store：记录 worker 执行摘要、子 Agent 执行摘要、死信通知和基础运行指标
+  ├─ Observability Store：记录 worker 执行摘要、子 Agent 执行摘要、死信通知、日历同步和基础运行指标
   ├─ Memory：会话、用户偏好、任务状态
   └─ Guardrails：权限、风控、合规、敏感信息保护
       ↓
@@ -105,8 +105,8 @@ Order Tool 创建订单
 - 返回对象带 `source` 字段，便于审计真实来源和 fallback 来源。
 - 审批通过后进入交通订单创建、酒店库存锁定和酒店订单创建，审批驳回则停止下单。
 - 下单后支持取消补偿：先取消交通订单和酒店订单，再释放酒店库存。
-- 改签/退订准备支持退款预估、交通改签、酒店改期和改签手续费记录；真实系统未配置时使用 mock fallback。
-- 日历同步支持订单完成、改签和取消后的企业日历更新；真实系统未配置时使用 mock fallback。
+- 改签/退订深化支持退款预估、改签审批、退款确认、交通改签、酒店改期、供应商失败补偿和改签后日历同步；真实系统未配置时使用 mock fallback。
+- 日历同步支持订单完成、改签和取消后的企业日历更新；真实系统未配置时使用 mock fallback，失败后可由 worker 重试并进入独立死信。
 - 会话可持久化到 SQLite，后续可替换为生产数据库或工作流引擎。
 - 锁库存后、下单前执行价格校验；价格变化时进入二次确认。
 - 订单创建后可刷新订单状态，便于后续接入异步轮询。
@@ -118,7 +118,7 @@ Order Tool 创建订单
 - 达到重试上限的通知可查询并人工重放，重放失败后会重新进入可重试队列。
 - 异常恢复会通过 `workflow_generation` 开启新一轮流程，避免重新提交时复用上一轮审批、库存、订单和通知幂等键。
 
-第一阶段历史范围曾暂不包含真实库存、真实 OA、订单创建、补偿和多 Agent。当前实现已推进到真实系统适配、酒店 + 交通组合下单、异常恢复、通知死信、多 Agent 协作深化、改签/退订准备和日历同步；剩余未完成的主线是生产级指标出口、评测集和更深的改签审批联动。
+第一阶段历史范围曾暂不包含真实库存、真实 OA、订单创建、补偿和多 Agent。当前实现已推进到真实系统适配、酒店 + 交通组合下单、异常恢复、通知死信、多 Agent 协作深化、改签/退订深化、日历同步重试/死信、Prometheus 文本指标出口、HTTP `/metrics` 服务和 OTLP/HTTP 导出；剩余未完成的主线是评测集和生产化存储。
 
 ## 4. 单 Agent 架构
 
@@ -236,7 +236,7 @@ USER_CANCELLED：用户取消，补偿动作已尽量执行
 - 用户取消：终止流程并记录取消原因。
 - 完成后取消：取消订单，释放库存，并保留补偿结果用于审计。
 - 取消前退款预估：按酒店和交通订单分别调用退款预估工具，记录可退金额、手续费和规则说明。
-- 改签/改期：对已创建订单调用交通改签和酒店改期工具，记录 `ChangeRecord`，并在子 Agent 执行摘要中保留输入/输出引用。
+- 改签/改期：先做退款预估和改签审批，审批通过后确认退款金额，再调用交通改签和酒店改期工具，记录 `RefundEstimate`、`RefundConfirmationRecord`、`ChangeRecord`；供应商失败时记录 `CompensationResult` 并进入人工可追踪补偿。
 - 订单状态变化：刷新订单状态并保存到会话，后续可由调度器定时执行。
 
 恢复流程：
@@ -292,6 +292,9 @@ APPROVAL_CREATED
 - `list_dead_letter_notifications` 从持久化会话里查询 `DEAD_LETTER` 通知，保留会话状态和原通知内容。
 - `replay_dead_letter_notification` 使用原事件类型、标题、消息和通知渠道重新调用通知工具；成功后写入去重键，失败后回到 `FAILED` 状态继续由 worker 重试。
 - CLI 暴露 worker 历史、死信列表、死信重放和基础指标摘要，便于在真实监控系统接入前做运维验证。
+- CLI 支持 `--metrics --metrics-format prometheus` 输出 Prometheus text exposition，覆盖 worker 扫描/推进/错误、通知死信、会话状态、Agent 执行摘要和日历同步状态。
+- CLI 支持 `--serve-metrics` 启动标准库 HTTP 指标服务，暴露 `/metrics` 和 `/health`，方便 Prometheus 或边车采集器直接拉取。
+- CLI 支持 `--export-otlp` 生成 OTLP/HTTP traces 与 metrics 并导出到 OpenTelemetry Collector，trace 覆盖 worker run 和子 Agent 执行摘要，metrics 覆盖 worker、会话状态、死信、日历同步和 SLA alert 点。
 
 ## 8. 第一阶段开发落地
 
@@ -330,17 +333,22 @@ COMPLETED
 
 交通订单先于酒店订单创建，因此价格变化、库存失效、用户取消或订单失败时，补偿逻辑会优先取消交通订单，再处理酒店订单和库存释放。
 
-改签/退订准备链路：
+改签/退订深化链路：
 
 ```text
 COMPLETED / ORDER_CREATED
   ├─ estimate_refund(transport)
-  ├─ change_transport_order
   ├─ estimate_refund(hotel)
-  └─ change_hotel_order
+  ├─ create_change_approval
+  ├─ confirm_refund(transport)
+  ├─ confirm_refund(hotel)
+  ├─ change_transport_order
+  ├─ change_hotel_order
+  ├─ compensate_change_failure（按需）
+  └─ sync_calendar(TRIP_CHANGED)
 ```
 
-退款预估会生成 `RefundEstimate`，改签/改期会生成 `ChangeRecord`，两者均写入 `TravelContext` 并可持久化到 SQLite。
+退款预估会生成 `RefundEstimate`，改签审批会写入 `change_approvals`，退款确认会生成 `RefundConfirmationRecord`，改签/改期会生成 `ChangeRecord`，供应商失败补偿会生成 `CompensationResult`；这些记录均写入 `TravelContext` 并可持久化到 SQLite。
 
 日历同步链路：
 
@@ -353,7 +361,14 @@ sync_calendar
   └─ TRIP_CANCELLED
 ```
 
-日历同步会生成 `CalendarSyncRecord`，记录事件类型、同步状态、日历事件 ID、时间范围和来源；改签后的日历时间优先使用最近一次酒店改期结果。
+日历同步会生成 `CalendarSyncRecord`，记录事件类型、同步状态、日历事件 ID、时间范围、参会人、重试次数、错误原因和来源；改签后的日历时间优先使用最近一次酒店改期结果。
+
+日历重试/死信：
+
+- `FAILED`：日历同步失败，可由 worker 后续扫描并重试。
+- `DEAD_LETTER`：达到最大重试次数后停止自动重试，等待人工或运维重放。
+- `list_dead_letter_calendar_syncs` 可查询日历死信，`replay_dead_letter_calendar_sync` 可按事件类型重放。
+- 日历同步支持传入 `attendees`，用于更新参会人或同步给管理者。
 
 运行方式：
 
@@ -389,8 +404,12 @@ python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --run-work
 $env:PYTHONPATH = "src"
 python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --list-worker-runs
 python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --list-dead-letters
+python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --list-calendar-dead-letters
 python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --replay-dead-letter-session "<session-id>" --replay-dead-letter-event "ORDER_COMPLETED"
+python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --replay-calendar-dead-letter-session "<session-id>" --replay-calendar-dead-letter-event "TRIP_BOOKED"
 python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --metrics
+python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --serve-metrics --metrics-port 9108
+python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --export-otlp --otlp-endpoint "http://localhost:4318"
 ```
 
 异常恢复并重新提交审批：
@@ -428,8 +447,8 @@ python -m unittest discover -s tests
 - 价格变化拒绝、用户取消、异常恢复中的交通订单取消、酒店订单取消、库存释放和审批撤回，均由对应子 Agent 执行。
 - 订单状态刷新通过 `TransportAgent.refresh_order` 和 `BookingAgent.refresh_hotel_order` 完成，并保留旧订单金额，兼容只返回状态的真实系统。
 - 异常恢复重规划阶段通过 `PolicyAgent`、`ItineraryAgent`、`HotelAgent`、`TransportAgent` 重新补齐政策、行程和库存候选。
-- 改签和退订准备通过 `TransportAgent`、`BookingAgent` 生成退款预估与改签记录，保持与现有 Orchestrator/facade 兼容。
-- 日历同步通过 `TravelAgent.sync_calendar` 暴露，支持完成、改签和取消三类事件，并保留 mock/真实系统来源。
+- 改签和退订深化通过 `TransportAgent`、`BookingAgent`、`ApprovalAgent` 协作生成退款预估、改签审批、退款确认、改签记录和失败补偿，保持与现有 Orchestrator/facade 兼容。
+- 日历同步通过 `TravelAgent.sync_calendar` 暴露，支持完成、改签和取消三类事件，保留 mock/真实系统来源，并支持失败重试、死信和参会人更新。
 
 落地原则：
 
@@ -440,7 +459,5 @@ python -m unittest discover -s tests
 
 下一阶段主线：
 
-- 指标出口：将 worker 运行摘要、死信、Agent 执行摘要和日历同步状态导出到 Prometheus/OpenTelemetry。
-- 日历同步深化：将日历同步失败纳入独立重试/死信机制，并支持取消会议、更新参会人。
-- 改签/退订深化：改签审批联动、退款确认支付和供应商失败补偿。
-- 评测集：覆盖政策超标、审批驳回、价格变化、库存失效、订单失败、改签失败等场景。
+- 评测集：沉淀政策超标、审批驳回、价格变化、库存失效、订单失败、改签失败、日历死信等多场景回归用例。
+- 生产化存储：评估将 SQLite 会话存储替换为生产数据库或工作流引擎。

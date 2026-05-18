@@ -14,6 +14,7 @@ from .models import (
     CalendarSyncRecord,
     ChangeRecord,
     CompensationResult,
+    DeadLetterCalendarSync,
     DeadLetterNotification,
     HotelOption,
     InventoryLock,
@@ -22,6 +23,7 @@ from .models import (
     PolicyResult,
     PriceCheckResult,
     RecoveryRecord,
+    RefundConfirmationRecord,
     RefundEstimate,
     Task,
     TaskPlan,
@@ -45,6 +47,9 @@ class SessionStore(Protocol):
     def list_by_states(self, states: set[str], limit: int = 50) -> list[TravelContext]:
         ...
 
+    def list_recent(self, limit: int = 50) -> list[TravelContext]:
+        ...
+
     def record_worker_run(self, record: WorkerRunRecord) -> None:
         ...
 
@@ -52,6 +57,9 @@ class SessionStore(Protocol):
         ...
 
     def list_dead_letter_notifications(self, limit: int = 50) -> list[DeadLetterNotification]:
+        ...
+
+    def list_dead_letter_calendar_syncs(self, limit: int = 50) -> list[DeadLetterCalendarSync]:
         ...
 
 
@@ -70,6 +78,9 @@ class InMemorySessionStore:
         matches = [context for context in self._sessions.values() if context.state in states]
         return matches[:limit]
 
+    def list_recent(self, limit: int = 50) -> list[TravelContext]:
+        return list(reversed(list(self._sessions.values())[-limit:]))
+
     def record_worker_run(self, record: WorkerRunRecord) -> None:
         self._worker_runs.append(record)
 
@@ -80,6 +91,14 @@ class InMemorySessionStore:
         records: list[DeadLetterNotification] = []
         for context in self._sessions.values():
             records.extend(_dead_letters_from_context(context))
+            if len(records) >= limit:
+                return records[:limit]
+        return records
+
+    def list_dead_letter_calendar_syncs(self, limit: int = 50) -> list[DeadLetterCalendarSync]:
+        records: list[DeadLetterCalendarSync] = []
+        for context in self._sessions.values():
+            records.extend(_calendar_dead_letters_from_context(context))
             if len(records) >= limit:
                 return records[:limit]
         return records
@@ -129,6 +148,19 @@ class SQLiteSessionStore:
         )
         with closing(sqlite3.connect(self.db_path)) as connection:
             rows = connection.execute(query, (*sorted(states), limit)).fetchall()
+        return [context_from_dict(json.loads(row[0])) for row in rows]
+
+    def list_recent(self, limit: int = 50) -> list[TravelContext]:
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            rows = connection.execute(
+                """
+                SELECT payload
+                FROM travel_sessions
+                ORDER BY updated_at DESC, rowid DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
         return [context_from_dict(json.loads(row[0])) for row in rows]
 
     def record_worker_run(self, record: WorkerRunRecord) -> None:
@@ -210,6 +242,23 @@ class SQLiteSessionStore:
                 return records[:limit]
         return records
 
+    def list_dead_letter_calendar_syncs(self, limit: int = 50) -> list[DeadLetterCalendarSync]:
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            rows = connection.execute(
+                """
+                SELECT payload
+                FROM travel_sessions
+                ORDER BY updated_at DESC
+                """
+            ).fetchall()
+
+        records: list[DeadLetterCalendarSync] = []
+        for row in rows:
+            records.extend(_calendar_dead_letters_from_context(context_from_dict(json.loads(row[0]))))
+            if len(records) >= limit:
+                return records[:limit]
+        return records
+
     def _init_schema(self) -> None:
         with closing(sqlite3.connect(self.db_path)) as connection:
             connection.execute(
@@ -279,7 +328,14 @@ def context_from_dict(payload: dict[str, Any]) -> TravelContext:
         transport_order_cancellation=_optional(CompensationResult, payload.get("transport_order_cancellation")),
         inventory_release=_optional(CompensationResult, payload.get("inventory_release")),
         refund_estimates=[RefundEstimate(**item) for item in payload.get("refund_estimates", [])],
+        refund_confirmations=[
+            RefundConfirmationRecord(**item) for item in payload.get("refund_confirmations", [])
+        ],
+        change_approvals=[ApprovalRecord(**item) for item in payload.get("change_approvals", [])],
         change_records=[ChangeRecord(**item) for item in payload.get("change_records", [])],
+        change_failure_compensations=[
+            CompensationResult(**item) for item in payload.get("change_failure_compensations", [])
+        ],
         calendar_syncs=[CalendarSyncRecord(**item) for item in payload.get("calendar_syncs", [])],
         notifications=[NotificationRecord(**item) for item in payload.get("notifications", [])],
         notification_keys=list(payload.get("notification_keys", [])),
@@ -336,4 +392,16 @@ def _dead_letters_from_context(context: TravelContext) -> list[DeadLetterNotific
         )
         for notification in context.notifications
         if notification.status == "DEAD_LETTER"
+    ]
+
+
+def _calendar_dead_letters_from_context(context: TravelContext) -> list[DeadLetterCalendarSync]:
+    return [
+        DeadLetterCalendarSync(
+            session_id=context.session_id,
+            state=context.state,
+            calendar_sync=record,
+        )
+        for record in context.calendar_syncs
+        if record.status == "DEAD_LETTER"
     ]

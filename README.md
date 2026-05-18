@@ -18,12 +18,12 @@
 - 异常恢复：审批驳回、价格变化、库存失效、订单失败后可由 Orchestrator 协调子 Agent 补偿并重新规划
 - 价格变化二次确认：锁库存后、下单前校验当前价
 - 订单状态刷新：订单创建后可同步最新订单状态
-- 改签/退订准备：支持交通订单改签、酒店订单改期、取消前退款预估和改签手续费记录，真实系统未就绪时使用 mock fallback
-- 日历同步：订单完成、改签、取消后可同步企业日历，支持真实 HTTP 系统和 mock fallback
+- 改签/退订深化：支持改签审批联动、退款确认、交通订单改签、酒店订单改期、供应商失败补偿和改签后日历同步，真实系统未就绪时使用 mock fallback
+- 日历同步：订单完成、改签、取消后可同步企业日历，支持真实 HTTP 系统和 mock fallback，失败后可重试、死信查询和重放
 - 异步 worker：扫描持久化会话，自动推进审批和订单状态
 - 通知/待办回调：关键成功、失败、待确认状态自动发送通知，支持真实 HTTP 系统和 Mock fallback
 - 通知重试/死信：通知失败不会阻断主流程，超过重试上限后进入 `DEAD_LETTER`
-- 生产化观测：worker 运行摘要落库、死信查询/重放、基础指标输出
+- 生产化观测：worker 运行摘要落库、死信查询/重放、基础指标输出、Prometheus 文本指标出口、HTTP `/metrics` 服务和 OTLP/HTTP 导出
 - SQLite 会话持久化，可从 session 恢复流程
 - 内存会话状态和确定性工作流状态机
 
@@ -106,6 +106,13 @@ $env:PYTHONPATH = "src"
 python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --sync-calendar-session "<session-id>"
 ```
 
+同步企业日历并指定参会人：
+
+```powershell
+$env:PYTHONPATH = "src"
+python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --sync-calendar-session "<session-id>" --calendar-attendee "u-demo" --calendar-attendee "manager@example.com"
+```
+
 运行一次异步 worker：
 
 ```powershell
@@ -142,6 +149,13 @@ $env:PYTHONPATH = "src"
 python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --list-dead-letters
 ```
 
+查看日历同步死信：
+
+```powershell
+$env:PYTHONPATH = "src"
+python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --list-calendar-dead-letters
+```
+
 重放指定通知死信：
 
 ```powershell
@@ -149,11 +163,48 @@ $env:PYTHONPATH = "src"
 python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --replay-dead-letter-session "<session-id>" --replay-dead-letter-event "ORDER_COMPLETED"
 ```
 
+重放指定日历同步死信：
+
+```powershell
+$env:PYTHONPATH = "src"
+python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --replay-calendar-dead-letter-session "<session-id>" --replay-calendar-dead-letter-event "TRIP_BOOKED"
+```
+
 输出基础运行指标：
 
 ```powershell
 $env:PYTHONPATH = "src"
 python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --metrics
+```
+
+输出 Prometheus 文本指标：
+
+```powershell
+$env:PYTHONPATH = "src"
+python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --metrics --metrics-format prometheus
+```
+
+启动 Prometheus 拉取端点：
+
+```powershell
+$env:PYTHONPATH = "src"
+python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --serve-metrics --metrics-host 127.0.0.1 --metrics-port 9108
+```
+
+启动后可访问 `http://127.0.0.1:9108/metrics` 和 `http://127.0.0.1:9108/health`。
+
+导出 OpenTelemetry Collector OTLP/HTTP traces 和 metrics：
+
+```powershell
+$env:PYTHONPATH = "src"
+python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --export-otlp --otlp-endpoint "http://localhost:4318"
+```
+
+也可以只打印生成的 OTLP payload 便于调试：
+
+```powershell
+$env:PYTHONPATH = "src"
+python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --export-otlp --print-otlp-payload
 ```
 
 异常恢复：对停在 `APPROVAL_REJECTED`、`PRICE_CHANGED`、`INVENTORY_EXPIRED`、`ORDER_FAILED` 等状态的会话执行补偿并重新查询酒店。
@@ -200,6 +251,9 @@ $env:TRAVEL_ORDER_API_URL = "https://order.example.com/api/orders"
 $env:TRAVEL_ORDER_STATUS_API_URL = "https://order.example.com/api/orders/status"
 $env:TRAVEL_ORDER_CANCEL_API_URL = "https://order.example.com/api/orders/cancel"
 $env:TRAVEL_REFUND_ESTIMATE_API_URL = "https://order.example.com/api/refund-estimate"
+$env:TRAVEL_REFUND_CONFIRM_API_URL = "https://order.example.com/api/refund-confirm"
+$env:TRAVEL_CHANGE_APPROVAL_API_URL = "https://oa.example.com/api/change-approvals"
+$env:TRAVEL_CHANGE_FAILURE_COMPENSATION_API_URL = "https://order.example.com/api/change-failure-compensation"
 $env:TRAVEL_HOTEL_CHANGE_API_URL = "https://order.example.com/api/hotel-change"
 $env:TRAVEL_TRANSPORT_ORDER_API_URL = "https://transport.example.com/api/orders"
 $env:TRAVEL_TRANSPORT_ORDER_STATUS_API_URL = "https://transport.example.com/api/orders/status"
@@ -207,6 +261,7 @@ $env:TRAVEL_TRANSPORT_ORDER_CANCEL_API_URL = "https://transport.example.com/api/
 $env:TRAVEL_TRANSPORT_CHANGE_API_URL = "https://transport.example.com/api/change"
 $env:TRAVEL_NOTIFICATION_API_URL = "https://notify.example.com/api/messages"
 $env:TRAVEL_CALENDAR_API_URL = "https://calendar.example.com/api/sync"
+$env:TRAVEL_OTLP_HTTP_ENDPOINT = "http://localhost:4318"
 $env:TRAVEL_POLICY_API_TOKEN = "policy-token"
 $env:TRAVEL_TRANSPORT_API_TOKEN = "transport-token"
 $env:TRAVEL_HOTEL_INVENTORY_API_TOKEN = "hotel-token"
@@ -214,7 +269,9 @@ $env:TRAVEL_OA_APPROVAL_API_TOKEN = "oa-token"
 $env:TRAVEL_ORDER_API_TOKEN = "order-token"
 $env:TRAVEL_NOTIFICATION_API_TOKEN = "notification-token"
 $env:TRAVEL_CALENDAR_API_TOKEN = "calendar-token"
+$env:TRAVEL_OTLP_API_TOKEN = "otel-token"
 $env:TRAVEL_NOTIFICATION_USE_MOCK_FALLBACK = "true"
+$env:TRAVEL_CALENDAR_USE_MOCK_FALLBACK = "true"
 $env:TRAVEL_SESSION_DB_PATH = "D:\tmp\travel-agent.sqlite3"
 ```
 
@@ -248,11 +305,14 @@ $env:TRAVEL_NOTIFICATION_USE_MOCK_FALLBACK = "false"
 - 交通订单状态接口：POST JSON，返回 `transport_order` 或 `data`，字段支持 `order_id`、`status`、`total_amount`、`currency`。
 - 交通订单取消接口：POST JSON，返回 `compensation` 或 `data`，字段支持 `action`、`target_id`、`status`。
 - 退款预估接口：POST JSON，返回 `refund_estimate` 或 `data`，字段支持 `estimate_id`、`target_type`、`target_id`、`refundable_amount`、`penalty_amount`、`currency`、`rules`。
+- 退款确认接口：POST JSON，返回 `refund_confirmation` 或 `data`，字段支持 `confirmation_id`、`estimate_id`、`target_type`、`target_id`、`status`、`confirmed_amount`、`currency`。
+- 改签审批接口：POST JSON，返回 `approval` 或 `data`，字段支持 `approval_id`、`status`。
 - 酒店改期接口：POST JSON，返回 `change` 或 `data`，字段支持 `change_id`、`target_type`、`target_id`、`status`、`penalty_amount`、`currency`。
 - 交通改签接口：POST JSON，返回 `change` 或 `data`，字段支持 `change_id`、`target_type`、`target_id`、`status`、`penalty_amount`、`currency`。
+- 改签失败补偿接口：POST JSON，返回 `compensation` 或 `data`，字段支持 `action`、`target_id`、`status`。
 - 库存释放接口：POST JSON，返回 `compensation` 或 `data`，字段支持 `action`、`target_id`、`status`。
 - 通知接口：POST JSON，返回 `notification` 或 `data`，字段支持 `notification_id`、`event_type`、`channel`、`recipient_id`、`title`、`message`、`status`。
-- 日历同步接口：POST JSON，返回 `calendar` 或 `data`，字段支持 `calendar_event_id`、`event_type`、`status`、`user_id`、`title`、`start_at`、`end_at`。
+- 日历同步接口：POST JSON，返回 `calendar` 或 `data`，字段支持 `calendar_event_id`、`event_type`、`status`、`user_id`、`title`、`start_at`、`end_at`、`attendees`、`retry_count`、`max_retries`、`last_error`。
 
 ## 运行测试
 
@@ -262,8 +322,5 @@ python -m unittest discover -s tests
 
 ## 下一阶段建议
 
-- 改签/退订深化：补充改签审批联动、退款确认支付、供应商失败补偿和改签后日历同步
-- 日历同步深化：将日历同步失败纳入独立重试/死信机制，并支持取消会议、更新参会人
-- 指标出口：将当前 worker 运行摘要、死信、Agent 执行摘要和日历同步状态导出到 Prometheus/OpenTelemetry
-- 评测集：沉淀政策超标、审批驳回、价格变化、库存失效、订单失败等多场景回归用例
-- 生产化存储：评估将 SQLite 会话存储替换为生产数据库或工作流引擎
+- 评测集：沉淀政策超标、审批驳回、价格变化、库存失效、订单失败、改签失败、日历死信等多场景回归用例。
+- 生产化存储：评估将 SQLite 会话存储替换为生产数据库或工作流引擎。

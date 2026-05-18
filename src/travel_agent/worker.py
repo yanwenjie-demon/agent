@@ -59,6 +59,7 @@ class WorkflowWorker:
             try:
                 updated = self.advance(context)
                 updated = self.agent.notify_current_state(updated)
+                updated = self._retry_calendar_syncs(updated)
                 session_ids.append(updated.session_id)
                 if updated.state != before_state or len(updated.events) != before_event_count:
                     advanced += 1
@@ -140,6 +141,21 @@ class WorkflowWorker:
         self.agent.session_store.save(context)
         return context
 
+    def _retry_calendar_syncs(self, context: TravelContext) -> TravelContext:
+        retryable = [
+            record
+            for record in context.calendar_syncs
+            if record.status == "FAILED" and record.retry_count < record.max_retries
+        ]
+        for record in retryable:
+            context = self.agent.sync_calendar(
+                context,
+                event_type=record.event_type,
+                attendees=record.attendees,
+                existing=record,
+            )
+        return context
+
     def _contexts_to_process(self, limit: int) -> list[TravelContext]:
         contexts = self.agent.session_store.list_by_states(AUTO_ADVANCE_STATES, limit)
         seen = {context.session_id for context in contexts}
@@ -153,7 +169,7 @@ class WorkflowWorker:
         for context in all_candidates:
             if context.session_id in seen:
                 continue
-            if self._has_retryable_notification(context):
+            if self._has_retryable_notification(context) or self._has_retryable_calendar_sync(context):
                 contexts.append(context)
                 seen.add(context.session_id)
             if len(contexts) >= limit:
@@ -165,6 +181,13 @@ class WorkflowWorker:
         return any(
             notification.status == "FAILED" and notification.retry_count < notification.max_retries
             for notification in context.notifications
+        )
+
+    @staticmethod
+    def _has_retryable_calendar_sync(context: TravelContext) -> bool:
+        return any(
+            record.status == "FAILED" and record.retry_count < record.max_retries
+            for record in context.calendar_syncs
         )
 
 

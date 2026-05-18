@@ -9,7 +9,19 @@ from .config import IntegrationSettings
 from .domain_agents import AgentTeam, build_agent_team
 from .integrations import HttpJsonClient, TravelSystemIntegrations
 from .mock_tools import plan_itinerary
-from .models import HotelOption, NotificationRecord, RecoveryRecord, Task, TaskPlan, TravelContext, TravelRequest, TransportOption
+from .models import (
+    CalendarSyncRecord,
+    ChangeRecord,
+    HotelOption,
+    NotificationRecord,
+    RecoveryRecord,
+    RefundEstimate,
+    Task,
+    TaskPlan,
+    TravelContext,
+    TravelRequest,
+    TransportOption,
+)
 from .state import TravelState, WorkflowStateMachine
 from .storage import InMemorySessionStore, SQLiteSessionStore, SessionStore
 from .tools import ToolGateway
@@ -556,39 +568,92 @@ class TravelAgent:
         if new_depart_at is None and (new_check_in is None or new_check_out is None):
             raise ValueError("Trip change requires transport or hotel change details.")
 
+        change_request = self._build_change_request(new_depart_at, new_check_in, new_check_out, reason)
+        estimates: list[RefundEstimate] = []
+        changes: list[ChangeRecord] = []
+
         if new_depart_at is not None:
-            self.agent_team.transport.estimate_refund(context, reason)
-            self.agent_team.transport.change_order(context, new_depart_at, reason)
+            estimate = self.agent_team.transport.estimate_refund(context, reason)
+            if estimate is not None:
+                estimates.append(estimate)
         if new_check_in is not None or new_check_out is not None:
             if new_check_in is None or new_check_out is None:
                 raise ValueError("Hotel change requires both new_check_in and new_check_out.")
             if new_check_out <= new_check_in:
                 raise ValueError("new_check_out must be later than new_check_in.")
-            self.agent_team.booking.estimate_refund(context, reason)
-            self.agent_team.booking.change_hotel_order(context, new_check_in, new_check_out, reason)
+            estimate = self.agent_team.booking.estimate_refund(context, reason)
+            if estimate is not None:
+                estimates.append(estimate)
 
-        self.session_store.save(context)
+        change_approval = self.agent_team.approval.create_change_approval(context, estimates, change_request)
+        if self._normalize_status(change_approval.status) not in {"APPROVED", "AUTO_APPROVED"}:
+            context.append_event(f"Change approval pending or rejected: {change_approval.status}.")
+            self.session_store.save(context)
+            return context
+
+        for estimate in estimates:
+            confirmation = self.agent_team.approval.confirm_refund(context, estimate, reason)
+            if not self._refund_confirmation_succeeded(confirmation.status):
+                context.append_event(f"Refund confirmation blocked trip change: {confirmation.status}.")
+                self.session_store.save(context)
+                return context
+
+        if new_depart_at is not None:
+            changes.append(self.agent_team.transport.change_order(context, new_depart_at, reason))
+            self._compensate_if_change_failed(context, changes[-1], changes[:-1], reason)
+        if new_check_in is not None and new_check_out is not None:
+            changes.append(self.agent_team.booking.change_hotel_order(context, new_check_in, new_check_out, reason))
+            self._compensate_if_change_failed(context, changes[-1], changes[:-1], reason)
+
+        if changes and all(self._change_succeeded(change) for change in changes):
+            self.sync_calendar(context, event_type="TRIP_CHANGED")
+        else:
+            self.session_store.save(context)
+
         return context
 
-    def sync_calendar(self, context: TravelContext, event_type: str | None = None) -> TravelContext:
+    def sync_calendar(
+        self,
+        context: TravelContext,
+        event_type: str | None = None,
+        attendees: list[str] | None = None,
+        existing: CalendarSyncRecord | None = None,
+    ) -> TravelContext:
         resolved_event_type = event_type or self._calendar_event_type(context)
         if resolved_event_type is None:
             raise ValueError(f"Calendar sync is not supported for state: {context.state}")
 
         title, start_at, end_at, payload = self._calendar_payload(context, resolved_event_type)
-        record = self.gateway.call(
-            "sync_calendar_event",
-            session_id=context.session_id,
-            user_id=context.request.user_id,
+        record = self._sync_or_record_calendar(
+            context=context,
             event_type=resolved_event_type,
             title=title,
             start_at=start_at,
             end_at=end_at,
             payload=payload,
-            workflow_generation=context.workflow_generation,
+            attendees=attendees,
+            existing=existing,
         )
-        context.calendar_syncs.append(record)
+        self._upsert_calendar_sync(context, record)
         context.append_event(f"Calendar sync {resolved_event_type} -> {record.status}.")
+        self.session_store.save(context)
+        return context
+
+    def replay_dead_letter_calendar_sync(self, context: TravelContext, event_type: str) -> TravelContext:
+        existing = self._find_calendar_sync(context, event_type, context.workflow_generation)
+        if existing is None:
+            raise ValueError(f"No calendar sync found for event type: {event_type}")
+        if existing.status != "DEAD_LETTER":
+            raise ValueError(f"Calendar sync {event_type} is not DEAD_LETTER: {existing.status}")
+
+        reset = replace(existing, status="FAILED", retry_count=0, last_error=None)
+        context = self.sync_calendar(
+            context,
+            event_type=event_type,
+            attendees=reset.attendees,
+            existing=reset,
+        )
+        context.append_event(f"Calendar dead-letter replay requested for {event_type}.")
         self.session_store.save(context)
         return context
 
@@ -718,6 +783,44 @@ class TravelAgent:
         return cls._normalize_status(status) in {"DONE", "CANCELLED", "RELEASED", "SUCCESS", "SUCCEEDED"}
 
     @staticmethod
+    def _build_change_request(
+        new_depart_at: str | None,
+        new_check_in: date | None,
+        new_check_out: date | None,
+        reason: str,
+    ) -> dict[str, object]:
+        return {
+            "new_depart_at": new_depart_at,
+            "new_check_in": new_check_in.isoformat() if new_check_in else None,
+            "new_check_out": new_check_out.isoformat() if new_check_out else None,
+            "reason": reason,
+        }
+
+    @classmethod
+    def _change_succeeded(cls, change: ChangeRecord) -> bool:
+        return cls._normalize_status(change.status) in {"CHANGED", "SUCCESS", "SUCCEEDED", "DONE", "CONFIRMED"}
+
+    @classmethod
+    def _refund_confirmation_succeeded(cls, status: str) -> bool:
+        return cls._normalize_status(status) in {"CONFIRMED", "SUCCESS", "SUCCEEDED", "DONE", "APPROVED"}
+
+    def _compensate_if_change_failed(
+        self,
+        context: TravelContext,
+        change: ChangeRecord,
+        completed_changes: list[ChangeRecord],
+        reason: str,
+    ) -> None:
+        if self._change_succeeded(change):
+            return
+        self.agent_team.approval.compensate_change_failure(
+            context,
+            failed_change=change,
+            reason=reason,
+            completed_changes=completed_changes,
+        )
+
+    @staticmethod
     def _build_notification_payload(context: TravelContext) -> tuple[str, str, str] | None:
         if context.state == TravelState.PRICE_CHANGED.value and context.price_check is not None:
             return (
@@ -819,6 +922,133 @@ class TravelAgent:
             "calendar_source_state": context.state,
         }
         return title, start_at, end_at, payload
+
+    def _sync_or_record_calendar(
+        self,
+        context: TravelContext,
+        event_type: str,
+        title: str,
+        start_at: str,
+        end_at: str,
+        payload: dict[str, object],
+        attendees: list[str] | None,
+        existing: CalendarSyncRecord | None,
+    ) -> CalendarSyncRecord:
+        retry_count = existing.retry_count if existing else 0
+        max_retries = existing.max_retries if existing else 3
+        if retry_count >= max_retries:
+            return replace(existing, status="DEAD_LETTER") if existing else self._failed_calendar_sync_record(
+                context,
+                event_type,
+                title,
+                start_at,
+                end_at,
+                payload,
+                attendees,
+                retry_count=max_retries,
+                max_retries=max_retries,
+                error="Calendar max retries reached before sync.",
+                status="DEAD_LETTER",
+            )
+
+        try:
+            return self.gateway.call(
+                "sync_calendar_event",
+                session_id=context.session_id,
+                user_id=context.request.user_id,
+                event_type=event_type,
+                title=title,
+                start_at=start_at,
+                end_at=end_at,
+                payload=payload,
+                attendees=attendees or [context.request.user_id],
+                workflow_generation=context.workflow_generation,
+            )
+        except Exception as exc:
+            retry_count += 1
+            status = "DEAD_LETTER" if retry_count >= max_retries else "FAILED"
+            return self._failed_calendar_sync_record(
+                context,
+                event_type,
+                title,
+                start_at,
+                end_at,
+                payload,
+                attendees,
+                retry_count=retry_count,
+                max_retries=max_retries,
+                error=str(exc),
+                status=status,
+            )
+
+    @staticmethod
+    def _failed_calendar_sync_record(
+        context: TravelContext,
+        event_type: str,
+        title: str,
+        start_at: str,
+        end_at: str,
+        payload: dict[str, object],
+        attendees: list[str] | None,
+        retry_count: int,
+        max_retries: int,
+        error: str,
+        status: str = "FAILED",
+    ) -> CalendarSyncRecord:
+        calendar_event_id = "CAL-" + uuid5(
+            NAMESPACE_URL,
+            f"{context.session_id}:{context.workflow_generation}:{event_type}",
+        ).hex[:10].upper()
+        return CalendarSyncRecord(
+            calendar_event_id=calendar_event_id,
+            event_type=event_type,
+            status=status,
+            user_id=context.request.user_id,
+            title=title,
+            start_at=start_at,
+            end_at=end_at,
+            payload=payload,
+            source="local",
+            attendees=attendees or [context.request.user_id],
+            retry_count=retry_count,
+            max_retries=max_retries,
+            last_error=error,
+        )
+
+    @staticmethod
+    def _find_calendar_sync(
+        context: TravelContext,
+        event_type: str,
+        workflow_generation: int | None = None,
+    ) -> CalendarSyncRecord | None:
+        for record in reversed(context.calendar_syncs):
+            if record.event_type != event_type:
+                continue
+            if workflow_generation is not None and TravelAgent._calendar_generation(record) != workflow_generation:
+                continue
+            return record
+        return None
+
+    @staticmethod
+    def _upsert_calendar_sync(context: TravelContext, record: CalendarSyncRecord) -> None:
+        for index, existing in enumerate(context.calendar_syncs):
+            if existing.event_type == record.event_type and TravelAgent._calendar_generation(
+                existing
+            ) == TravelAgent._calendar_generation(record):
+                context.calendar_syncs[index] = record
+                return
+        context.calendar_syncs.append(record)
+
+    @staticmethod
+    def _calendar_generation(record: CalendarSyncRecord) -> int:
+        payload = record.payload
+        generation = payload.get("workflow_generation")
+        if generation is None and isinstance(payload.get("payload"), dict):
+            generation = payload["payload"].get("workflow_generation")
+        try:
+            return int(generation)
+        except (TypeError, ValueError):
+            return 1
 
     def _send_or_record_notification(
         self,
@@ -1008,6 +1238,12 @@ def build_default_agent(
         handler=integrations.cancel_approval,
     )
     gateway.register(
+        name="create_change_approval",
+        description="Create an OA approval record for a post-booking trip change.",
+        required=("session_id", "user_id", "request", "current_approval", "refund_estimates", "change_request"),
+        handler=integrations.create_change_approval,
+    )
+    gateway.register(
         name="lock_hotel_inventory",
         description="Lock selected hotel inventory before order creation.",
         required=("session_id", "user_id", "selected_hotel", "check_in", "check_out"),
@@ -1068,6 +1304,21 @@ def build_default_agent(
         handler=integrations.estimate_refund,
     )
     gateway.register(
+        name="confirm_refund",
+        description="Confirm refund amount before executing a cancellation or change.",
+        required=(
+            "estimate_id",
+            "target_type",
+            "target_id",
+            "user_id",
+            "refundable_amount",
+            "penalty_amount",
+            "currency",
+            "reason",
+        ),
+        handler=integrations.confirm_refund,
+    )
+    gateway.register(
         name="change_transport_order",
         description="Change a created flight or train order.",
         required=("order_id", "user_id", "new_depart_at", "reason"),
@@ -1078,6 +1329,12 @@ def build_default_agent(
         description="Change a created hotel order date range.",
         required=("order_id", "user_id", "new_check_in", "new_check_out", "reason"),
         handler=integrations.change_hotel_order,
+    )
+    gateway.register(
+        name="compensate_change_failure",
+        description="Compensate or escalate when one supplier change fails after another succeeded.",
+        required=("session_id", "user_id", "failed_target_type", "failed_target_id", "reason"),
+        handler=integrations.compensate_change_failure,
     )
     gateway.register(
         name="send_notification",

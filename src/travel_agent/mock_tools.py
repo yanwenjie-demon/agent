@@ -15,6 +15,7 @@ from .models import (
     NotificationRecord,
     PolicyResult,
     PriceCheckResult,
+    RefundConfirmationRecord,
     RefundEstimate,
     TravelOrder,
     TransportOption,
@@ -281,6 +282,35 @@ def cancel_approval(approval_id: str, user_id: str, reason: str) -> Compensation
     )
 
 
+def create_change_approval(
+    session_id: str,
+    user_id: str,
+    request: dict[str, Any],
+    current_approval: dict[str, Any],
+    refund_estimates: list[dict[str, Any]],
+    change_request: dict[str, Any],
+    workflow_generation: int = 1,
+) -> ApprovalRecord:
+    approval_id = "CAPP-" + uuid5(
+        NAMESPACE_URL,
+        f"{session_id}:{workflow_generation}:{user_id}:{change_request}",
+    ).hex[:10].upper()
+    return ApprovalRecord(
+        approval_id=approval_id,
+        status="APPROVED",
+        payload={
+            "session_id": session_id,
+            "user_id": user_id,
+            "request": request,
+            "current_approval": current_approval,
+            "refund_estimates": refund_estimates,
+            "change_request": change_request,
+            "workflow_generation": workflow_generation,
+            "approval_type": "CHANGE",
+        },
+    )
+
+
 def lock_hotel_inventory(
     session_id: str,
     user_id: str,
@@ -489,6 +519,42 @@ def estimate_refund(
     )
 
 
+def confirm_refund(
+    estimate_id: str,
+    target_type: str,
+    target_id: str,
+    user_id: str,
+    refundable_amount: int,
+    penalty_amount: int,
+    currency: str,
+    reason: str,
+) -> RefundConfirmationRecord:
+    confirmation_id = "RFC-" + uuid5(
+        NAMESPACE_URL,
+        f"{estimate_id}:{target_type}:{target_id}:{user_id}:{refundable_amount}:{penalty_amount}:{reason}",
+    ).hex[:10].upper()
+    normalized_target = target_type.strip().lower()
+    return RefundConfirmationRecord(
+        confirmation_id=confirmation_id,
+        estimate_id=estimate_id,
+        target_type=normalized_target,
+        target_id=target_id,
+        status="CONFIRMED",
+        confirmed_amount=refundable_amount,
+        currency=currency,
+        payload={
+            "estimate_id": estimate_id,
+            "target_type": normalized_target,
+            "target_id": target_id,
+            "user_id": user_id,
+            "refundable_amount": refundable_amount,
+            "penalty_amount": penalty_amount,
+            "currency": currency,
+            "reason": reason,
+        },
+    )
+
+
 def change_transport_order(
     order_id: str,
     user_id: str,
@@ -541,6 +607,30 @@ def change_hotel_order(
             "new_check_out": new_check_out,
             "new_nights": nights,
             "reason": reason,
+        },
+    )
+
+
+def compensate_change_failure(
+    session_id: str,
+    user_id: str,
+    failed_target_type: str,
+    failed_target_id: str,
+    reason: str,
+    completed_changes: list[dict[str, Any]] | None = None,
+) -> CompensationResult:
+    normalized_target = failed_target_type.strip().lower()
+    return CompensationResult(
+        action="compensate_change_failure",
+        target_id=f"{normalized_target}:{failed_target_id}",
+        status="DONE",
+        payload={
+            "session_id": session_id,
+            "user_id": user_id,
+            "failed_target_type": normalized_target,
+            "failed_target_id": failed_target_id,
+            "reason": reason,
+            "completed_changes": completed_changes or [],
         },
     )
 
@@ -601,8 +691,10 @@ def sync_calendar_event(
     start_at: str,
     end_at: str,
     payload: dict[str, Any],
+    attendees: list[str] | None = None,
     workflow_generation: int = 1,
 ) -> CalendarSyncRecord:
+    attendees = attendees or [user_id]
     calendar_event_id = "CAL-" + uuid5(
         NAMESPACE_URL,
         f"{session_id}:{workflow_generation}:{user_id}:{event_type}:{start_at}:{end_at}",
@@ -623,8 +715,10 @@ def sync_calendar_event(
             "start_at": start_at,
             "end_at": end_at,
             "workflow_generation": workflow_generation,
+            "attendees": attendees,
             "payload": payload,
         },
+        attendees=attendees,
     )
 
 

@@ -23,6 +23,9 @@ class IntegrationSettings:
     order_status_api_url: str | None = None
     order_cancel_api_url: str | None = None
     refund_estimate_api_url: str | None = None
+    refund_confirm_api_url: str | None = None
+    change_approval_api_url: str | None = None
+    change_failure_compensation_api_url: str | None = None
     hotel_change_api_url: str | None = None
     transport_inventory_api_url: str | None = None
     transport_order_api_url: str | None = None
@@ -31,6 +34,7 @@ class IntegrationSettings:
     transport_change_api_url: str | None = None
     notification_api_url: str | None = None
     calendar_api_url: str | None = None
+    otlp_http_endpoint: str | None = None
     policy_api_token: str | None = None
     transport_api_token: str | None = None
     hotel_inventory_api_token: str | None = None
@@ -38,8 +42,10 @@ class IntegrationSettings:
     order_api_token: str | None = None
     notification_api_token: str | None = None
     calendar_api_token: str | None = None
+    otlp_api_token: str | None = None
     use_mock_fallback: bool = True
     notification_use_mock_fallback: bool = True
+    calendar_use_mock_fallback: bool = True
     timeout_seconds: float = 5.0
     session_db_path: str | None = None
 
@@ -59,6 +65,9 @@ class IntegrationSettings:
             order_status_api_url=_optional_env("TRAVEL_ORDER_STATUS_API_URL"),
             order_cancel_api_url=_optional_env("TRAVEL_ORDER_CANCEL_API_URL"),
             refund_estimate_api_url=_optional_env("TRAVEL_REFUND_ESTIMATE_API_URL"),
+            refund_confirm_api_url=_optional_env("TRAVEL_REFUND_CONFIRM_API_URL"),
+            change_approval_api_url=_optional_env("TRAVEL_CHANGE_APPROVAL_API_URL"),
+            change_failure_compensation_api_url=_optional_env("TRAVEL_CHANGE_FAILURE_COMPENSATION_API_URL"),
             hotel_change_api_url=_optional_env("TRAVEL_HOTEL_CHANGE_API_URL"),
             transport_inventory_api_url=_optional_env("TRAVEL_TRANSPORT_INVENTORY_API_URL"),
             transport_order_api_url=_optional_env("TRAVEL_TRANSPORT_ORDER_API_URL"),
@@ -67,6 +76,7 @@ class IntegrationSettings:
             transport_change_api_url=_optional_env("TRAVEL_TRANSPORT_CHANGE_API_URL"),
             notification_api_url=_optional_env("TRAVEL_NOTIFICATION_API_URL"),
             calendar_api_url=_optional_env("TRAVEL_CALENDAR_API_URL"),
+            otlp_http_endpoint=_optional_env("TRAVEL_OTLP_HTTP_ENDPOINT"),
             policy_api_token=_optional_env("TRAVEL_POLICY_API_TOKEN"),
             transport_api_token=_optional_env("TRAVEL_TRANSPORT_API_TOKEN"),
             hotel_inventory_api_token=_optional_env("TRAVEL_HOTEL_INVENTORY_API_TOKEN"),
@@ -74,8 +84,10 @@ class IntegrationSettings:
             order_api_token=_optional_env("TRAVEL_ORDER_API_TOKEN"),
             notification_api_token=_optional_env("TRAVEL_NOTIFICATION_API_TOKEN"),
             calendar_api_token=_optional_env("TRAVEL_CALENDAR_API_TOKEN"),
+            otlp_api_token=_optional_env("TRAVEL_OTLP_API_TOKEN"),
             use_mock_fallback=_bool_env("TRAVEL_USE_MOCK_FALLBACK", True),
             notification_use_mock_fallback=_bool_env("TRAVEL_NOTIFICATION_USE_MOCK_FALLBACK", True),
+            calendar_use_mock_fallback=_bool_env("TRAVEL_CALENDAR_USE_MOCK_FALLBACK", True),
             timeout_seconds=_float_env("TRAVEL_API_TIMEOUT_SECONDS", 5.0),
             session_db_path=_optional_env("TRAVEL_SESSION_DB_PATH"),
         )

@@ -8,6 +8,7 @@ from .models import (
     AgentExecutionRecord,
     ChangeRecord,
     CompensationResult,
+    RefundConfirmationRecord,
     RefundEstimate,
     TravelContext,
     TravelOrder,
@@ -611,6 +612,122 @@ class ApprovalAgent:
             message="OA approval cancellation compensation completed.",
         )
         return context.approval_cancellation
+
+    def create_change_approval(
+        self,
+        context: TravelContext,
+        refund_estimates: list[RefundEstimate],
+        change_request: dict[str, Any],
+    ) -> ApprovalRecord:
+        from .models import ApprovalRecord
+
+        approval = self.gateway.call(
+            "create_change_approval",
+            session_id=context.session_id,
+            user_id=context.request.user_id,
+            request=asdict(context.request),
+            current_approval=asdict(context.approval) if context.approval else {},
+            refund_estimates=[asdict(estimate) for estimate in refund_estimates],
+            change_request=change_request,
+            workflow_generation=context.workflow_generation,
+        )
+        context.change_approvals.append(approval)
+        context.append_event(f"ApprovalAgent created change approval: {approval.approval_id} -> {approval.status}.")
+        _record_execution(
+            context,
+            "ApprovalAgent",
+            "create_change_approval",
+            "SUCCESS",
+            input_refs={
+                "change_request": change_request,
+                "estimate_ids": [estimate.estimate_id for estimate in refund_estimates],
+            },
+            output_refs={
+                "approval_id": approval.approval_id,
+                "status": approval.status,
+            },
+            message="Change approval record created.",
+        )
+        return approval
+
+    def confirm_refund(
+        self,
+        context: TravelContext,
+        estimate: RefundEstimate,
+        reason: str,
+    ) -> RefundConfirmationRecord:
+        confirmation = self.gateway.call(
+            "confirm_refund",
+            estimate_id=estimate.estimate_id,
+            target_type=estimate.target_type,
+            target_id=estimate.target_id,
+            user_id=context.request.user_id,
+            refundable_amount=estimate.refundable_amount,
+            penalty_amount=estimate.penalty_amount,
+            currency=estimate.currency,
+            reason=reason,
+        )
+        context.refund_confirmations.append(confirmation)
+        context.append_event(
+            "ApprovalAgent confirmed refund: "
+            f"{confirmation.target_id} -> {confirmation.status}, amount {confirmation.confirmed_amount}."
+        )
+        _record_execution(
+            context,
+            "ApprovalAgent",
+            "confirm_refund",
+            "SUCCESS",
+            input_refs={
+                "estimate_id": estimate.estimate_id,
+                "target_type": estimate.target_type,
+                "target_id": estimate.target_id,
+            },
+            output_refs={
+                "confirmation_id": confirmation.confirmation_id,
+                "status": confirmation.status,
+                "confirmed_amount": confirmation.confirmed_amount,
+            },
+            message="Refund confirmation completed.",
+        )
+        return confirmation
+
+    def compensate_change_failure(
+        self,
+        context: TravelContext,
+        failed_change: ChangeRecord,
+        reason: str,
+        completed_changes: list[ChangeRecord],
+    ) -> CompensationResult:
+        result = self.gateway.call(
+            "compensate_change_failure",
+            session_id=context.session_id,
+            user_id=context.request.user_id,
+            failed_target_type=failed_change.target_type,
+            failed_target_id=failed_change.target_id,
+            reason=reason,
+            completed_changes=[asdict(change) for change in completed_changes],
+        )
+        context.change_failure_compensations.append(result)
+        context.append_event(
+            "ApprovalAgent compensated change failure: "
+            f"{result.target_id} -> {result.status}."
+        )
+        _record_execution(
+            context,
+            "ApprovalAgent",
+            "compensate_change_failure",
+            "SUCCESS",
+            input_refs={
+                "failed_change_id": failed_change.change_id,
+                "completed_change_ids": [change.change_id for change in completed_changes],
+            },
+            output_refs={
+                "target_id": result.target_id,
+                "status": result.status,
+            },
+            message="Change failure compensation completed.",
+        )
+        return result
 
 
 class BookingAgent:

@@ -171,6 +171,19 @@ class RefundEstimate:
 
 
 @dataclass(frozen=True)
+class RefundConfirmationRecord:
+    confirmation_id: str
+    estimate_id: str
+    target_type: str
+    target_id: str
+    status: str
+    confirmed_amount: int
+    currency: str
+    payload: dict[str, Any]
+    source: str = "mock"
+
+
+@dataclass(frozen=True)
 class ChangeRecord:
     change_id: str
     target_type: str
@@ -193,6 +206,10 @@ class CalendarSyncRecord:
     end_at: str
     payload: dict[str, Any]
     source: str = "mock"
+    attendees: list[str] = field(default_factory=list)
+    retry_count: int = 0
+    max_retries: int = 3
+    last_error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -216,6 +233,13 @@ class DeadLetterNotification:
     session_id: str
     state: str
     notification: NotificationRecord
+
+
+@dataclass(frozen=True)
+class DeadLetterCalendarSync:
+    session_id: str
+    state: str
+    calendar_sync: CalendarSyncRecord
 
 
 @dataclass(frozen=True)
@@ -277,7 +301,10 @@ class TravelContext:
     transport_order_cancellation: CompensationResult | None = None
     inventory_release: CompensationResult | None = None
     refund_estimates: list[RefundEstimate] = field(default_factory=list)
+    refund_confirmations: list[RefundConfirmationRecord] = field(default_factory=list)
+    change_approvals: list[ApprovalRecord] = field(default_factory=list)
     change_records: list[ChangeRecord] = field(default_factory=list)
+    change_failure_compensations: list[CompensationResult] = field(default_factory=list)
     calendar_syncs: list[CalendarSyncRecord] = field(default_factory=list)
     notifications: list[NotificationRecord] = field(default_factory=list)
     notification_keys: list[str] = field(default_factory=list)

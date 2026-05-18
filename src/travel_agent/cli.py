@@ -1,11 +1,18 @@
 from __future__ import annotations
 
 import argparse
+import json
 from datetime import date
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from threading import Thread
+from typing import Callable
+from urllib.parse import urlsplit
 
 from .agent import build_default_agent
 from .config import IntegrationSettings
-from .models import DeadLetterNotification, TravelContext, TravelRequest, WorkerRunRecord
+from .models import DeadLetterCalendarSync, DeadLetterNotification, TravelContext, TravelRequest, WorkerRunRecord
+from .observability import build_otlp_payloads, export_otlp_http
+from .storage import SessionStore
 from .worker import WorkflowLoopResult, WorkflowRunResult, WorkflowWorker
 
 
@@ -136,6 +143,12 @@ def parse_args() -> argparse.Namespace:
         help="Optional calendar event type override for --sync-calendar-session.",
     )
     parser.add_argument(
+        "--calendar-attendee",
+        action="append",
+        default=[],
+        help="Calendar attendee user id or email. Can be repeated.",
+    )
+    parser.add_argument(
         "--run-worker-once",
         action="store_true",
         help="Scan persisted sessions and advance approval/order workflows once.",
@@ -169,6 +182,11 @@ def parse_args() -> argparse.Namespace:
         help="List notification dead letters from persisted sessions.",
     )
     parser.add_argument(
+        "--list-calendar-dead-letters",
+        action="store_true",
+        help="List calendar sync dead letters from persisted sessions.",
+    )
+    parser.add_argument(
         "--replay-dead-letter-session",
         default=None,
         help="Session id whose notification dead letter should be replayed.",
@@ -177,6 +195,16 @@ def parse_args() -> argparse.Namespace:
         "--replay-dead-letter-event",
         default=None,
         help="Notification event type to replay for --replay-dead-letter-session.",
+    )
+    parser.add_argument(
+        "--replay-calendar-dead-letter-session",
+        default=None,
+        help="Session id whose calendar sync dead letter should be replayed.",
+    )
+    parser.add_argument(
+        "--replay-calendar-dead-letter-event",
+        default=None,
+        help="Calendar event type to replay for --replay-calendar-dead-letter-session.",
     )
     parser.add_argument(
         "--observability-limit",
@@ -188,6 +216,48 @@ def parse_args() -> argparse.Namespace:
         "--metrics",
         action="store_true",
         help="Print a compact metrics summary from worker runs and dead letters.",
+    )
+    parser.add_argument(
+        "--metrics-format",
+        choices=("summary", "prometheus"),
+        default="summary",
+        help="Metrics output format.",
+    )
+    parser.add_argument(
+        "--serve-metrics",
+        action="store_true",
+        help="Serve Prometheus metrics over HTTP at /metrics.",
+    )
+    parser.add_argument(
+        "--metrics-host",
+        default="127.0.0.1",
+        help="Host for --serve-metrics.",
+    )
+    parser.add_argument(
+        "--metrics-port",
+        type=int,
+        default=9108,
+        help="Port for --serve-metrics.",
+    )
+    parser.add_argument(
+        "--export-otlp",
+        action="store_true",
+        help="Export OTLP/HTTP traces and metrics to an OpenTelemetry Collector.",
+    )
+    parser.add_argument(
+        "--otlp-endpoint",
+        default=None,
+        help="OpenTelemetry Collector OTLP/HTTP endpoint, for example http://localhost:4318.",
+    )
+    parser.add_argument(
+        "--otlp-service-name",
+        default="travel-agent",
+        help="Service name used in OTLP resource attributes.",
+    )
+    parser.add_argument(
+        "--print-otlp-payload",
+        action="store_true",
+        help="Print generated OTLP trace and metric payloads instead of sending them.",
     )
     return parser.parse_args()
 
@@ -207,14 +277,57 @@ def main() -> None:
         _require_session_db(settings, "--list-dead-letters")
         print(render_dead_letters(agent.session_store.list_dead_letter_notifications(args.observability_limit)))
         return
-    if args.metrics:
-        _require_session_db(settings, "--metrics")
+    if args.list_calendar_dead_letters:
+        _require_session_db(settings, "--list-calendar-dead-letters")
         print(
-            render_metrics(
-                worker_runs=agent.session_store.list_worker_runs(args.observability_limit),
-                dead_letters=agent.session_store.list_dead_letter_notifications(args.observability_limit),
+            render_calendar_dead_letters(
+                agent.session_store.list_dead_letter_calendar_syncs(args.observability_limit)
             )
         )
+        return
+    if args.metrics:
+        _require_session_db(settings, "--metrics")
+        worker_runs = agent.session_store.list_worker_runs(args.observability_limit)
+        dead_letters = agent.session_store.list_dead_letter_notifications(args.observability_limit)
+        sessions = agent.session_store.list_recent(args.observability_limit)
+        if args.metrics_format == "prometheus":
+            print(render_prometheus_metrics(worker_runs, dead_letters, sessions))
+        else:
+            print(render_metrics(worker_runs, dead_letters, sessions))
+        return
+    if args.serve_metrics:
+        _require_session_db(settings, "--serve-metrics")
+        serve_metrics(
+            session_store=agent.session_store,
+            host=args.metrics_host,
+            port=args.metrics_port,
+            limit=args.observability_limit,
+        )
+        return
+    if args.export_otlp:
+        _require_session_db(settings, "--export-otlp")
+        endpoint = args.otlp_endpoint or settings.otlp_http_endpoint
+        if not endpoint and not args.print_otlp_payload:
+            raise SystemExit("--export-otlp requires --otlp-endpoint or TRAVEL_OTLP_HTTP_ENDPOINT.")
+        worker_runs = agent.session_store.list_worker_runs(args.observability_limit)
+        dead_letters = agent.session_store.list_dead_letter_notifications(args.observability_limit)
+        sessions = agent.session_store.list_recent(args.observability_limit)
+        traces_payload, metrics_payload, alerts = build_otlp_payloads(
+            worker_runs,
+            dead_letters,
+            sessions,
+            service_name=args.otlp_service_name,
+        )
+        if args.print_otlp_payload:
+            print(json.dumps({"traces": traces_payload, "metrics": metrics_payload, "alerts": alerts}, ensure_ascii=False))
+            return
+        result = export_otlp_http(
+            endpoint=endpoint,
+            traces_payload=traces_payload,
+            metrics_payload=metrics_payload,
+            token=settings.otlp_api_token,
+        )
+        print(render_otlp_export_result(result))
         return
     if args.replay_dead_letter_session or args.replay_dead_letter_event:
         _require_session_db(settings, "--replay-dead-letter-session")
@@ -222,6 +335,16 @@ def main() -> None:
             raise SystemExit("--replay-dead-letter-session requires --replay-dead-letter-event.")
         context = agent.get_session(args.replay_dead_letter_session)
         context = agent.replay_dead_letter_notification(context, args.replay_dead_letter_event)
+        print(render_context(context))
+        return
+    if args.replay_calendar_dead_letter_session or args.replay_calendar_dead_letter_event:
+        _require_session_db(settings, "--replay-calendar-dead-letter-session")
+        if not args.replay_calendar_dead_letter_session or not args.replay_calendar_dead_letter_event:
+            raise SystemExit(
+                "--replay-calendar-dead-letter-session requires --replay-calendar-dead-letter-event."
+            )
+        context = agent.get_session(args.replay_calendar_dead_letter_session)
+        context = agent.replay_dead_letter_calendar_sync(context, args.replay_calendar_dead_letter_event)
         print(render_context(context))
         return
     if args.replan_session:
@@ -284,7 +407,7 @@ def main() -> None:
         return
     if args.sync_calendar_session:
         context = agent.get_session(args.sync_calendar_session)
-        context = agent.sync_calendar(context, args.calendar_event_type)
+        context = agent.sync_calendar(context, args.calendar_event_type, attendees=args.calendar_attendee or None)
         print(render_context(context))
         return
     if args.cancel_session:
@@ -383,14 +506,32 @@ def render_dead_letters(records: list[DeadLetterNotification]) -> str:
     return "\n".join(lines)
 
 
+def render_calendar_dead_letters(records: list[DeadLetterCalendarSync]) -> str:
+    lines = ["Calendar sync dead letters:"]
+    if not records:
+        lines.append("- none")
+        return "\n".join(lines)
+    for record in records:
+        calendar = record.calendar_sync
+        lines.append(
+            f"- session={record.session_id} state={record.state} event={calendar.event_type} "
+            f"retry={calendar.retry_count}/{calendar.max_retries} error={calendar.last_error or '-'}"
+        )
+    return "\n".join(lines)
+
+
 def render_metrics(
     worker_runs: list[WorkerRunRecord],
     dead_letters: list[DeadLetterNotification],
+    sessions: list[TravelContext] | None = None,
 ) -> str:
+    sessions = sessions or []
     scanned = sum(record.scanned for record in worker_runs)
     advanced = sum(record.advanced for record in worker_runs)
     skipped = sum(record.skipped for record in worker_runs)
     errors = sum(len(record.errors) for record in worker_runs)
+    agent_executions = sum(len(context.agent_executions) for context in sessions)
+    calendar_syncs = sum(len(context.calendar_syncs) for context in sessions)
     lines = [
         "Metrics:",
         f"- worker_runs: {len(worker_runs)}",
@@ -399,8 +540,199 @@ def render_metrics(
         f"- skipped: {skipped}",
         f"- worker_errors: {errors}",
         f"- dead_letters: {len(dead_letters)}",
+        f"- sessions_observed: {len(sessions)}",
+        f"- agent_executions: {agent_executions}",
+        f"- calendar_syncs: {calendar_syncs}",
     ]
     return "\n".join(lines)
+
+
+def render_prometheus_metrics(
+    worker_runs: list[WorkerRunRecord],
+    dead_letters: list[DeadLetterNotification],
+    sessions: list[TravelContext],
+) -> str:
+    scanned = sum(record.scanned for record in worker_runs)
+    advanced = sum(record.advanced for record in worker_runs)
+    skipped = sum(record.skipped for record in worker_runs)
+    errors = sum(len(record.errors) for record in worker_runs)
+    lines = [
+        "# HELP travel_worker_runs_total Total recorded workflow worker runs.",
+        "# TYPE travel_worker_runs_total counter",
+        f"travel_worker_runs_total {len(worker_runs)}",
+        "# HELP travel_worker_sessions_total Total sessions scanned by workflow workers.",
+        "# TYPE travel_worker_sessions_total counter",
+        f'travel_worker_sessions_total{{result="scanned"}} {scanned}',
+        f'travel_worker_sessions_total{{result="advanced"}} {advanced}',
+        f'travel_worker_sessions_total{{result="skipped"}} {skipped}',
+        "# HELP travel_worker_errors_total Total workflow worker errors.",
+        "# TYPE travel_worker_errors_total counter",
+        f"travel_worker_errors_total {errors}",
+        "# HELP travel_notification_dead_letters_total Notification dead letters by event type.",
+        "# TYPE travel_notification_dead_letters_total gauge",
+    ]
+
+    dead_letter_counts: dict[tuple[str, str], int] = {}
+    for record in dead_letters:
+        key = (record.state, record.notification.event_type)
+        dead_letter_counts[key] = dead_letter_counts.get(key, 0) + 1
+    if dead_letter_counts:
+        for (state, event_type), count in sorted(dead_letter_counts.items()):
+            lines.append(
+                "travel_notification_dead_letters_total"
+                f'{{state="{_metric_label(state)}",event_type="{_metric_label(event_type)}"}} {count}'
+            )
+    else:
+        lines.append("travel_notification_dead_letters_total 0")
+
+    lines.extend(
+        [
+            "# HELP travel_sessions_observed_total Sessions included in this metrics snapshot.",
+            "# TYPE travel_sessions_observed_total gauge",
+            f"travel_sessions_observed_total {len(sessions)}",
+            "# HELP travel_session_states_total Sessions by current workflow state.",
+            "# TYPE travel_session_states_total gauge",
+        ]
+    )
+    state_counts: dict[str, int] = {}
+    for context in sessions:
+        state_counts[context.state] = state_counts.get(context.state, 0) + 1
+    if state_counts:
+        for state, count in sorted(state_counts.items()):
+            lines.append(f'travel_session_states_total{{state="{_metric_label(state)}"}} {count}')
+    else:
+        lines.append("travel_session_states_total 0")
+
+    lines.extend(
+        [
+            "# HELP travel_agent_executions_total Agent execution records by agent, action, and status.",
+            "# TYPE travel_agent_executions_total counter",
+        ]
+    )
+    execution_counts: dict[tuple[str, str, str], int] = {}
+    for context in sessions:
+        for record in context.agent_executions:
+            key = (record.agent_name, record.action, record.status)
+            execution_counts[key] = execution_counts.get(key, 0) + 1
+    if execution_counts:
+        for (agent_name, action, status), count in sorted(execution_counts.items()):
+            lines.append(
+                "travel_agent_executions_total"
+                f'{{agent="{_metric_label(agent_name)}",action="{_metric_label(action)}",status="{_metric_label(status)}"}} {count}'
+            )
+    else:
+        lines.append("travel_agent_executions_total 0")
+
+    lines.extend(
+        [
+            "# HELP travel_calendar_syncs_total Calendar sync records by event type, status, and source.",
+            "# TYPE travel_calendar_syncs_total counter",
+        ]
+    )
+    calendar_counts: dict[tuple[str, str, str], int] = {}
+    for context in sessions:
+        for record in context.calendar_syncs:
+            key = (record.event_type, record.status, record.source)
+            calendar_counts[key] = calendar_counts.get(key, 0) + 1
+    if calendar_counts:
+        for (event_type, status, source), count in sorted(calendar_counts.items()):
+            lines.append(
+                "travel_calendar_syncs_total"
+                f'{{event_type="{_metric_label(event_type)}",status="{_metric_label(status)}",source="{_metric_label(source)}"}} {count}'
+            )
+    else:
+        lines.append("travel_calendar_syncs_total 0")
+
+    return "\n".join(lines)
+
+
+def render_otlp_export_result(result: object) -> str:
+    return "\n".join(
+        [
+            "OTLP export result:",
+            f"- traces_url: {getattr(result, 'traces_url')}",
+            f"- traces_status: {getattr(result, 'traces_status')}",
+            f"- metrics_url: {getattr(result, 'metrics_url')}",
+            f"- metrics_status: {getattr(result, 'metrics_status')}",
+            f"- spans: {getattr(result, 'span_count')}",
+            f"- metrics: {getattr(result, 'metric_count')}",
+            f"- sla_alert_points: {getattr(result, 'alert_count')}",
+        ]
+    )
+
+
+def build_prometheus_metrics(session_store: SessionStore, limit: int = 50) -> str:
+    return render_prometheus_metrics(
+        worker_runs=session_store.list_worker_runs(limit),
+        dead_letters=session_store.list_dead_letter_notifications(limit),
+        sessions=session_store.list_recent(limit),
+    )
+
+
+def make_metrics_handler(metrics_provider: Callable[[], str]) -> type[BaseHTTPRequestHandler]:
+    class MetricsHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            path = urlsplit(self.path).path
+            if path == "/health":
+                self._send_text("ok\n", "text/plain; charset=utf-8")
+                return
+            if path == "/metrics":
+                self._send_text(metrics_provider() + "\n", "text/plain; version=0.0.4; charset=utf-8")
+                return
+            self.send_response(404)
+            self.end_headers()
+
+        def log_message(self, format: str, *args: object) -> None:
+            del format, args
+
+        def _send_text(self, body: str, content_type: str) -> None:
+            encoded = body.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(encoded)))
+            self.end_headers()
+            self.wfile.write(encoded)
+
+    return MetricsHandler
+
+
+def create_metrics_server(
+    session_store: SessionStore,
+    host: str = "127.0.0.1",
+    port: int = 9108,
+    limit: int = 50,
+) -> ThreadingHTTPServer:
+    return ThreadingHTTPServer(
+        (host, port),
+        make_metrics_handler(lambda: build_prometheus_metrics(session_store, limit)),
+    )
+
+
+def serve_metrics(
+    session_store: SessionStore,
+    host: str = "127.0.0.1",
+    port: int = 9108,
+    limit: int = 50,
+) -> None:
+    server = create_metrics_server(session_store, host=host, port=port, limit=limit)
+    actual_host, actual_port = server.server_address
+    print(f"Serving metrics on http://{actual_host}:{actual_port}/metrics")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+
+
+def run_metrics_server_in_thread(server: ThreadingHTTPServer) -> Thread:
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return thread
+
+
+def _metric_label(value: object) -> str:
+    return str(value).replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
 
 
 def _replace_session_db(settings: IntegrationSettings, session_db_path: str) -> IntegrationSettings:
@@ -418,6 +750,9 @@ def _replace_session_db(settings: IntegrationSettings, session_db_path: str) -> 
         order_status_api_url=settings.order_status_api_url,
         order_cancel_api_url=settings.order_cancel_api_url,
         refund_estimate_api_url=settings.refund_estimate_api_url,
+        refund_confirm_api_url=settings.refund_confirm_api_url,
+        change_approval_api_url=settings.change_approval_api_url,
+        change_failure_compensation_api_url=settings.change_failure_compensation_api_url,
         hotel_change_api_url=settings.hotel_change_api_url,
         transport_inventory_api_url=settings.transport_inventory_api_url,
         transport_order_api_url=settings.transport_order_api_url,
@@ -426,6 +761,7 @@ def _replace_session_db(settings: IntegrationSettings, session_db_path: str) -> 
         transport_change_api_url=settings.transport_change_api_url,
         notification_api_url=settings.notification_api_url,
         calendar_api_url=settings.calendar_api_url,
+        otlp_http_endpoint=settings.otlp_http_endpoint,
         policy_api_token=settings.policy_api_token,
         transport_api_token=settings.transport_api_token,
         hotel_inventory_api_token=settings.hotel_inventory_api_token,
@@ -433,8 +769,10 @@ def _replace_session_db(settings: IntegrationSettings, session_db_path: str) -> 
         order_api_token=settings.order_api_token,
         notification_api_token=settings.notification_api_token,
         calendar_api_token=settings.calendar_api_token,
+        otlp_api_token=settings.otlp_api_token,
         use_mock_fallback=settings.use_mock_fallback,
         notification_use_mock_fallback=settings.notification_use_mock_fallback,
+        calendar_use_mock_fallback=settings.calendar_use_mock_fallback,
         timeout_seconds=settings.timeout_seconds,
         session_db_path=session_db_path,
     )
@@ -659,6 +997,19 @@ def render_context(context: TravelContext) -> str:
                 f"{estimate.currency} | 手续费 {estimate.penalty_amount} | 来源 {estimate.source}"
             )
 
+    if context.change_approvals:
+        lines.extend(["", "改签审批:"])
+        for approval in context.change_approvals:
+            lines.append(f"- {approval.approval_id} | {approval.status} | 来源 {approval.source}")
+
+    if context.refund_confirmations:
+        lines.extend(["", "退款确认:"])
+        for confirmation in context.refund_confirmations:
+            lines.append(
+                f"- {confirmation.target_type} {confirmation.target_id} | {confirmation.status} | "
+                f"确认退款 {confirmation.confirmed_amount} {confirmation.currency} | 来源 {confirmation.source}"
+            )
+
     if context.change_records:
         lines.extend(["", "改签记录:"])
         for record in context.change_records:
@@ -667,13 +1018,24 @@ def render_context(context: TravelContext) -> str:
                 f"手续费 {record.penalty_amount} {record.currency} | 来源 {record.source}"
             )
 
+    if context.change_failure_compensations:
+        lines.extend(["", "改签失败补偿:"])
+        for result in context.change_failure_compensations:
+            lines.append(
+                f"- 动作: {result.action} | 目标: {result.target_id} | 状态: {result.status} | 来源 {result.source}"
+            )
+
     if context.calendar_syncs:
         lines.extend(["", "日历同步:"])
         for record in context.calendar_syncs:
             lines.append(
                 f"- {record.event_type} | {record.calendar_event_id} | {record.status} | "
-                f"{record.start_at}->{record.end_at} | 来源 {record.source}"
+                f"{record.start_at}->{record.end_at} | 重试 {record.retry_count}/{record.max_retries} | 来源 {record.source}"
             )
+            if record.attendees:
+                lines.append(f"  参会人: {', '.join(record.attendees)}")
+            if record.last_error:
+                lines.append(f"  错误: {record.last_error}")
 
     if context.notifications:
         lines.extend(["", "通知:"])

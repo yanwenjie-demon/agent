@@ -19,6 +19,7 @@ from .models import (
     NotificationRecord,
     PolicyResult,
     PriceCheckResult,
+    RefundConfirmationRecord,
     RefundEstimate,
     TravelOrder,
     TransportOption,
@@ -254,6 +255,40 @@ class TravelSystemIntegrations:
                 return self._fallback_cancel_approval(approval_id, user_id, reason, exc)
 
         return self._fallback_cancel_approval(approval_id, user_id, reason, None)
+
+    def create_change_approval(
+        self,
+        session_id: str,
+        user_id: str,
+        request: dict[str, Any],
+        current_approval: dict[str, Any],
+        refund_estimates: list[dict[str, Any]],
+        change_request: dict[str, Any],
+        workflow_generation: int = 1,
+    ) -> ApprovalRecord:
+        payload = {
+            "session_id": session_id,
+            "user_id": user_id,
+            "request": request,
+            "current_approval": current_approval,
+            "refund_estimates": refund_estimates,
+            "change_request": change_request,
+            "workflow_generation": workflow_generation,
+            "approval_type": "CHANGE",
+            "idempotency_key": f"change-approval:{session_id}:{workflow_generation}:{user_id}",
+        }
+        if self.settings.change_approval_api_url:
+            try:
+                response = self.http_client.post_json(
+                    self.settings.change_approval_api_url,
+                    payload,
+                    self.settings.oa_approval_api_token,
+                )
+                return self._parse_approval_response(response, payload, source="real")
+            except Exception as exc:
+                return self._fallback_change_approval(payload, exc)
+
+        return self._fallback_change_approval(payload, None)
 
     def lock_hotel_inventory(
         self,
@@ -531,6 +566,41 @@ class TravelSystemIntegrations:
 
         return self._fallback_refund_estimate(target_type, target_id, user_id, total_amount, reason, None)
 
+    def confirm_refund(
+        self,
+        estimate_id: str,
+        target_type: str,
+        target_id: str,
+        user_id: str,
+        refundable_amount: int,
+        penalty_amount: int,
+        currency: str,
+        reason: str,
+    ) -> RefundConfirmationRecord:
+        payload = {
+            "estimate_id": estimate_id,
+            "target_type": target_type,
+            "target_id": target_id,
+            "user_id": user_id,
+            "refundable_amount": refundable_amount,
+            "penalty_amount": penalty_amount,
+            "currency": currency,
+            "reason": reason,
+            "idempotency_key": f"refund-confirm:{estimate_id}:{target_type}:{target_id}:{user_id}",
+        }
+        if self.settings.refund_confirm_api_url:
+            try:
+                response = self.http_client.post_json(
+                    self.settings.refund_confirm_api_url,
+                    payload,
+                    self.settings.order_api_token,
+                )
+                return self._parse_refund_confirmation_response(response, payload, source="real")
+            except Exception as exc:
+                return self._fallback_refund_confirmation(payload, exc)
+
+        return self._fallback_refund_confirmation(payload, None)
+
     def change_transport_order(
         self,
         order_id: str,
@@ -587,6 +657,45 @@ class TravelSystemIntegrations:
 
         return self._fallback_change_hotel_order(order_id, user_id, new_check_in, new_check_out, reason, None)
 
+    def compensate_change_failure(
+        self,
+        session_id: str,
+        user_id: str,
+        failed_target_type: str,
+        failed_target_id: str,
+        reason: str,
+        completed_changes: list[dict[str, Any]] | None = None,
+    ) -> CompensationResult:
+        payload = {
+            "session_id": session_id,
+            "user_id": user_id,
+            "failed_target_type": failed_target_type,
+            "failed_target_id": failed_target_id,
+            "reason": reason,
+            "completed_changes": completed_changes or [],
+            "idempotency_key": (
+                f"change-failure-compensation:{session_id}:{failed_target_type}:{failed_target_id}:{user_id}"
+            ),
+        }
+        if self.settings.change_failure_compensation_api_url:
+            try:
+                response = self.http_client.post_json(
+                    self.settings.change_failure_compensation_api_url,
+                    payload,
+                    self.settings.order_api_token,
+                )
+                return self._parse_compensation_response(
+                    response,
+                    payload,
+                    "compensate_change_failure",
+                    f"{failed_target_type}:{failed_target_id}",
+                    source="real",
+                )
+            except Exception as exc:
+                return self._fallback_change_failure_compensation(payload, exc)
+
+        return self._fallback_change_failure_compensation(payload, None)
+
     def send_notification(
         self,
         session_id: str,
@@ -631,8 +740,10 @@ class TravelSystemIntegrations:
         start_at: str,
         end_at: str,
         payload: dict[str, Any],
+        attendees: list[str] | None = None,
         workflow_generation: int = 1,
     ) -> CalendarSyncRecord:
+        attendees = attendees or [user_id]
         request_payload = {
             "session_id": session_id,
             "user_id": user_id,
@@ -640,6 +751,7 @@ class TravelSystemIntegrations:
             "title": title,
             "start_at": start_at,
             "end_at": end_at,
+            "attendees": attendees,
             "workflow_generation": workflow_generation,
             "payload": payload,
             "idempotency_key": f"calendar:{session_id}:{workflow_generation}:{event_type}",
@@ -784,6 +896,28 @@ class TravelSystemIntegrations:
                 **result.payload,
                 "fallback_reason": f"OA approval cancellation system unavailable, used mock fallback: {exc}",
             },
+        )
+
+    def _fallback_change_approval(self, payload: dict[str, Any], exc: Exception | None) -> ApprovalRecord:
+        self._ensure_fallback_allowed("change approval", exc)
+        fallback_payload = dict(payload)
+        if exc is not None:
+            fallback_payload["fallback_reason"] = f"Change approval system unavailable, used mock fallback: {exc}"
+        approval = mock_tools.create_change_approval(
+            session_id=fallback_payload["session_id"],
+            user_id=fallback_payload["user_id"],
+            request=fallback_payload["request"],
+            current_approval=fallback_payload["current_approval"],
+            refund_estimates=list(fallback_payload.get("refund_estimates", [])),
+            change_request=fallback_payload["change_request"],
+            workflow_generation=int(fallback_payload.get("workflow_generation", 1)),
+        )
+        if exc is None:
+            return approval
+        return replace(
+            approval,
+            source="mock_fallback",
+            payload={**approval.payload, "fallback_reason": fallback_payload["fallback_reason"]},
         )
 
     def _fallback_inventory_lock(
@@ -1001,6 +1135,33 @@ class TravelSystemIntegrations:
             },
         )
 
+    def _fallback_refund_confirmation(
+        self,
+        payload: dict[str, Any],
+        exc: Exception | None,
+    ) -> RefundConfirmationRecord:
+        self._ensure_fallback_allowed("refund confirmation", exc)
+        result = mock_tools.confirm_refund(
+            estimate_id=payload["estimate_id"],
+            target_type=payload["target_type"],
+            target_id=payload["target_id"],
+            user_id=payload["user_id"],
+            refundable_amount=int(payload["refundable_amount"]),
+            penalty_amount=int(payload["penalty_amount"]),
+            currency=payload["currency"],
+            reason=payload["reason"],
+        )
+        if exc is None:
+            return result
+        return replace(
+            result,
+            source="mock_fallback",
+            payload={
+                **result.payload,
+                "fallback_reason": f"Refund confirmation system unavailable, used mock fallback: {exc}",
+            },
+        )
+
     def _fallback_change_transport_order(
         self,
         order_id: str,
@@ -1044,6 +1205,31 @@ class TravelSystemIntegrations:
             },
         )
 
+    def _fallback_change_failure_compensation(
+        self,
+        payload: dict[str, Any],
+        exc: Exception | None,
+    ) -> CompensationResult:
+        self._ensure_fallback_allowed("change failure compensation", exc)
+        result = mock_tools.compensate_change_failure(
+            session_id=payload["session_id"],
+            user_id=payload["user_id"],
+            failed_target_type=payload["failed_target_type"],
+            failed_target_id=payload["failed_target_id"],
+            reason=payload["reason"],
+            completed_changes=list(payload.get("completed_changes", [])),
+        )
+        if exc is None:
+            return result
+        return replace(
+            result,
+            source="mock_fallback",
+            payload={
+                **result.payload,
+                "fallback_reason": f"Change failure compensation system unavailable, used mock fallback: {exc}",
+            },
+        )
+
     def _fallback_notification(
         self,
         payload: dict[str, Any],
@@ -1080,6 +1266,10 @@ class TravelSystemIntegrations:
         payload: dict[str, Any],
         exc: Exception | None,
     ) -> CalendarSyncRecord:
+        if not self.settings.calendar_use_mock_fallback:
+            if exc is None:
+                raise IntegrationError("calendar API URL is not configured and calendar mock fallback is disabled.")
+            raise IntegrationError(f"calendar integration failed and calendar mock fallback is disabled: {exc}") from exc
         self._ensure_fallback_allowed("calendar", exc)
         result = mock_tools.sync_calendar_event(
             session_id=payload["session_id"],
@@ -1089,6 +1279,7 @@ class TravelSystemIntegrations:
             start_at=payload["start_at"],
             end_at=payload["end_at"],
             payload=payload["payload"],
+            attendees=list(payload.get("attendees", [payload["user_id"]])),
             workflow_generation=int(payload.get("workflow_generation", 1)),
         )
         if exc is None:
@@ -1405,6 +1596,33 @@ class TravelSystemIntegrations:
         )
 
     @staticmethod
+    def _parse_refund_confirmation_response(
+        response: dict[str, Any],
+        request_payload: dict[str, Any],
+        source: str,
+    ) -> RefundConfirmationRecord:
+        body = _unwrap(response, "refund_confirmation")
+        confirmed_amount = int(
+            body.get("confirmed_amount")
+            or body.get("refund_amount")
+            or body.get("refundable_amount")
+            or request_payload["refundable_amount"]
+        )
+        return RefundConfirmationRecord(
+            confirmation_id=str(
+                body.get("confirmation_id") or body.get("id") or request_payload["idempotency_key"]
+            ),
+            estimate_id=str(body.get("estimate_id") or request_payload["estimate_id"]),
+            target_type=str(body.get("target_type") or request_payload["target_type"]),
+            target_id=str(body.get("target_id") or request_payload["target_id"]),
+            status=str(body.get("status") or body.get("state") or "CONFIRMED"),
+            confirmed_amount=confirmed_amount,
+            currency=str(body.get("currency") or request_payload["currency"]),
+            payload=body.get("payload") or request_payload,
+            source=source,
+        )
+
+    @staticmethod
     def _parse_change_response(
         response: dict[str, Any],
         request_payload: dict[str, Any],
@@ -1469,6 +1687,10 @@ class TravelSystemIntegrations:
             end_at=str(body.get("end_at") or request_payload["end_at"]),
             payload=body.get("payload") or request_payload,
             source=source,
+            attendees=list(body.get("attendees") or request_payload.get("attendees", [])),
+            retry_count=int(body.get("retry_count") or 0),
+            max_retries=int(body.get("max_retries") or 3),
+            last_error=body.get("last_error"),
         )
 
 

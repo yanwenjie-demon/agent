@@ -6,16 +6,35 @@ import unittest
 from datetime import date
 from pathlib import Path
 from typing import Any
+from urllib.request import urlopen
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from travel_agent.agent import build_default_agent
-from travel_agent.cli import render_context, render_dead_letters, render_metrics, render_worker_runs
+from travel_agent.cli import (
+    create_metrics_server,
+    render_calendar_dead_letters,
+    render_context,
+    render_dead_letters,
+    render_metrics,
+    render_otlp_export_result,
+    render_prometheus_metrics,
+    render_worker_runs,
+    run_metrics_server_in_thread,
+)
 from travel_agent.config import IntegrationSettings
 from travel_agent.domain_agents import ApprovalAgent, BookingAgent, HotelAgent, PolicyAgent, TransportAgent
 from travel_agent.integrations import IntegrationError
-from travel_agent.models import DeadLetterNotification, NotificationRecord, TravelRequest, WorkerRunRecord
+from travel_agent.models import (
+    CalendarSyncRecord,
+    DeadLetterCalendarSync,
+    DeadLetterNotification,
+    NotificationRecord,
+    TravelRequest,
+    WorkerRunRecord,
+)
+from travel_agent.observability import build_otlp_payloads, build_sla_alerts, export_otlp_http
 from travel_agent.state import TravelState
 from travel_agent.storage import InMemorySessionStore, SQLiteSessionStore
 from travel_agent.tools import ToolGateway, ToolValidationError
@@ -105,9 +124,15 @@ class TravelAgentFlowTest(unittest.TestCase):
         self.assertEqual(len(context.change_records), 2)
         self.assertEqual({record.target_type for record in context.change_records}, {"hotel", "transport"})
         self.assertEqual({record.status for record in context.change_records}, {"CHANGED"})
+        self.assertEqual(len(context.change_approvals), 1)
+        self.assertEqual(context.change_approvals[0].status, "APPROVED")
+        self.assertEqual(len(context.refund_confirmations), 2)
+        self.assertEqual(context.calendar_syncs[-1].event_type, "TRIP_CHANGED")
         actions = {(record.agent_name, record.action) for record in context.agent_executions}
         self.assertIn(("TransportAgent", "change_transport_order"), actions)
         self.assertIn(("BookingAgent", "change_hotel_order"), actions)
+        self.assertIn(("ApprovalAgent", "create_change_approval"), actions)
+        self.assertIn(("ApprovalAgent", "confirm_refund"), actions)
 
     def test_syncs_calendar_for_completed_changed_and_cancelled_trip(self) -> None:
         agent = build_default_agent()
@@ -123,7 +148,6 @@ class TravelAgentFlowTest(unittest.TestCase):
             new_check_out=date(2026, 6, 6),
             reason="meeting_rescheduled",
         )
-        changed = agent.sync_calendar(changed)
 
         self.assertEqual(changed.calendar_syncs[-1].event_type, "TRIP_CHANGED")
         self.assertEqual(changed.calendar_syncs[-1].start_at, "2026-06-04")
@@ -133,6 +157,15 @@ class TravelAgentFlowTest(unittest.TestCase):
         cancelled = agent.sync_calendar(cancelled)
 
         self.assertEqual(cancelled.calendar_syncs[-1].event_type, "TRIP_CANCELLED")
+
+    def test_syncs_calendar_with_attendees(self) -> None:
+        agent = build_default_agent()
+        context = agent.sync_calendar(
+            agent.run_to_order(_request()),
+            attendees=["u-demo", "manager@example.com"],
+        )
+
+        self.assertEqual(context.calendar_syncs[-1].attendees, ["u-demo", "manager@example.com"])
 
     def test_notify_current_state_is_idempotent(self) -> None:
         agent = build_default_agent()
@@ -525,6 +558,23 @@ class IntegrationAdapterTest(unittest.TestCase):
                         "rules": ["remote refund rule"],
                     }
                 },
+                "https://oa.example/change": {
+                    "approval": {
+                        "approval_id": "REMOTE-CHANGE-APPROVAL-1",
+                        "status": "APPROVED",
+                    }
+                },
+                "https://refund.example/confirm": {
+                    "refund_confirmation": {
+                        "confirmation_id": "REMOTE-RFC-1",
+                        "estimate_id": "REMOTE-RFD-1",
+                        "target_type": "hotel",
+                        "target_id": "REMOTE-ORDER-1",
+                        "status": "CONFIRMED",
+                        "confirmed_amount": 1000,
+                        "currency": "CNY",
+                    }
+                },
                 "https://transport.example/change": {
                     "change": {
                         "change_id": "REMOTE-TCHG-1",
@@ -549,6 +599,8 @@ class IntegrationAdapterTest(unittest.TestCase):
         )
         settings = _remote_order_settings(
             refund_estimate_api_url="https://refund.example/estimate",
+            refund_confirm_api_url="https://refund.example/confirm",
+            change_approval_api_url="https://oa.example/change",
             transport_change_api_url="https://transport.example/change",
             hotel_change_api_url="https://hotel.example/change",
         )
@@ -563,10 +615,67 @@ class IntegrationAdapterTest(unittest.TestCase):
         )
 
         self.assertEqual(context.refund_estimates[0].source, "real")
+        self.assertEqual(context.change_approvals[0].source, "real")
+        self.assertEqual(context.change_approvals[0].approval_id, "REMOTE-CHANGE-APPROVAL-1")
+        self.assertEqual(context.refund_confirmations[0].source, "real")
+        self.assertEqual(context.refund_confirmations[0].confirmation_id, "REMOTE-RFC-1")
         self.assertEqual(context.change_records[0].source, "real")
         self.assertEqual(context.change_records[1].source, "real")
         self.assertEqual(context.change_records[0].change_id, "REMOTE-TCHG-1")
         self.assertEqual(context.change_records[1].change_id, "REMOTE-HCHG-1")
+
+    def test_change_trip_records_supplier_failure_compensation(self) -> None:
+        http = StubHttpClient(
+            _remote_order_responses()
+            | {
+                "https://transport.example/change": {
+                    "change": {
+                        "change_id": "REMOTE-TCHG-FAILED",
+                        "target_type": "transport",
+                        "target_id": "REMOTE-TRANSPORT-ORDER-1",
+                        "status": "FAILED",
+                        "penalty_amount": 0,
+                        "currency": "CNY",
+                    }
+                },
+                "https://hotel.example/change": {
+                    "change": {
+                        "change_id": "REMOTE-HCHG-1",
+                        "target_type": "hotel",
+                        "target_id": "REMOTE-ORDER-1",
+                        "status": "CHANGED",
+                        "penalty_amount": 80,
+                        "currency": "CNY",
+                    }
+                },
+                "https://change.example/compensate": {
+                    "compensation": {
+                        "action": "compensate_change_failure",
+                        "target_id": "transport:REMOTE-TRANSPORT-ORDER-1",
+                        "status": "DONE",
+                    }
+                },
+            }
+        )
+        settings = _remote_order_settings(
+            transport_change_api_url="https://transport.example/change",
+            hotel_change_api_url="https://hotel.example/change",
+            change_failure_compensation_api_url="https://change.example/compensate",
+        )
+
+        agent = build_default_agent(settings=settings, http_client=http)
+        context = agent.change_trip(
+            agent.run_to_order(_request()),
+            new_depart_at="2026-06-03T13:00:00+08:00",
+            new_check_in=date(2026, 6, 4),
+            new_check_out=date(2026, 6, 6),
+            reason="meeting_rescheduled",
+        )
+
+        self.assertEqual(context.change_records[0].status, "FAILED")
+        self.assertEqual(len(context.change_failure_compensations), 1)
+        self.assertEqual(context.change_failure_compensations[0].source, "real")
+        self.assertFalse(context.calendar_syncs)
 
     def test_uses_real_http_integration_for_calendar_sync(self) -> None:
         http = StubHttpClient(
@@ -998,12 +1107,11 @@ class SessionStoreTest(unittest.TestCase):
             )
             changed_reloaded = SQLiteSessionStore(db_path).get(changed.session_id)
             self.assertEqual(len(changed_reloaded.refund_estimates), 2)
+            self.assertEqual(len(changed_reloaded.refund_confirmations), 2)
+            self.assertEqual(len(changed_reloaded.change_approvals), 1)
             self.assertEqual(len(changed_reloaded.change_records), 2)
-
-            synced = agent.sync_calendar(changed)
-            synced_reloaded = SQLiteSessionStore(db_path).get(synced.session_id)
-            self.assertEqual(len(synced_reloaded.calendar_syncs), 1)
-            self.assertEqual(synced_reloaded.calendar_syncs[0].event_type, "TRIP_CHANGED")
+            self.assertEqual(len(changed_reloaded.calendar_syncs), 1)
+            self.assertEqual(changed_reloaded.calendar_syncs[0].event_type, "TRIP_CHANGED")
 
     def test_sqlite_session_store_lists_by_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1017,6 +1125,20 @@ class SessionStoreTest(unittest.TestCase):
 
             self.assertEqual([context.session_id for context in approval_sessions], [approval_context.session_id])
             self.assertNotEqual(approval_sessions[0].session_id, completed_context.session_id)
+
+    def test_sqlite_session_store_lists_recent_sessions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "sessions.sqlite3"
+            store = SQLiteSessionStore(db_path)
+            agent = build_default_agent(session_store=store)
+            first = agent.run_to_approval(_request())
+            second = agent.run_to_order(_request())
+
+            sessions = SQLiteSessionStore(db_path).list_recent(limit=2)
+
+            self.assertEqual(len(sessions), 2)
+            self.assertEqual(sessions[0].session_id, second.session_id)
+            self.assertEqual(sessions[1].session_id, first.session_id)
 
     def test_sqlite_session_store_records_worker_runs(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1058,6 +1180,31 @@ class SessionStoreTest(unittest.TestCase):
             self.assertEqual(dead_letters[0].session_id, context.session_id)
             self.assertEqual(dead_letters[0].notification.event_type, "ORDER_COMPLETED")
             self.assertEqual(dead_letters[0].notification.status, "DEAD_LETTER")
+
+    def test_sqlite_session_store_lists_calendar_dead_letters(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "sessions.sqlite3"
+            store = SQLiteSessionStore(db_path)
+            settings = IntegrationSettings(
+                calendar_api_url="https://calendar.example/sync",
+                calendar_use_mock_fallback=False,
+            )
+            agent = build_default_agent(
+                settings=settings,
+                http_client=CalendarFailingHttpClient(),
+                session_store=store,
+            )
+            context = agent.sync_calendar(agent.run_to_order(_request()))
+
+            worker = WorkflowWorker(agent)
+            worker.run_once()
+            worker.run_once()
+            dead_letters = SQLiteSessionStore(db_path).list_dead_letter_calendar_syncs()
+
+            self.assertEqual(len(dead_letters), 1)
+            self.assertEqual(dead_letters[0].session_id, context.session_id)
+            self.assertEqual(dead_letters[0].calendar_sync.event_type, "TRIP_BOOKED")
+            self.assertEqual(dead_letters[0].calendar_sync.status, "DEAD_LETTER")
 
 
 class WorkflowWorkerTest(unittest.TestCase):
@@ -1175,6 +1322,46 @@ class WorkflowWorkerTest(unittest.TestCase):
         self.assertEqual(updated.notifications[0].status, "DEAD_LETTER")
         self.assertEqual(updated.notifications[0].retry_count, 3)
 
+    def test_worker_retries_failed_calendar_sync_and_marks_dead_letter(self) -> None:
+        store = InMemorySessionStore()
+        settings = IntegrationSettings(
+            calendar_api_url="https://calendar.example/sync",
+            calendar_use_mock_fallback=False,
+        )
+        agent = build_default_agent(settings=settings, http_client=CalendarFailingHttpClient(), session_store=store)
+        context = agent.sync_calendar(agent.run_to_order(_request()))
+
+        worker = WorkflowWorker(agent)
+        worker.run_once()
+        worker.run_once()
+        updated = store.get(context.session_id)
+
+        self.assertEqual(updated.calendar_syncs[0].status, "DEAD_LETTER")
+        self.assertEqual(updated.calendar_syncs[0].retry_count, 3)
+
+    def test_replay_calendar_dead_letter_syncs_again(self) -> None:
+        store = InMemorySessionStore()
+        settings = IntegrationSettings(
+            calendar_api_url="https://calendar.example/sync",
+            calendar_use_mock_fallback=False,
+        )
+        agent = build_default_agent(
+            settings=settings,
+            http_client=FlakyCalendarHttpClient(failures=3),
+            session_store=store,
+        )
+        context = agent.sync_calendar(agent.run_to_order(_request()))
+
+        worker = WorkflowWorker(agent)
+        worker.run_once()
+        worker.run_once()
+        dead_letter_context = store.get(context.session_id)
+        replayed = agent.replay_dead_letter_calendar_sync(dead_letter_context, "TRIP_BOOKED")
+
+        self.assertEqual(replayed.calendar_syncs[0].status, "SYNCED")
+        self.assertEqual(replayed.calendar_syncs[0].retry_count, 0)
+        self.assertEqual(replayed.calendar_syncs[0].calendar_event_id, "REMOTE-CALENDAR-REPLAY")
+
     def test_replay_dead_letter_notification_sends_again(self) -> None:
         store = InMemorySessionStore()
         settings = IntegrationSettings(
@@ -1269,6 +1456,183 @@ class CliRenderTest(unittest.TestCase):
         self.assertIn("WRK-1", render_worker_runs([worker_run]))
         self.assertIn("ORDER_COMPLETED", render_dead_letters([dead_letter]))
         self.assertIn("- dead_letters: 1", render_metrics([worker_run], [dead_letter]))
+        calendar_dead_letter = CalendarSyncRecord(
+            calendar_event_id="CAL-1",
+            event_type="TRIP_BOOKED",
+            status="DEAD_LETTER",
+            user_id="u-demo",
+            title="title",
+            start_at="2026-06-03",
+            end_at="2026-06-05",
+            payload={},
+            retry_count=3,
+            last_error="calendar unavailable",
+        )
+        self.assertIn(
+            "TRIP_BOOKED",
+            render_calendar_dead_letters(
+                [
+                    DeadLetterCalendarSync(
+                        session_id="S-1",
+                        state=TravelState.COMPLETED.value,
+                        calendar_sync=calendar_dead_letter,
+                    )
+                ]
+            ),
+        )
+
+    def test_renders_prometheus_metrics_for_agent_and_calendar_records(self) -> None:
+        agent = build_default_agent()
+        context = agent.sync_calendar(agent.run_to_order(_request()))
+        worker_run = WorkerRunRecord(
+            run_id="WRK-1",
+            started_at="2026-05-14T00:00:00+00:00",
+            finished_at="2026-05-14T00:00:01+00:00",
+            scanned=1,
+            advanced=1,
+            skipped=0,
+            errors={},
+            session_ids=[context.session_id],
+        )
+
+        rendered = render_prometheus_metrics([worker_run], [], [context])
+
+        self.assertIn("travel_worker_runs_total 1", rendered)
+        self.assertIn('travel_session_states_total{state="COMPLETED"} 1', rendered)
+        self.assertIn('travel_agent_executions_total{agent="PolicyAgent",action="check_policies",status="SUCCESS"} 1', rendered)
+        self.assertIn('travel_calendar_syncs_total{event_type="TRIP_BOOKED",status="SYNCED",source="mock"} 1', rendered)
+
+    def test_serves_prometheus_metrics_over_http(self) -> None:
+        store = InMemorySessionStore()
+        agent = build_default_agent(session_store=store)
+        agent.sync_calendar(agent.run_to_order(_request()))
+        WorkflowWorker(agent).run_once()
+        server = create_metrics_server(store, port=0)
+        thread = run_metrics_server_in_thread(server)
+        host, port = server.server_address
+        try:
+            with urlopen(f"http://{host}:{port}/health", timeout=5) as response:
+                health = response.read().decode("utf-8")
+            with urlopen(f"http://{host}:{port}/metrics", timeout=5) as response:
+                metrics = response.read().decode("utf-8")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+        self.assertEqual(health, "ok\n")
+        self.assertIn("travel_worker_runs_total 1", metrics)
+        self.assertIn("travel_calendar_syncs_total", metrics)
+
+    def test_builds_otlp_payloads_and_sla_alerts(self) -> None:
+        agent = build_default_agent()
+        context = agent.sync_calendar(agent.run_to_order(_request()))
+        worker_run = WorkerRunRecord(
+            run_id="WRK-1",
+            started_at="2026-05-14T00:00:00+00:00",
+            finished_at="2026-05-14T00:00:01+00:00",
+            scanned=1,
+            advanced=1,
+            skipped=0,
+            errors={"S-ERR": "boom"},
+            session_ids=[context.session_id],
+        )
+        dead_letter = DeadLetterNotification(
+            session_id=context.session_id,
+            state=TravelState.COMPLETED.value,
+            notification=NotificationRecord(
+                notification_id="NTF-1",
+                event_type="ORDER_COMPLETED",
+                channel="im",
+                recipient_id="u-demo",
+                title="title",
+                message="message",
+                status="DEAD_LETTER",
+                payload={},
+                retry_count=3,
+                max_retries=3,
+                last_error="unavailable",
+            ),
+        )
+
+        traces_payload, metrics_payload, alerts = build_otlp_payloads(
+            [worker_run],
+            [dead_letter],
+            [context],
+            service_name="travel-agent-test",
+        )
+
+        spans = traces_payload["resourceSpans"][0]["scopeSpans"][0]["spans"]
+        metrics = metrics_payload["resourceMetrics"][0]["scopeMetrics"][0]["metrics"]
+        alert_types = {alert["alert_type"] for alert in alerts}
+
+        self.assertGreaterEqual(len(spans), len(context.agent_executions) + 1)
+        self.assertTrue(any(metric["name"] == "travel.agent.executions" for metric in metrics))
+        self.assertTrue(any(metric["name"] == "travel.sla.alerts" for metric in metrics))
+        self.assertIn("worker_errors", alert_types)
+        self.assertIn("notification_dead_letters", alert_types)
+
+    def test_exports_otlp_http_payloads(self) -> None:
+        calls: list[tuple[str, dict[str, Any], str | None]] = []
+
+        def post_json(url: str, payload: dict[str, Any], token: str | None) -> int:
+            calls.append((url, payload, token))
+            return 200
+
+        traces_payload = {"resourceSpans": [{"scopeSpans": [{"spans": [{"spanId": "1"}]}]}]}
+        metrics_payload = {
+            "resourceMetrics": [
+                {
+                    "scopeMetrics": [
+                        {
+                            "metrics": [
+                                {"name": "travel.worker.runs", "sum": {"dataPoints": [{"asInt": "1"}]}},
+                                {"name": "travel.sla.alerts", "gauge": {"dataPoints": [{"asInt": "0"}]}},
+                            ]
+                        }
+                    ]
+                }
+            ]
+        }
+
+        result = export_otlp_http(
+            "http://collector:4318",
+            traces_payload,
+            metrics_payload,
+            token="otel-token",
+            post_json=post_json,
+        )
+
+        self.assertEqual([call[0] for call in calls], ["http://collector:4318/v1/traces", "http://collector:4318/v1/metrics"])
+        self.assertTrue(all(call[2] == "otel-token" for call in calls))
+        self.assertEqual(result.traces_status, 200)
+        self.assertEqual(result.metrics_status, 200)
+        self.assertEqual(result.span_count, 1)
+        self.assertEqual(result.metric_count, 2)
+        self.assertIn("OTLP export result:", render_otlp_export_result(result))
+
+    def test_sla_alerts_include_order_failed_and_calendar_failure(self) -> None:
+        context = build_default_agent().run_to_order(_request())
+        context.state = TravelState.ORDER_FAILED.value
+        context.calendar_syncs.append(
+            CalendarSyncRecord(
+                calendar_event_id="CAL-FAILED",
+                event_type="TRIP_BOOKED",
+                status="FAILED",
+                user_id=context.request.user_id,
+                title="calendar failed",
+                start_at=context.request.start_date.isoformat(),
+                end_at=context.request.end_date.isoformat(),
+                payload={},
+                source="mock",
+            )
+        )
+
+        alerts = build_sla_alerts([], [], [context])
+        alert_types = {alert["alert_type"] for alert in alerts}
+
+        self.assertIn("order_failed", alert_types)
+        self.assertIn("calendar_sync_failed", alert_types)
 
 
 def _request(budget_per_night: int = 650) -> TravelRequest:
@@ -1319,6 +1683,14 @@ class NotificationFailingHttpClient:
         return {}
 
 
+class CalendarFailingHttpClient:
+    def post_json(self, url: str, payload: dict[str, Any], token: str | None = None) -> dict[str, Any]:
+        del payload, token
+        if url == "https://calendar.example/sync":
+            raise IntegrationError(f"{url} is unavailable")
+        return {}
+
+
 class FlakyNotificationHttpClient:
     def __init__(self, failures: int) -> None:
         self.failures = failures
@@ -1339,6 +1711,32 @@ class FlakyNotificationHttpClient:
                     "title": payload["title"],
                     "message": payload["message"],
                     "status": "SENT",
+                }
+            }
+        return {}
+
+
+class FlakyCalendarHttpClient:
+    def __init__(self, failures: int) -> None:
+        self.failures = failures
+        self.calls = 0
+
+    def post_json(self, url: str, payload: dict[str, Any], token: str | None = None) -> dict[str, Any]:
+        del token
+        if url == "https://calendar.example/sync":
+            self.calls += 1
+            if self.calls <= self.failures:
+                raise IntegrationError(f"{url} is unavailable")
+            return {
+                "calendar": {
+                    "calendar_event_id": "REMOTE-CALENDAR-REPLAY",
+                    "event_type": payload["event_type"],
+                    "status": "SYNCED",
+                    "user_id": payload["user_id"],
+                    "title": payload["title"],
+                    "start_at": payload["start_at"],
+                    "end_at": payload["end_at"],
+                    "attendees": payload["attendees"],
                 }
             }
         return {}
