@@ -117,8 +117,38 @@ Order Tool 创建订单
 - 子 Agent 每次执行会写入 `AgentExecutionRecord`，记录 Agent 名称、动作、状态、输入/输出引用、说明和时间，形成跨 Agent 审计视图。
 - 达到重试上限的通知可查询并人工重放，重放失败后会重新进入可重试队列。
 - 异常恢复会通过 `workflow_generation` 开启新一轮流程，避免重新提交时复用上一轮审批、库存、订单和通知幂等键。
+- 内置评测集覆盖完整下单、政策超标、审批驳回、价格变化、库存失效、订单失败恢复、改签失败补偿和日历死信，可通过 CLI 作为回归基线运行。
+- SQLite 存储已补齐 schema 版本、会话版本号、乐观并发保存、查询索引和健康检查，为替换到外部数据库或工作流引擎提供稳定接口边界。
+- HTTP JSON `SessionStore` 已支持外部生产存储适配，可桥接 PostgreSQL/MySQL、工作流引擎或内部存储服务，并保留版本控制、健康检查、worker run、死信查询和回放能力。
+- 联调验收报告已汇总真实端点配置、mock fallback 风险、持久化存储健康和内置评测集结果，用于上线前准入检查。
+- 真实端到端 smoke 探活已覆盖政策、库存、OA、订单、通知、日历和外部存储健康端点，统一发送 `dry_run` payload 并校验响应契约。
+- 发布准入门禁已汇总 fallback、持久化存储、接口 token、审计与观测能力、验收和 smoke 结果，用于生产发布前最终检查。
+- 灰度发布决策已支持按用户、部门、百分比放量，并支持回滚开关直接阻断。
+- 权限策略检查已支持按用户、部门、角色和动作进行本地放行/阻断，关键工作流动作执行前会统一校验。
+- Tool Gateway 已生成脱敏后的治理审计事件，敏感字段不会直接进入审计事件 payload。
+- 外部权限中心和审计日志 sink 已提供 HTTP 适配，系统未就绪时可回退本地权限策略和内存审计事件。
+- CI/CD 发布 gate 已可复用发布准入报告，并按 `PASS` / `ACTION_REQUIRED` / `FAIL` 输出稳定退出码。
+- 生产运行手册已沉淀上线、灰度、回滚、死信处理和人工补偿 runbook。
+- SLO 告警聚合已覆盖 worker 错误、通知死信、日历死信、订单失败、权限拒绝、权限中心 fallback 和审计 sink 失败。
+- 事故演练自动化已可模拟权限中心不可用、审计 sink 不可用、供应商订单失败和回滚开关触发。
+- 告警平台接入已支持 summary/JSON/Prometheus 输出、HTTP 告警 sink 推送和事故演练 gate 退出码。
+- 生产运行看板已汇总会话状态、worker 错误、通知/日历死信、活跃告警和行动项。
+- 告警规则模板已覆盖路由、升级和静默策略，可输出 summary 或 JSON。
+- 真实值班闭环已提供 OnCall/工单 HTTP ticket 创建入口。
+- 看板数据落库已支持 dashboard snapshot 持久化和查询。
+- 工单状态回写已支持从 OnCall 状态接口同步并保存 ticket 状态。
+- 告警规则配置化已支持通过 `TRAVEL_ALERT_RULES_JSON` 覆盖默认路由规则。
+- 看板趋势分析已支持基于持久化 dashboard snapshot 计算趋势、环比和异常波动。
+- 多维运行视图已支持按部门、用户、路线、城市、供应商和政策来源拆分运行数据。
+- 事故复盘自动化已支持关联告警、dashboard snapshot、worker run、OnCall 状态、补偿/恢复记录和演练结果生成复盘摘要。
+- 趋势阈值告警自动化已支持通过默认规则或 `TRAVEL_TREND_ALERT_RULES_JSON` 将趋势波动转换为可路由告警。
+- 复盘行动项闭环已支持从趋势告警和事故复盘生成 owner、ETA、状态、证据和关闭备注，并持久化查询。
+- 运营知识库沉淀已支持从复盘、趋势告警和已关闭行动项生成可持久化知识条目。
+- 运营知识检索增强已支持按 query 检索知识条目，并返回命中、匹配词和推荐处置动作。
+- 行动项 SLA 与升级已支持按可配置阈值评估 open action item，并输出 owner route、严重级别和提醒文本。
+- 运营闭环报表已支持汇总趋势告警、行动项关闭率、SLA 发现、知识主题和后续建议。
 
-第一阶段历史范围曾暂不包含真实库存、真实 OA、订单创建、补偿和多 Agent。当前实现已推进到真实系统适配、酒店 + 交通组合下单、异常恢复、通知死信、多 Agent 协作深化、改签/退订深化、日历同步重试/死信、Prometheus 文本指标出口、HTTP `/metrics` 服务和 OTLP/HTTP 导出；剩余未完成的主线是评测集和生产化存储。
+第一阶段历史范围曾暂不包含真实库存、真实 OA、订单创建、补偿和多 Agent。当前实现已推进到真实系统适配、酒店 + 交通组合下单、异常恢复、通知死信、多 Agent 协作深化、改签/退订深化、日历同步重试/死信、Prometheus 文本指标出口、HTTP `/metrics` 服务、OTLP/HTTP 导出、内置评测集、生产化存储准备、外部生产存储适配、联调验收报告、真实端到端探活、发布准入门禁、灰度发布决策、权限策略检查、脱敏审计事件、外部权限/审计适配、CI/CD 发布 gate、生产运行 runbook、SLO 告警聚合、事故演练自动化、告警平台接入、演练流水线化、生产运行看板、告警规则模板、真实值班闭环、看板数据落库、工单状态回写、告警规则配置化、看板趋势分析、多维运行视图、事故复盘自动化、趋势阈值告警自动化、复盘行动项闭环、运营知识库沉淀、运营知识检索增强、行动项 SLA 与升级和运营闭环报表；下一阶段主线转为知识检索接入 Agent 规划、SLA 自动通知联动和闭环指标外部导出。
 
 ## 4. 单 Agent 架构
 
@@ -303,12 +333,19 @@ APPROVAL_CREATED
 ```text
 src/travel_agent/
   ├─ agent.py       单 Agent 编排和任务规划
+  ├─ acceptance.py  真实系统联调验收报告
   ├─ config.py      真实系统接入配置
+  ├─ data_governance.py 字段级脱敏和审计事件摘要
   ├─ domain_agents.py 多 Agent 协作雏形，封装策略、酒店、交通、审批、预订等领域 Agent
   ├─ integrations.py 真实系统 HTTP 适配与 mock fallback
   ├─ models.py      请求、政策、酒店、审批、上下文数据模型
+  ├─ governance.py  发布准入门禁
+  ├─ permissions.py 用户、部门、角色和动作级权限策略
+  ├─ release_control.py 灰度发布和回滚决策
+  ├─ release_gate.py CI/CD 发布门禁退出码
+  ├─ smoke.py       真实系统 dry-run smoke 探活
   ├─ state.py       工作流状态机
-  ├─ storage.py     内存/SQLite 会话存储
+  ├─ storage.py     内存/SQLite/HTTP 会话存储
   ├─ tools.py       Tool Gateway
   ├─ worker.py      异步工作流推进器
   ├─ mock_tools.py  Mock 业务工具
@@ -412,6 +449,132 @@ python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --serve-me
 python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --export-otlp --otlp-endpoint "http://localhost:4318"
 ```
 
+外部会话存储可通过环境变量接入：
+
+```powershell
+$env:TRAVEL_SESSION_STORE_BACKEND = "http"
+$env:TRAVEL_SESSION_STORE_API_URL = "https://store.example.com/api/travel-agent"
+$env:TRAVEL_SESSION_STORE_API_TOKEN = "store-token"
+```
+
+HTTP `SessionStore` 约定统一使用 POST JSON，核心端点包括 `/sessions/save`、`/sessions/save-if-version`、`/sessions/get`、`/sessions/list-by-states`、`/sessions/list-recent`、`/worker-runs/record`、`/worker-runs/list` 和 `/health`。存储服务可以在后端落 PostgreSQL/MySQL、工作流引擎变量表或内部存储平台；Agent 侧只依赖 `SessionStore` 契约。
+
+联调验收报告：
+
+```powershell
+$env:PYTHONPATH = "src"
+python -m travel_agent.cli --run-integration-acceptance
+python -m travel_agent.cli --run-integration-acceptance --skip-acceptance-evaluation
+```
+
+报告状态含义：
+
+- `PASS`：必需真实端点均已配置，mock fallback 已关闭，存储健康正常，评测集通过。
+- `ACTION_REQUIRED`：仍有端点缺失、fallback 风险或未配置持久化存储。
+- `FAIL`：评测集失败或持久化存储健康检查失败。
+
+真实端到端 smoke 探活：
+
+```powershell
+$env:PYTHONPATH = "src"
+python -m travel_agent.cli --run-smoke-probes
+python -m travel_agent.cli --run-smoke-probes --skip-optional-smoke-probes
+```
+
+探活只调用已配置的真实端点，未配置端点返回 `SKIP`；每个请求都会携带 `smoke_test=true`、`dry_run=true` 和稳定 `idempotency_key`。真实系统需要将这类请求实现为无副作用探活，不创建真实审批、订单、通知或日历事件。
+
+发布准入门禁：
+
+```powershell
+$env:PYTHONPATH = "src"
+python -m travel_agent.cli --release-readiness
+python -m travel_agent.cli --release-readiness --include-acceptance --include-smoke-probes
+```
+
+门禁会综合检查 mock fallback、持久化存储、接口 token、审计与观测、联调验收和 smoke 探活结果。
+
+权限策略检查：
+
+```powershell
+$env:PYTHONPATH = "src"
+python -m travel_agent.cli --permission-check --permission-user u-demo --permission-action plan_trip --permission-role traveler
+```
+
+相关环境变量：
+
+- `TRAVEL_PERMISSION_ENABLED`：是否启用权限强制校验。
+- `TRAVEL_PERMISSION_ALLOWED_ACTIONS` / `TRAVEL_PERMISSION_BLOCKED_ACTIONS`：动作白名单/黑名单。
+- `TRAVEL_PERMISSION_REQUIRED_ROLES`：允许执行差旅动作所需角色。
+- `TRAVEL_PERMISSION_ALLOWED_USERS` / `TRAVEL_PERMISSION_BLOCKED_USERS`：用户白名单/黑名单。
+- `TRAVEL_PERMISSION_ALLOWED_DEPARTMENTS` / `TRAVEL_PERMISSION_BLOCKED_DEPARTMENTS`：部门白名单/黑名单。
+
+当前本地策略用于在企业用户中心未接入前形成可执行权限门禁；后续可将 `PermissionPolicy.from_env()` 替换为用户中心或 IAM 策略查询。
+
+外部权限中心接入：
+
+```powershell
+$env:TRAVEL_PERMISSION_API_URL = "https://iam.example.com/api/check"
+$env:TRAVEL_PERMISSION_API_TOKEN = "iam-token"
+```
+
+审计日志外部落库：
+
+```powershell
+$env:TRAVEL_AUDIT_LOG_API_URL = "https://audit.example.com/api/events"
+$env:TRAVEL_AUDIT_LOG_API_TOKEN = "audit-token"
+```
+
+CI/CD 发布 gate：
+
+```powershell
+$env:PYTHONPATH = "src"
+python -m travel_agent.cli --release-gate --include-acceptance --include-smoke-probes
+```
+
+生产运行手册与事故演练：
+
+```powershell
+$env:PYTHONPATH = "src"
+python -m travel_agent.cli --operations-runbook
+python -m travel_agent.cli --operations-drill
+python -m travel_agent.cli --operations-alerts --operations-alert-format prometheus
+python -m travel_agent.cli --operations-drill-gate
+python -m travel_agent.cli --operations-dashboard
+python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --save-operations-dashboard
+python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --list-operations-dashboard-snapshots
+python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --operations-dashboard-trend --dashboard-trend-window 7
+python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --operations-trend-alerts --persist-trend-alerts --create-trend-action-items
+python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --operations-multidim-view --multidim-limit 5
+python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --operations-postmortem --create-postmortem-action-items --save-operations-knowledge
+python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --list-operations-action-items
+python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --list-operations-knowledge
+python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --search-operations-knowledge "critical alerts"
+python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --operations-action-sla
+python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --operations-closed-loop-report
+python -m travel_agent.cli --alert-rules
+python -m travel_agent.cli --alert-rules --alert-rules-format json
+python -m travel_agent.cli --open-oncall-ticket
+python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --sync-oncall-ticket "INC-1"
+python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --list-oncall-ticket-statuses
+```
+
+`--operations-runbook` 会输出上线、灰度、回滚、死信处理、人工补偿、权限中心不可用和审计 sink 不可用的操作手册。`--operations-drill` 会汇总 release readiness、SLO 告警和演练结果；当真实系统或持久化存储未就绪时，使用 mock 信号模拟权限中心不可用、审计 sink 不可用、供应商订单失败和回滚开关触发。`--operations-alerts` 支持 summary、JSON 和 Prometheus 输出；`--export-operations-alerts` 可通过 `TRAVEL_ALERT_API_URL` / `TRAVEL_ALERT_API_TOKEN` 推送到企业告警平台；`--operations-drill-gate` 可用于 CI/CD 或预发巡检。`--operations-dashboard` 汇总运行看板，`--save-operations-dashboard` 会保存 dashboard snapshot，`--operations-dashboard-trend` 会基于持久化快照计算趋势、环比和异常波动，`--operations-trend-alerts` 会根据默认规则或 `TRAVEL_TREND_ALERT_RULES_JSON` 生成趋势阈值告警，并可落库和生成行动项。`--operations-multidim-view` 会按部门、用户、路线、城市、供应商和政策来源拆分运行数据，`--operations-postmortem` 会自动关联告警、快照、worker run、OnCall 状态、补偿/恢复记录和演练结果生成事故复盘，并可生成行动项和知识条目。`--list-operations-action-items`、`--close-operations-action-item`、`--list-operations-knowledge` 用于查询和维护闭环产物。`--search-operations-knowledge` 可检索历史知识条目并返回推荐处置动作，`--operations-action-sla` 可按 `TRAVEL_ACTION_SLA_POLICY_JSON` 或默认阈值评估行动项超时升级，`--operations-closed-loop-report` 可汇总趋势告警、行动项关闭率、知识主题和闭环建议。`--alert-rules` 输出告警路由/升级/静默模板并可由 `TRAVEL_ALERT_RULES_JSON` 覆盖，`--open-oncall-ticket` 可通过 `TRAVEL_ONCALL_API_URL` / `TRAVEL_ONCALL_API_TOKEN` 创建真实值班工单，`--sync-oncall-ticket` 可通过 `TRAVEL_ONCALL_STATUS_API_URL` 同步状态。
+
+灰度发布决策：
+
+```powershell
+$env:PYTHONPATH = "src"
+python -m travel_agent.cli --rollout-decision --rollout-user u-demo
+```
+
+相关环境变量：
+
+- `TRAVEL_ROLLOUT_ENABLED`：是否启用灰度。
+- `TRAVEL_ROLLOUT_PERCENTAGE`：百分比放量。
+- `TRAVEL_ROLLOUT_ALLOWED_USERS` / `TRAVEL_ROLLOUT_BLOCKED_USERS`：用户白名单/黑名单。
+- `TRAVEL_ROLLOUT_ALLOWED_DEPARTMENTS` / `TRAVEL_ROLLOUT_BLOCKED_DEPARTMENTS`：部门白名单/黑名单。
+- `TRAVEL_ROLLBACK_ENABLED`：开启后直接返回 `ROLLED_BACK`。
+
 异常恢复并重新提交审批：
 
 ```powershell
@@ -459,5 +622,6 @@ python -m unittest discover -s tests
 
 下一阶段主线：
 
-- 评测集：沉淀政策超标、审批驳回、价格变化、库存失效、订单失败、改签失败、日历死信等多场景回归用例。
-- 生产化存储：评估将 SQLite 会话存储替换为生产数据库或工作流引擎。
+- 知识检索接入 Agent 规划：让历史复盘和处置知识参与行程规划、异常恢复和告警解释。
+- SLA 自动通知联动：将行动项超时升级推送到通知、OnCall 或企业工单系统。
+- 闭环指标外部导出：将闭环报表输出为 Prometheus/JSON/HTTP sink，接入 BI 或运营大盘。

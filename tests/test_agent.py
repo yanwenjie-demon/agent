@@ -11,7 +11,8 @@ from urllib.request import urlopen
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from travel_agent.agent import build_default_agent
+from travel_agent.agent import build_default_agent, build_session_store
+from travel_agent.acceptance import render_integration_acceptance_report, run_integration_acceptance_report
 from travel_agent.cli import (
     create_metrics_server,
     render_calendar_dead_letters,
@@ -20,12 +21,17 @@ from travel_agent.cli import (
     render_metrics,
     render_otlp_export_result,
     render_prometheus_metrics,
+    render_storage_health,
     render_worker_runs,
     run_metrics_server_in_thread,
 )
 from travel_agent.config import IntegrationSettings
+from travel_agent.evaluation import render_evaluation_report, run_evaluation_suite
 from travel_agent.domain_agents import ApprovalAgent, BookingAgent, HotelAgent, PolicyAgent, TransportAgent
+from travel_agent.governance import render_release_readiness_report, run_release_readiness_report
 from travel_agent.integrations import IntegrationError
+from travel_agent.data_governance import HttpAuditSink, build_audit_event, redact_payload
+from travel_agent.permissions import PermissionDeniedError, PermissionPolicy, evaluate_permission, render_permission_decision
 from travel_agent.models import (
     CalendarSyncRecord,
     DeadLetterCalendarSync,
@@ -35,8 +41,75 @@ from travel_agent.models import (
     WorkerRunRecord,
 )
 from travel_agent.observability import build_otlp_payloads, build_sla_alerts, export_otlp_http
+from travel_agent.operations import (
+    build_alert_route_rules,
+    build_operations_alerts,
+    build_operations_dashboard,
+    build_operations_dashboard_snapshot,
+    build_operations_action_sla_policy,
+    build_operations_closed_loop_report,
+    build_operations_dashboard_trend_report,
+    build_operations_knowledge_entries,
+    build_operations_drill_report,
+    build_operations_multidimensional_view,
+    build_operations_postmortem_report,
+    build_operations_trend_alert_rules,
+    build_postmortem_action_items,
+    build_trend_alert_action_items,
+    close_operations_action_item,
+    evaluate_operations_action_sla,
+    build_operations_runbook,
+    evaluate_operations_drill_gate,
+    evaluate_operations_trend_alerts,
+    export_operations_alerts_http,
+    fetch_oncall_ticket_status_http,
+    open_oncall_ticket_http,
+    oncall_ticket_status_from_dict,
+    oncall_ticket_status_to_dict,
+    operations_action_item_from_dict,
+    operations_action_item_to_dict,
+    operations_dashboard_snapshot_from_dict,
+    operations_dashboard_snapshot_to_dict,
+    operations_knowledge_entry_from_dict,
+    operations_knowledge_entry_to_dict,
+    operations_trend_alert_from_dict,
+    operations_trend_alert_to_dict,
+    render_alert_route_rules,
+    render_alert_route_rules_json,
+    render_operations_action_items,
+    render_operations_action_sla_report,
+    render_operations_closed_loop_report,
+    render_oncall_ticket_status,
+    render_oncall_ticket_result,
+    render_operations_alert_export_result,
+    render_operations_alerts,
+    render_operations_alerts_json,
+    render_operations_alerts_prometheus,
+    render_operations_dashboard,
+    render_operations_dashboard_snapshots,
+    render_operations_dashboard_trend_report,
+    render_operations_knowledge_entries,
+    render_operations_knowledge_search_report,
+    render_operations_drill_gate_result,
+    render_operations_drill_report,
+    render_operations_multidimensional_view,
+    render_operations_postmortem_report,
+    render_operations_trend_alerts,
+    render_operations_trend_alerts_json,
+    render_operations_runbook,
+    search_operations_knowledge,
+)
+from travel_agent.release_gate import evaluate_release_gate, render_release_gate_result
+from travel_agent.release_control import RolloutPolicy, evaluate_rollout
+from travel_agent.smoke import render_smoke_probe_report, run_smoke_probes
 from travel_agent.state import TravelState
-from travel_agent.storage import InMemorySessionStore, SQLiteSessionStore
+from travel_agent.storage import (
+    HttpSessionStore,
+    InMemorySessionStore,
+    SQLiteSessionStore,
+    StoreConcurrencyError,
+    StorageHealth,
+)
 from travel_agent.tools import ToolGateway, ToolValidationError
 from travel_agent.worker import WorkflowWorker
 
@@ -1076,8 +1149,193 @@ class ToolGatewayTest(unittest.TestCase):
         self.assertEqual(len(gateway.call_logs), 1)
         self.assertFalse(gateway.call_logs[0].ok)
 
+    def test_records_redacted_audit_event_for_tool_calls(self) -> None:
+        gateway = ToolGateway()
+        gateway.register("echo", "Echo one value.", ("phone",), lambda phone: phone)
+
+        gateway.call("echo", phone="13800000000")
+
+        self.assertEqual(len(gateway.audit_events), 1)
+        self.assertEqual(gateway.audit_events[0].redacted_payload["phone"], "***")
+        self.assertIn("phone", gateway.audit_events[0].redacted_keys)
+
+    def test_writes_redacted_audit_event_to_http_sink(self) -> None:
+        http = CapturingAnyHttpClient({"https://audit.example/events": {"ok": True, "accepted": 1}})
+        gateway = ToolGateway(audit_sink=HttpAuditSink("https://audit.example/events", "audit-token", http_client=http))
+        gateway.register("echo", "Echo one value.", ("phone",), lambda phone: phone)
+
+        gateway.call("echo", phone="13800000000")
+
+        self.assertEqual(gateway.audit_sink_results[0].delivered, 1)
+        self.assertEqual(http.calls[0][2], "audit-token")
+        self.assertEqual(http.calls[0][1]["events"][0]["payload"]["phone"], "***")
+
 
 class SessionStoreTest(unittest.TestCase):
+    def test_http_session_store_round_trips_context_and_worker_runs(self) -> None:
+        http = FakeSessionStoreHttpClient()
+        store = HttpSessionStore("https://store.example/api", token="store-token", http_client=http)
+        agent = build_default_agent(session_store=store)
+        context = agent.run_to_order(_request())
+
+        reloaded = store.get(context.session_id)
+        recent = store.list_recent(limit=1)
+        by_state = store.list_by_states({TravelState.COMPLETED.value})
+        worker_run = WorkerRunRecord(
+            run_id="WRK-HTTP-1",
+            started_at="2026-05-14T00:00:00+00:00",
+            finished_at="2026-05-14T00:00:01+00:00",
+            scanned=1,
+            advanced=1,
+            skipped=0,
+            errors={},
+            session_ids=[context.session_id],
+        )
+        store.record_worker_run(worker_run)
+        health = store.health_check()
+
+        self.assertEqual(reloaded.session_id, context.session_id)
+        self.assertEqual(reloaded.state, TravelState.COMPLETED.value)
+        self.assertEqual(recent[0].session_id, context.session_id)
+        self.assertEqual(by_state[0].session_id, context.session_id)
+        self.assertEqual(store.list_worker_runs()[0].run_id, "WRK-HTTP-1")
+        self.assertTrue(health.ok)
+        self.assertEqual(health.backend, "http-json")
+        self.assertEqual(health.session_count, 1)
+        self.assertTrue(all(token == "store-token" for _, _, token in http.calls))
+
+    def test_http_session_store_uses_optimistic_concurrency(self) -> None:
+        http = FakeSessionStoreHttpClient()
+        store = HttpSessionStore("https://store.example/api", http_client=http)
+        context = build_default_agent(session_store=store).run_to_order(_request())
+
+        stored = store.get_with_metadata(context.session_id)
+        context.events.append("manual http metadata test event")
+        next_version = store.save_if_version(context, expected_version=stored.version)
+        reloaded = store.get_with_metadata(context.session_id)
+
+        self.assertEqual(next_version, stored.version + 1)
+        self.assertEqual(reloaded.version, next_version)
+        self.assertTrue(reloaded.created_at)
+        self.assertTrue(reloaded.updated_at)
+        with self.assertRaises(StoreConcurrencyError):
+            store.save_if_version(context, expected_version=stored.version)
+
+    def test_build_default_agent_can_use_http_session_store_from_settings(self) -> None:
+        http = FakeSessionStoreHttpClient()
+        settings = IntegrationSettings(
+            session_store_backend="http",
+            session_store_api_url="https://store.example/api",
+            session_store_api_token="store-token",
+        )
+
+        agent = build_default_agent(settings=settings, store_http_client=http)
+        context = agent.run_to_order(_request())
+
+        self.assertIsInstance(agent.session_store, HttpSessionStore)
+        self.assertEqual(agent.get_session(context.session_id).state, TravelState.COMPLETED.value)
+
+    def test_http_session_store_records_operations_records(self) -> None:
+        http = FakeSessionStoreHttpClient()
+        store = HttpSessionStore("https://store.example/api", http_client=http)
+        dashboard = build_operations_dashboard()
+        snapshot = build_operations_dashboard_snapshot(
+            dashboard,
+            snapshot_id="DASH-HTTP",
+            created_at="2026-05-19T10:00:00+00:00",
+        )
+        status = oncall_ticket_status_to_dict(
+            fetch_oncall_ticket_status_http(
+                "INC-HTTP",
+                endpoint="https://oncall.example/status",
+                http_client=CapturingAnyHttpClient(
+                    {
+                        "https://oncall.example/status": {
+                            "ticket": {
+                                "ticket_id": "INC-HTTP",
+                                "status": "ACKED",
+                                "updated_at": "2026-05-19T10:05:00+00:00",
+                            }
+                        }
+                    }
+                ),
+            )
+        )
+
+        store.record_operations_dashboard_snapshot(operations_dashboard_snapshot_to_dict(snapshot))
+        store.record_oncall_ticket_status(status)
+        store.record_operations_trend_alert(
+            {
+                "alert_id": "TREND-HTTP",
+                "metric": "critical_alerts",
+                "severity": "critical",
+                "route": "ops",
+                "escalation": "page",
+                "owner": "ops",
+                "current": 2,
+                "previous": 1,
+                "delta": 1,
+                "delta_percent": 100.0,
+                "reason": "delta 1 >= threshold 1",
+                "action_item": "Handle critical alerts",
+            }
+        )
+        store.record_operations_action_item(
+            {
+                "action_id": "ACT-HTTP",
+                "source_type": "trend_alert",
+                "source_id": "TREND-HTTP",
+                "title": "Handle critical alerts",
+                "owner": "ops",
+                "status": "OPEN",
+                "eta": None,
+                "created_at": "2026-05-19T10:00:00+00:00",
+                "updated_at": "2026-05-19T10:00:00+00:00",
+                "evidence": ["metric=critical_alerts"],
+                "closure_note": None,
+            }
+        )
+        store.record_operations_knowledge_entry(
+            {
+                "entry_id": "KB-HTTP",
+                "topic": "critical_alerts",
+                "title": "Critical alert response",
+                "summary": "Handle critical alert growth",
+                "signals": ["critical_alerts"],
+                "recommended_actions": ["Handle critical alerts"],
+                "source_refs": ["TREND-HTTP"],
+                "created_at": "2026-05-19T10:00:00+00:00",
+                "updated_at": "2026-05-19T10:00:00+00:00",
+            }
+        )
+
+        self.assertEqual(store.list_operations_dashboard_snapshots()[0]["snapshot_id"], "DASH-HTTP")
+        self.assertEqual(store.list_oncall_ticket_statuses()[0]["status"], "ACKED")
+        self.assertEqual(store.list_operations_trend_alerts()[0]["alert_id"], "TREND-HTTP")
+        self.assertEqual(store.list_operations_action_items()[0]["action_id"], "ACT-HTTP")
+        self.assertEqual(store.list_operations_knowledge_entries()[0]["entry_id"], "KB-HTTP")
+        self.assertTrue(any(call[0].endswith("/operations/dashboard-snapshots/record") for call in http.calls))
+        self.assertTrue(any(call[0].endswith("/operations/oncall-statuses/record") for call in http.calls))
+        self.assertTrue(any(call[0].endswith("/operations/trend-alerts/record") for call in http.calls))
+        self.assertTrue(any(call[0].endswith("/operations/action-items/record") for call in http.calls))
+        self.assertTrue(any(call[0].endswith("/operations/knowledge/record") for call in http.calls))
+
+    def test_build_session_store_selects_configured_backends(self) -> None:
+        http = FakeSessionStoreHttpClient()
+        http_store = build_session_store(
+            IntegrationSettings(session_store_backend="http", session_store_api_url="https://store.example/api"),
+            store_http_client=http,
+        )
+        memory_store = build_session_store(IntegrationSettings(session_store_backend="memory"))
+        auto_store = build_session_store(
+            IntegrationSettings(session_store_api_url="https://store.example/api"),
+            store_http_client=http,
+        )
+
+        self.assertIsInstance(http_store, HttpSessionStore)
+        self.assertIsInstance(memory_store, InMemorySessionStore)
+        self.assertIsInstance(auto_store, HttpSessionStore)
+
     def test_sqlite_session_store_round_trips_context(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = Path(tmpdir) / "sessions.sqlite3"
@@ -1112,6 +1370,106 @@ class SessionStoreTest(unittest.TestCase):
             self.assertEqual(len(changed_reloaded.change_records), 2)
             self.assertEqual(len(changed_reloaded.calendar_syncs), 1)
             self.assertEqual(changed_reloaded.calendar_syncs[0].event_type, "TRIP_CHANGED")
+
+    def test_sqlite_store_records_operations_dashboard_and_oncall_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "sessions.sqlite3"
+            store = SQLiteSessionStore(db_path)
+            dashboard = build_operations_dashboard(
+                alerts=[{"alert_type": "audit_sink_failed", "severity": "critical", "message": "audit down", "value": 1}]
+            )
+            snapshot = build_operations_dashboard_snapshot(
+                dashboard,
+                alerts=[{"alert_type": "audit_sink_failed", "severity": "critical", "message": "audit down", "value": 1}],
+                snapshot_id="DASH-SQL",
+                created_at="2026-05-19T10:00:00+00:00",
+            )
+            status = fetch_oncall_ticket_status_http(
+                "INC-SQL",
+                endpoint="https://oncall.example/status",
+                http_client=CapturingAnyHttpClient(
+                    {
+                        "https://oncall.example/status": {
+                            "ticket": {
+                                "ticket_id": "INC-SQL",
+                                "status": "RESOLVED",
+                                "assignee": "ops",
+                                "updated_at": "2026-05-19T10:05:00+00:00",
+                            }
+                        }
+                    }
+                ),
+            )
+
+            store.record_operations_dashboard_snapshot(operations_dashboard_snapshot_to_dict(snapshot))
+            store.record_oncall_ticket_status(oncall_ticket_status_to_dict(status))
+            trend = build_operations_dashboard_trend_report([snapshot], window=1)
+            trend_alerts = evaluate_operations_trend_alerts(trend)
+            action_items = build_trend_alert_action_items(trend_alerts, eta="2026-05-20T12:00:00+00:00")
+            entries = build_operations_knowledge_entries(trend_alerts=trend_alerts, action_items=action_items)
+            for alert in trend_alerts:
+                store.record_operations_trend_alert(operations_trend_alert_to_dict(alert))
+            for item in action_items:
+                store.record_operations_action_item(operations_action_item_to_dict(item))
+            for entry in entries:
+                store.record_operations_knowledge_entry(operations_knowledge_entry_to_dict(entry))
+
+            reloaded_snapshot = operations_dashboard_snapshot_from_dict(store.list_operations_dashboard_snapshots()[0])
+            reloaded_status = oncall_ticket_status_from_dict(store.list_oncall_ticket_statuses()[0])
+            reloaded_alert = operations_trend_alert_from_dict(store.list_operations_trend_alerts()[0])
+            reloaded_action = operations_action_item_from_dict(store.list_operations_action_items()[0])
+            reloaded_entry = operations_knowledge_entry_from_dict(store.list_operations_knowledge_entries()[0])
+            health = store.health_check()
+
+            self.assertEqual(reloaded_snapshot.snapshot_id, "DASH-SQL")
+            self.assertEqual(reloaded_status.status, "RESOLVED")
+            self.assertEqual(reloaded_alert.metric, "critical_alerts")
+            self.assertEqual(reloaded_action.status, "OPEN")
+            self.assertEqual(reloaded_entry.topic, "critical_alerts")
+            self.assertGreaterEqual(health.schema_version, 4)
+            self.assertEqual(health.details["dashboard_snapshots"], "1")
+            self.assertEqual(health.details["oncall_ticket_statuses"], "1")
+            self.assertEqual(health.details["operations_trend_alerts"], "1")
+            self.assertEqual(health.details["operations_action_items"], "1")
+            self.assertEqual(health.details["operations_knowledge_entries"], "1")
+
+    def test_sqlite_session_store_tracks_metadata_and_versions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "sessions.sqlite3"
+            store = SQLiteSessionStore(db_path)
+            agent = build_default_agent(session_store=store)
+            context = agent.run_to_order(_request())
+
+            stored = SQLiteSessionStore(db_path).get_with_metadata(context.session_id)
+            original_version = stored.version
+            context.events.append("manual metadata test event")
+            next_version = store.save_if_version(context, expected_version=original_version)
+
+            reloaded = store.get_with_metadata(context.session_id)
+
+            self.assertEqual(next_version, original_version + 1)
+            self.assertEqual(reloaded.version, next_version)
+            self.assertTrue(reloaded.created_at)
+            self.assertTrue(reloaded.updated_at)
+
+            with self.assertRaises(StoreConcurrencyError):
+                store.save_if_version(context, expected_version=original_version)
+
+    def test_sqlite_session_store_health_check(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "sessions.sqlite3"
+            store = SQLiteSessionStore(db_path)
+            agent = build_default_agent(session_store=store)
+            agent.run_to_order(_request())
+            WorkflowWorker(agent).run_once()
+
+            health = SQLiteSessionStore(db_path).health_check()
+
+            self.assertTrue(health.ok)
+            self.assertGreaterEqual(health.schema_version, 2)
+            self.assertEqual(health.session_count, 1)
+            self.assertEqual(health.worker_run_count, 1)
+            self.assertEqual(health.details["integrity_check"], "ok")
 
     def test_sqlite_session_store_lists_by_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1634,6 +1992,767 @@ class CliRenderTest(unittest.TestCase):
         self.assertIn("order_failed", alert_types)
         self.assertIn("calendar_sync_failed", alert_types)
 
+    def test_renders_storage_health(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "sessions.sqlite3"
+            store = SQLiteSessionStore(db_path)
+            build_default_agent(session_store=store).run_to_order(_request())
+
+            rendered = render_storage_health(store.health_check())
+
+            self.assertIn("Storage health:", rendered)
+            self.assertIn("- ok: True", rendered)
+            self.assertIn("- sessions: 1", rendered)
+
+
+class EvaluationSuiteTest(unittest.TestCase):
+    def test_builtin_evaluation_suite_passes_expected_scenarios(self) -> None:
+        report = run_evaluation_suite()
+
+        scenario_ids = {result.scenario_id for result in report.scenarios}
+        statuses = {result.scenario_id: result.status for result in report.scenarios}
+
+        self.assertEqual(report.failed, 0)
+        self.assertIn("happy_path", scenario_ids)
+        self.assertIn("policy_over_cap", scenario_ids)
+        self.assertIn("approval_rejected", scenario_ids)
+        self.assertIn("price_changed", scenario_ids)
+        self.assertIn("inventory_expired", scenario_ids)
+        self.assertIn("order_failed", scenario_ids)
+        self.assertIn("change_failure", scenario_ids)
+        self.assertIn("calendar_dead_letter", scenario_ids)
+        self.assertTrue(all(status == "PASS" for status in statuses.values()))
+
+    def test_renders_evaluation_report(self) -> None:
+        rendered = render_evaluation_report(run_evaluation_suite())
+
+        self.assertIn("Evaluation report:", rendered)
+        self.assertIn("happy_path", rendered)
+        self.assertIn("- failed: 0", rendered)
+
+
+class IntegrationAcceptanceTest(unittest.TestCase):
+    def test_acceptance_report_marks_mock_only_configuration_action_required(self) -> None:
+        report = run_integration_acceptance_report(IntegrationSettings(), include_evaluation=False)
+        rendered = render_integration_acceptance_report(report)
+
+        self.assertEqual(report.status, "ACTION_REQUIRED")
+        self.assertGreater(len(report.missing_required_endpoints), 0)
+        self.assertIn("WARN required_endpoints", rendered)
+        self.assertIn("WARN mock_fallback", rendered)
+        self.assertIn("WARN session_store", rendered)
+
+    def test_acceptance_report_passes_for_full_real_configuration(self) -> None:
+        health = StorageHealth(
+            backend="sqlite",
+            ok=True,
+            schema_version=2,
+            session_count=1,
+            worker_run_count=1,
+            details={"integrity_check": "ok"},
+        )
+
+        report = run_integration_acceptance_report(
+            _full_acceptance_settings(),
+            storage_health=health,
+            include_evaluation=False,
+        )
+        rendered = render_integration_acceptance_report(report)
+
+        self.assertEqual(report.status, "PASS")
+        self.assertEqual(report.configured_required_endpoints, report.required_endpoints)
+        self.assertIn("- status: PASS", rendered)
+        self.assertIn("PASS session_store", rendered)
+
+
+class SmokeProbeTest(unittest.TestCase):
+    def test_smoke_probes_skip_unconfigured_endpoints(self) -> None:
+        report = run_smoke_probes(IntegrationSettings(), SmokeProbeHttpClient({}))
+
+        self.assertEqual(report.status, "SKIP")
+        self.assertEqual(report.failed, 0)
+        self.assertGreater(report.skipped, 0)
+
+    def test_smoke_probes_call_configured_endpoints_with_dry_run_payloads(self) -> None:
+        settings = _full_acceptance_settings()
+        http = SmokeProbeHttpClient(
+            {
+                "https://policy.example/check": {"policy": {}},
+                "https://policy.example/transport": {"transport_policy": {}},
+                "https://hotel.example/search": {"hotels": []},
+                "https://transport.example/search": {"transports": []},
+                "https://hotel.example/price": {"price_check": {}},
+                "https://hotel.example/lock": {"inventory_lock": {}},
+                "https://hotel.example/release": {"compensation": {}},
+                "https://oa.example/create": {"approval": {}},
+                "https://oa.example/status": {"approval": {}},
+                "https://oa.example/cancel": {"compensation": {}},
+                "https://order.example/create": {"order": {}},
+                "https://order.example/status": {"order": {}},
+                "https://order.example/cancel": {"compensation": {}},
+                "https://transport.example/order": {"transport_order": {}},
+                "https://transport.example/status": {"transport_order": {}},
+                "https://transport.example/cancel": {"compensation": {}},
+                "https://refund.example/estimate": {"refund_estimate": {}},
+                "https://refund.example/confirm": {"refund_confirmation": {}},
+                "https://oa.example/change": {"approval": {}},
+                "https://hotel.example/change": {"change": {}},
+                "https://transport.example/change": {"change": {}},
+                "https://change.example/compensate": {"compensation": {}},
+                "https://notify.example/send": {"notification": {}},
+                "https://calendar.example/sync": {"calendar": {}},
+            }
+        )
+
+        report = run_smoke_probes(settings, http, include_optional=False)
+        rendered = render_smoke_probe_report(report)
+
+        self.assertEqual(report.status, "PASS")
+        self.assertEqual(report.passed, 24)
+        self.assertTrue(all(call[1]["dry_run"] is True for call in http.calls))
+        self.assertTrue(all(call[1]["smoke_test"] is True for call in http.calls))
+        self.assertIn("- status: PASS", rendered)
+
+
+class ReleaseControlTest(unittest.TestCase):
+    def test_rollout_decision_allows_explicit_user(self) -> None:
+        policy = RolloutPolicy(enabled=False, allowed_users={"u-demo"})
+
+        decision = evaluate_rollout(policy, user_id="u-demo")
+
+        self.assertTrue(decision.enabled)
+        self.assertEqual(decision.status, "ENABLED")
+
+    def test_rollout_decision_honors_rollback(self) -> None:
+        policy = RolloutPolicy(enabled=True, rollback_enabled=True, rollback_reason="incident")
+
+        decision = evaluate_rollout(policy, user_id="u-demo")
+
+        self.assertFalse(decision.enabled)
+        self.assertEqual(decision.status, "ROLLED_BACK")
+
+
+class OperationsReadinessTest(unittest.TestCase):
+    def test_renders_operations_runbook(self) -> None:
+        rendered = render_operations_runbook(build_operations_runbook())
+
+        self.assertIn("Operations runbook:", rendered)
+        self.assertIn("上线准备", rendered)
+        self.assertIn("权限中心不可用演练", rendered)
+
+    def test_operations_alerts_include_permission_and_audit_failures(self) -> None:
+        denied = evaluate_permission(
+            PermissionPolicy(enabled=True, blocked_actions={"book_order"}),
+            user_id="u-demo",
+            action="book_order",
+            roles={"traveler"},
+        )
+
+        alerts = build_operations_alerts(
+            permission_decisions=[denied],
+            audit_sink_results=[HttpAuditSink("https://audit.example/events", http_client=FailingHttpClient()).write([])],
+        )
+        alert_types = {alert["alert_type"] for alert in alerts}
+
+        self.assertIn("permission_denied", alert_types)
+        self.assertIn("audit_sink_failed", alert_types)
+
+    def test_operations_drill_report_covers_expected_scenarios(self) -> None:
+        report = build_operations_drill_report(IntegrationSettings())
+        rendered = render_operations_drill_report(report)
+        statuses = {drill.scenario: drill.status for drill in report.drills}
+        alert_types = {alert["alert_type"] for alert in report.alerts}
+
+        self.assertEqual(statuses["permission_unavailable"], "PASS")
+        self.assertEqual(statuses["audit_sink_unavailable"], "PASS")
+        self.assertEqual(statuses["supplier_order_failure"], "PASS")
+        self.assertEqual(statuses["rollback_trigger"], "PASS")
+        self.assertIn("permission_center_fallback", alert_types)
+        self.assertIn("permission_denied", alert_types)
+        self.assertIn("audit_sink_failed", alert_types)
+        self.assertIn("order_failed", alert_types)
+        self.assertIn("Operations drill report:", rendered)
+
+    def test_renders_operations_alert_formats(self) -> None:
+        alerts = [{"alert_type": "audit_sink_failed", "severity": "critical", "message": "audit down", "value": 2}]
+
+        self.assertIn("critical audit_sink_failed", render_operations_alerts(alerts))
+        self.assertIn('"alert_type": "audit_sink_failed"', render_operations_alerts_json(alerts))
+        self.assertIn('travel_operations_alerts{alert_type="audit_sink_failed"', render_operations_alerts_prometheus(alerts))
+
+    def test_exports_operations_alerts_to_http_sink(self) -> None:
+        http = CapturingAnyHttpClient({"https://alerts.example/events": {"ok": True, "accepted": 1}})
+
+        result = export_operations_alerts_http(
+            [{"alert_type": "order_failed", "severity": "critical", "message": "order failed", "value": 1}],
+            endpoint="https://alerts.example/events",
+            token="alert-token",
+            http_client=http,
+        )
+        rendered = render_operations_alert_export_result(result)
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.delivered, 1)
+        self.assertEqual(http.calls[0][2], "alert-token")
+        self.assertEqual(http.calls[0][1]["source"], "travel-agent")
+        self.assertIn("Operations alert export:", rendered)
+
+    def test_operations_alert_export_reports_failures(self) -> None:
+        result = export_operations_alerts_http(
+            [{"alert_type": "audit_sink_failed", "severity": "critical", "message": "audit down", "value": 1}],
+            endpoint="https://alerts.example/events",
+            http_client=FailingHttpClient(),
+        )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.failed, 1)
+
+    def test_operations_drill_gate_exit_codes(self) -> None:
+        report = build_operations_drill_report(IntegrationSettings())
+
+        gate = evaluate_operations_drill_gate(report)
+        rendered = render_operations_drill_gate_result(gate)
+
+        self.assertTrue(gate.passed)
+        self.assertEqual(gate.exit_code, 0)
+        self.assertIn("Operations drill gate:", rendered)
+
+    def test_builds_operations_dashboard(self) -> None:
+        context = build_default_agent().run_to_order(_request())
+        context.state = TravelState.ORDER_FAILED.value
+        worker_run = WorkerRunRecord(
+            run_id="WRK-OPS",
+            started_at="2026-05-14T00:00:00+00:00",
+            finished_at="2026-05-14T00:00:01+00:00",
+            scanned=1,
+            advanced=0,
+            skipped=0,
+            errors={context.session_id: "boom"},
+            session_ids=[context.session_id],
+        )
+
+        dashboard = build_operations_dashboard(
+            worker_runs=[worker_run],
+            sessions=[context],
+            alerts=[{"alert_type": "order_failed", "severity": "critical", "message": "failed", "value": 1}],
+        )
+        rendered = render_operations_dashboard(dashboard)
+
+        self.assertEqual(dashboard.worker_errors, 1)
+        self.assertEqual(dashboard.critical_alerts, 1)
+        self.assertEqual(dashboard.state_counts[TravelState.ORDER_FAILED.value], 1)
+        self.assertIn("Operations dashboard:", rendered)
+        self.assertIn("ORDER_FAILED", rendered)
+
+    def test_renders_alert_route_rules(self) -> None:
+        rules = build_alert_route_rules()
+        rendered = render_alert_route_rules(rules)
+        rendered_json = render_alert_route_rules_json(rules)
+
+        self.assertTrue(any(rule.alert_type == "order_failed" for rule in rules))
+        self.assertIn("Alert route rules:", rendered)
+        self.assertIn('"alert_type": "order_failed"', rendered_json)
+
+    def test_builds_alert_route_rules_from_config(self) -> None:
+        rules = build_alert_route_rules(
+            '{"rules":[{"alert_type":"custom_alert","severity":"critical","route":"custom-oncall","escalation":"page","silence_hint":"owner approval"}]}'
+        )
+
+        self.assertEqual(len(rules), 1)
+        self.assertEqual(rules[0].alert_type, "custom_alert")
+        self.assertEqual(rules[0].route, "custom-oncall")
+
+    def test_opens_oncall_ticket(self) -> None:
+        report = build_operations_drill_report(IntegrationSettings())
+        http = CapturingAnyHttpClient({"https://oncall.example/tickets": {"ok": True, "ticket_id": "INC-1"}})
+
+        result = open_oncall_ticket_http(
+            report,
+            endpoint="https://oncall.example/tickets",
+            token="oncall-token",
+            http_client=http,
+        )
+        rendered = render_oncall_ticket_result(result)
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.ticket_id, "INC-1")
+        self.assertEqual(http.calls[0][2], "oncall-token")
+        self.assertEqual(http.calls[0][1]["source"], "travel-agent")
+        self.assertIn("OnCall ticket:", rendered)
+
+    def test_oncall_ticket_reports_failures(self) -> None:
+        result = open_oncall_ticket_http(
+            build_operations_drill_report(IntegrationSettings()),
+            endpoint="https://oncall.example/tickets",
+            http_client=FailingHttpClient(),
+        )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.failed, 1)
+
+    def test_fetches_oncall_ticket_status(self) -> None:
+        http = CapturingAnyHttpClient(
+            {
+                "https://oncall.example/status": {
+                    "ticket": {
+                        "ticket_id": "INC-1",
+                        "status": "ACKED",
+                        "assignee": "ops-user",
+                        "updated_at": "2026-05-19T10:00:00+00:00",
+                        "detail": "accepted",
+                    }
+                }
+            }
+        )
+
+        status = fetch_oncall_ticket_status_http(
+            "INC-1",
+            endpoint="https://oncall.example/status",
+            token="oncall-token",
+            http_client=http,
+        )
+        rendered = render_oncall_ticket_status(status)
+
+        self.assertEqual(status.status, "ACKED")
+        self.assertEqual(status.assignee, "ops-user")
+        self.assertEqual(http.calls[0][1]["ticket_id"], "INC-1")
+        self.assertIn("OnCall ticket status:", rendered)
+
+    def test_dashboard_snapshot_round_trips_as_dict(self) -> None:
+        dashboard = build_operations_dashboard(
+            alerts=[{"alert_type": "order_failed", "severity": "critical", "message": "failed", "value": 1}]
+        )
+        snapshot = build_operations_dashboard_snapshot(
+            dashboard,
+            alerts=[{"alert_type": "order_failed", "severity": "critical", "message": "failed", "value": 1}],
+            snapshot_id="DASH-1",
+            created_at="2026-05-19T10:00:00+00:00",
+        )
+
+        reloaded = operations_dashboard_snapshot_from_dict(operations_dashboard_snapshot_to_dict(snapshot))
+        rendered = render_operations_dashboard_snapshots([reloaded])
+
+        self.assertEqual(reloaded.snapshot_id, "DASH-1")
+        self.assertEqual(reloaded.dashboard.critical_alerts, 1)
+        self.assertIn("DASH-1", rendered)
+
+    def test_dashboard_trend_report_detects_alert_growth(self) -> None:
+        first = build_operations_dashboard_snapshot(
+            build_operations_dashboard(
+                alerts=[{"alert_type": "order_failed", "severity": "critical", "message": "failed", "value": 1}]
+            ),
+            alerts=[{"alert_type": "order_failed", "severity": "critical", "message": "failed", "value": 1}],
+            snapshot_id="DASH-A",
+            created_at="2026-05-19T10:00:00+00:00",
+        )
+        second = build_operations_dashboard_snapshot(
+            build_operations_dashboard(
+                alerts=[
+                    {"alert_type": "order_failed", "severity": "critical", "message": "failed", "value": 1},
+                    {"alert_type": "audit_sink_failed", "severity": "critical", "message": "audit down", "value": 1},
+                ]
+            ),
+            alerts=[
+                {"alert_type": "order_failed", "severity": "critical", "message": "failed", "value": 1},
+                {"alert_type": "audit_sink_failed", "severity": "critical", "message": "audit down", "value": 1},
+            ],
+            snapshot_id="DASH-B",
+            created_at="2026-05-19T10:05:00+00:00",
+        )
+
+        report = build_operations_dashboard_trend_report([second, first], window=2)
+        rendered = render_operations_dashboard_trend_report(report)
+
+        self.assertEqual(report.latest_snapshot.snapshot_id, "DASH-B")
+        self.assertTrue(any(metric.name == "critical_alerts" and metric.delta == 1 for metric in report.metrics))
+        self.assertTrue(any("critical_alerts" in anomaly for anomaly in report.anomalies))
+        self.assertIn("Operations dashboard trends:", rendered)
+
+    def test_trend_alerts_create_action_items_and_knowledge(self) -> None:
+        first = build_operations_dashboard_snapshot(
+            build_operations_dashboard(),
+            snapshot_id="DASH-T1",
+            created_at="2026-05-19T10:00:00+00:00",
+        )
+        second = build_operations_dashboard_snapshot(
+            build_operations_dashboard(
+                alerts=[{"alert_type": "order_failed", "severity": "critical", "message": "failed", "value": 1}]
+            ),
+            alerts=[{"alert_type": "order_failed", "severity": "critical", "message": "failed", "value": 1}],
+            snapshot_id="DASH-T2",
+            created_at="2026-05-19T10:05:00+00:00",
+        )
+        trend = build_operations_dashboard_trend_report([first, second], window=2)
+        rules = build_operations_trend_alert_rules(
+            '{"rules":[{"metric":"critical_alerts","severity":"critical","route":"ops","owner":"ops","delta_threshold":1,"action_template":"Handle {metric} now"}]}'
+        )
+
+        alerts = evaluate_operations_trend_alerts(trend, rules)
+        action_items = build_trend_alert_action_items(alerts, eta="2026-05-20T12:00:00+00:00")
+        closed = close_operations_action_item(action_items[0], "verified fixed", "2026-05-20T13:00:00+00:00")
+        entries = build_operations_knowledge_entries(trend_alerts=alerts, action_items=[closed])
+
+        reloaded_alert = operations_trend_alert_from_dict(operations_trend_alert_to_dict(alerts[0]))
+        reloaded_action = operations_action_item_from_dict(operations_action_item_to_dict(closed))
+        reloaded_entry = operations_knowledge_entry_from_dict(operations_knowledge_entry_to_dict(entries[0]))
+
+        self.assertEqual(alerts[0].metric, "critical_alerts")
+        self.assertEqual(reloaded_alert.severity, "critical")
+        self.assertEqual(reloaded_action.status, "CLOSED")
+        self.assertTrue(reloaded_entry.recommended_actions)
+        self.assertIn("Operations trend alerts:", render_operations_trend_alerts(alerts))
+        self.assertIn('"metric": "critical_alerts"', render_operations_trend_alerts_json(alerts))
+        self.assertIn("Operations action items:", render_operations_action_items([closed]))
+        self.assertIn("Operations knowledge entries:", render_operations_knowledge_entries(entries))
+
+    def test_builds_operations_multidimensional_view(self) -> None:
+        request = TravelRequest(
+            user_id="u-demo",
+            origin_city="北京",
+            destination_city="上海",
+            start_date=date(2026, 6, 3),
+            end_date=date(2026, 6, 5),
+            purpose="客户会议",
+            venue="上海张江人工智能岛",
+            budget_per_night=650,
+            preferences=["可取消"],
+            department="sales",
+        )
+        context = build_default_agent().run_to_order(request)
+        context.state = TravelState.ORDER_FAILED.value
+        context.order_cancellation = context.order_cancellation or None
+        worker_run = WorkerRunRecord(
+            run_id="WRK-MD",
+            started_at="2026-05-14T00:00:00+00:00",
+            finished_at="2026-05-14T00:00:01+00:00",
+            scanned=1,
+            advanced=0,
+            skipped=0,
+            errors={context.session_id: "boom"},
+            session_ids=[context.session_id],
+        )
+
+        view = build_operations_multidimensional_view(
+            sessions=[context],
+            alerts=[{"alert_type": "order_failed", "severity": "critical", "message": "failed", "value": 1}],
+            worker_runs=[worker_run],
+            limit=3,
+        )
+        rendered = render_operations_multidimensional_view(view)
+
+        self.assertEqual(view.total_sessions, 1)
+        self.assertEqual(view.worker_errors, 1)
+        self.assertEqual(view.alert_counts["order_failed"], 1)
+        self.assertTrue(any(group.name == "departments" for group in view.groups))
+        self.assertIn("Operations multi-dimensional view:", rendered)
+        self.assertIn("sales", rendered)
+
+    def test_builds_operations_postmortem_report(self) -> None:
+        context = build_default_agent().run_to_order(_request())
+        context.state = TravelState.ORDER_FAILED.value
+        dashboard = build_operations_dashboard(
+            sessions=[context],
+            alerts=[{"alert_type": "order_failed", "severity": "critical", "message": "failed", "value": 1}],
+        )
+        snapshot = build_operations_dashboard_snapshot(
+            dashboard,
+            alerts=[{"alert_type": "order_failed", "severity": "critical", "message": "failed", "value": 1}],
+            snapshot_id="DASH-PM",
+            created_at="2026-05-19T10:00:00+00:00",
+        )
+        ticket = fetch_oncall_ticket_status_http(
+            "INC-PM",
+            endpoint="https://oncall.example/status",
+            http_client=CapturingAnyHttpClient(
+                {
+                    "https://oncall.example/status": {
+                        "ticket": {
+                            "ticket_id": "INC-PM",
+                            "status": "ACKED",
+                            "assignee": "ops",
+                            "updated_at": "2026-05-19T10:05:00+00:00",
+                        }
+                    }
+                }
+            ),
+        )
+        worker_run = WorkerRunRecord(
+            run_id="WRK-PM",
+            started_at="2026-05-19T10:00:00+00:00",
+            finished_at="2026-05-19T10:00:01+00:00",
+            scanned=1,
+            advanced=0,
+            skipped=0,
+            errors={context.session_id: "boom"},
+            session_ids=[context.session_id],
+        )
+
+        report = build_operations_postmortem_report(
+            sessions=[context],
+            snapshots=[snapshot],
+            oncall_statuses=[ticket],
+            alerts=[{"alert_type": "order_failed", "severity": "critical", "message": "failed", "value": 1}],
+            worker_runs=[worker_run],
+            drill_report=build_operations_drill_report(IntegrationSettings(), sessions=[context]),
+        )
+        rendered = render_operations_postmortem_report(report)
+
+        self.assertEqual(report.incident_id, "INC-PM")
+        self.assertEqual(report.severity, "critical")
+        self.assertIn(context.session_id, report.related_sessions)
+        self.assertTrue(any("Supplier order" in cause for cause in report.root_causes))
+        self.assertIn("Operations incident postmortem:", rendered)
+
+    def test_postmortem_creates_action_items_and_knowledge(self) -> None:
+        context = build_default_agent().run_to_order(_request())
+        context.state = TravelState.ORDER_FAILED.value
+        report = build_operations_postmortem_report(
+            sessions=[context],
+            alerts=[{"alert_type": "order_failed", "severity": "critical", "message": "failed", "value": 1}],
+            drill_report=build_operations_drill_report(IntegrationSettings(), sessions=[context]),
+            incident_id="INC-ACTION",
+            generated_at="2026-05-19T10:00:00+00:00",
+        )
+
+        items = build_postmortem_action_items(report, owner="ops", eta="2026-05-20T12:00:00+00:00")
+        entries = build_operations_knowledge_entries(postmortem=report, action_items=items)
+
+        self.assertTrue(items)
+        self.assertEqual(items[0].source_type, "postmortem")
+        self.assertEqual(items[0].source_id, "INC-ACTION")
+        self.assertTrue(any(entry.topic == report.primary_signal for entry in entries))
+        self.assertIn("Operations action items:", render_operations_action_items(items))
+
+    def test_searches_operations_knowledge_and_summarizes_closed_loop(self) -> None:
+        trend_alert = operations_trend_alert_from_dict(
+            {
+                "alert_id": "TREND-SEARCH",
+                "metric": "critical_alerts",
+                "severity": "critical",
+                "route": "incident-oncall",
+                "escalation": "page",
+                "owner": "platform-oncall",
+                "current": 2,
+                "previous": 1,
+                "delta": 1,
+                "delta_percent": 100.0,
+                "reason": "critical alert grew",
+                "action_item": "Review critical alerts",
+            }
+        )
+        action = operations_action_item_from_dict(
+            {
+                "action_id": "ACT-SEARCH",
+                "source_type": "trend_alert",
+                "source_id": trend_alert.alert_id,
+                "title": "Review critical alerts",
+                "owner": "platform-oncall",
+                "status": "CLOSED",
+                "eta": None,
+                "created_at": "2026-05-19T00:00:00+00:00",
+                "updated_at": "2026-05-19T02:00:00+00:00",
+                "evidence": ["metric=critical_alerts"],
+                "closure_note": "alert owner confirmed",
+            }
+        )
+        entries = build_operations_knowledge_entries(trend_alerts=[trend_alert], action_items=[action])
+
+        search = search_operations_knowledge(entries, "critical alerts", limit=3)
+        closed_loop = build_operations_closed_loop_report(
+            trend_alerts=[trend_alert],
+            action_items=[action],
+            knowledge_entries=entries,
+            generated_at="2026-05-20T00:00:00+00:00",
+        )
+
+        self.assertTrue(search.hits)
+        self.assertEqual(closed_loop.closure_rate, 100.0)
+        self.assertEqual(closed_loop.action_items_closed, 1)
+        self.assertIn("Operations knowledge search:", render_operations_knowledge_search_report(search))
+        self.assertIn("Operations closed-loop report:", render_operations_closed_loop_report(closed_loop))
+
+    def test_action_sla_escalates_overdue_open_items(self) -> None:
+        item = operations_action_item_from_dict(
+            {
+                "action_id": "ACT-SLA",
+                "source_type": "postmortem",
+                "source_id": "INC-SLA",
+                "title": "Recover audit sink",
+                "owner": "compliance-platform-oncall",
+                "status": "OPEN",
+                "eta": None,
+                "created_at": "2026-05-18T00:00:00+00:00",
+                "updated_at": "2026-05-18T00:00:00+00:00",
+                "evidence": ["audit_sink_failed"],
+                "closure_note": None,
+            }
+        )
+        policy = build_operations_action_sla_policy(
+            '{"warning_after_hours":12,"critical_after_hours":24,"owner_routes":{"compliance-platform-oncall":"compliance-route"}}'
+        )
+
+        report = evaluate_operations_action_sla(
+            [item],
+            policy=policy,
+            now="2026-05-20T00:00:00+00:00",
+        )
+        rendered = render_operations_action_sla_report(report)
+
+        self.assertEqual(len(report.findings), 1)
+        self.assertEqual(report.findings[0].severity, "critical")
+        self.assertEqual(report.findings[0].route, "compliance-route")
+        self.assertIn("Operations action SLA:", rendered)
+
+
+class PermissionPolicyTest(unittest.TestCase):
+    def test_permission_policy_allows_matching_role(self) -> None:
+        policy = PermissionPolicy(enabled=True, required_roles={"traveler"})
+
+        decision = evaluate_permission(policy, user_id="u-demo", action="plan_trip", roles={"traveler"})
+
+        self.assertTrue(decision.allowed)
+        self.assertEqual(decision.status, "ALLOW")
+        self.assertIn("ALLOW", render_permission_decision(decision))
+
+    def test_permission_policy_denies_missing_role_in_agent_flow(self) -> None:
+        policy = PermissionPolicy(enabled=True, required_roles={"travel_admin"})
+        agent = build_default_agent(permission_policy=policy)
+
+        with self.assertRaises(PermissionDeniedError):
+            agent.plan(_request())
+
+    def test_permission_policy_can_block_specific_action(self) -> None:
+        policy = PermissionPolicy(enabled=True, blocked_actions={"book_order"}, required_roles={"traveler"})
+        agent = build_default_agent(permission_policy=policy)
+        context = agent.run_to_approval(_request_with_roles(["traveler"]))
+        context = agent.refresh_approval_status(context)
+
+        with self.assertRaises(PermissionDeniedError):
+            agent.book_after_approval(context)
+
+    def test_permission_policy_uses_remote_permission_center(self) -> None:
+        http = CapturingAnyHttpClient(
+            {
+                "https://iam.example/check": {
+                    "decision": {
+                        "allowed": False,
+                        "status": "DENY",
+                        "reasons": ["remote denied"],
+                        "source": "iam",
+                    }
+                }
+            }
+        )
+        policy = PermissionPolicy(enabled=True, api_url="https://iam.example/check", api_token="iam-token")
+
+        decision = evaluate_permission(
+            policy,
+            user_id="u-demo",
+            action="plan_trip",
+            roles={"traveler"},
+            http_client=http,
+        )
+
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.source, "iam")
+        self.assertEqual(http.calls[0][2], "iam-token")
+
+    def test_permission_policy_falls_back_to_local_policy_when_remote_unavailable(self) -> None:
+        policy = PermissionPolicy(
+            enabled=True,
+            api_url="https://iam.example/check",
+            required_roles={"traveler"},
+        )
+
+        decision = evaluate_permission(
+            policy,
+            user_id="u-demo",
+            action="plan_trip",
+            roles={"traveler"},
+            http_client=FailingHttpClient(),
+        )
+
+        self.assertTrue(decision.allowed)
+        self.assertEqual(decision.source, "local")
+
+
+class DataGovernanceTest(unittest.TestCase):
+    def test_redacts_sensitive_payload_fields(self) -> None:
+        result = redact_payload(
+            {
+                "user_id": "u-demo",
+                "phone": "13800000000",
+                "traveler": {"id_card_no": "110101199001010011"},
+                "items": [{"email": "user@example.com"}, {"hotel_id": "H-1"}],
+            }
+        )
+
+        self.assertEqual(result.redacted["phone"], "***")
+        self.assertEqual(result.redacted["traveler"]["id_card_no"], "***")
+        self.assertEqual(result.redacted["items"][0]["email"], "***")
+        self.assertIn("phone", result.redacted_keys)
+        self.assertIn("traveler.id_card_no", result.redacted_keys)
+
+    def test_builds_audit_event_from_redacted_payload(self) -> None:
+        event = build_audit_event("submit_approval", {"phone": "13800000000", "session_id": "S-1"})
+
+        self.assertEqual(event.event_type, "submit_approval")
+        self.assertEqual(event.detail, "payload redacted")
+        self.assertIn("phone", event.redacted_keys)
+        self.assertEqual(event.redacted_payload["phone"], "***")
+
+
+class ReleaseReadinessTest(unittest.TestCase):
+    def test_release_readiness_blocks_mock_only_configuration(self) -> None:
+        report = run_release_readiness_report(IntegrationSettings())
+        rendered = render_release_readiness_report(report)
+
+        self.assertEqual(report.status, "FAIL")
+        self.assertIn("WARN mock_fallback", rendered)
+        self.assertIn("FAIL session_store", rendered)
+
+    def test_release_readiness_passes_for_full_configuration_with_tokens(self) -> None:
+        report = run_release_readiness_report(
+            _full_acceptance_settings_with_tokens(),
+            rollout_policy=RolloutPolicy(enabled=True, percentage=10, rollback_runbook_url="https://runbook.example"),
+            permission_policy=PermissionPolicy(
+                enabled=True,
+                required_roles={"traveler"},
+                api_url="https://iam.example/check",
+                api_token="iam-token",
+            ),
+        )
+        rendered = render_release_readiness_report(report)
+
+        self.assertEqual(report.status, "PASS")
+        self.assertIn("PASS api_tokens", rendered)
+        self.assertIn("PASS rollout_control", rendered)
+        self.assertIn("PASS permission_policy", rendered)
+        self.assertIn("PASS audit_log_sink", rendered)
+        self.assertIn("PASS auditability", rendered)
+
+    def test_release_gate_fails_on_readiness_fail(self) -> None:
+        report = run_release_readiness_report(IntegrationSettings())
+
+        gate = evaluate_release_gate(report)
+        rendered = render_release_gate_result(gate)
+
+        self.assertFalse(gate.passed)
+        self.assertEqual(gate.exit_code, 1)
+        self.assertIn("Release gate:", rendered)
+
+    def test_release_readiness_warns_for_external_permission_and_audit_tokens(self) -> None:
+        report = run_release_readiness_report(
+            IntegrationSettings(
+                permission_api_url="https://iam.example/check",
+                audit_log_api_url="https://audit.example/events",
+            )
+        )
+        rendered = render_release_readiness_report(report)
+
+        self.assertIn("permission", rendered)
+        self.assertIn("audit_log", rendered)
+
 
 def _request(budget_per_night: int = 650) -> TravelRequest:
     return TravelRequest(
@@ -1646,6 +2765,105 @@ def _request(budget_per_night: int = 650) -> TravelRequest:
         venue="上海张江人工智能岛",
         budget_per_night=budget_per_night,
         preferences=["可取消"],
+    )
+
+
+def _request_with_roles(roles: list[str]) -> TravelRequest:
+    return TravelRequest(
+        user_id="u-demo",
+        origin_city="北京",
+        destination_city="上海",
+        start_date=date(2026, 6, 3),
+        end_date=date(2026, 6, 5),
+        purpose="客户会议",
+        venue="上海张江人工智能岛",
+        budget_per_night=650,
+        preferences=["可取消"],
+        roles=roles,
+    )
+
+
+def _full_acceptance_settings() -> IntegrationSettings:
+    return IntegrationSettings(
+        policy_api_url="https://policy.example/check",
+        transport_policy_api_url="https://policy.example/transport",
+        hotel_inventory_api_url="https://hotel.example/search",
+        hotel_price_check_api_url="https://hotel.example/price",
+        hotel_inventory_lock_api_url="https://hotel.example/lock",
+        hotel_inventory_release_api_url="https://hotel.example/release",
+        oa_approval_api_url="https://oa.example/create",
+        oa_approval_status_api_url="https://oa.example/status",
+        oa_approval_cancel_api_url="https://oa.example/cancel",
+        order_api_url="https://order.example/create",
+        order_status_api_url="https://order.example/status",
+        order_cancel_api_url="https://order.example/cancel",
+        refund_estimate_api_url="https://refund.example/estimate",
+        refund_confirm_api_url="https://refund.example/confirm",
+        change_approval_api_url="https://oa.example/change",
+        change_failure_compensation_api_url="https://change.example/compensate",
+        hotel_change_api_url="https://hotel.example/change",
+        transport_inventory_api_url="https://transport.example/search",
+        transport_order_api_url="https://transport.example/order",
+        transport_order_status_api_url="https://transport.example/status",
+        transport_order_cancel_api_url="https://transport.example/cancel",
+        transport_change_api_url="https://transport.example/change",
+        notification_api_url="https://notify.example/send",
+        calendar_api_url="https://calendar.example/sync",
+        use_mock_fallback=False,
+        notification_use_mock_fallback=False,
+        calendar_use_mock_fallback=False,
+        session_store_backend="sqlite",
+        session_db_path="travel-agent-acceptance.sqlite3",
+    )
+
+
+def _full_acceptance_settings_with_tokens() -> IntegrationSettings:
+    settings = _full_acceptance_settings()
+    return IntegrationSettings(
+        policy_api_url=settings.policy_api_url,
+        transport_policy_api_url=settings.transport_policy_api_url,
+        hotel_inventory_api_url=settings.hotel_inventory_api_url,
+        hotel_price_check_api_url=settings.hotel_price_check_api_url,
+        hotel_inventory_lock_api_url=settings.hotel_inventory_lock_api_url,
+        hotel_inventory_release_api_url=settings.hotel_inventory_release_api_url,
+        oa_approval_api_url=settings.oa_approval_api_url,
+        oa_approval_status_api_url=settings.oa_approval_status_api_url,
+        oa_approval_cancel_api_url=settings.oa_approval_cancel_api_url,
+        order_api_url=settings.order_api_url,
+        order_status_api_url=settings.order_status_api_url,
+        order_cancel_api_url=settings.order_cancel_api_url,
+        refund_estimate_api_url=settings.refund_estimate_api_url,
+        refund_confirm_api_url=settings.refund_confirm_api_url,
+        change_approval_api_url=settings.change_approval_api_url,
+        change_failure_compensation_api_url=settings.change_failure_compensation_api_url,
+        hotel_change_api_url=settings.hotel_change_api_url,
+        transport_inventory_api_url=settings.transport_inventory_api_url,
+        transport_order_api_url=settings.transport_order_api_url,
+        transport_order_status_api_url=settings.transport_order_status_api_url,
+        transport_order_cancel_api_url=settings.transport_order_cancel_api_url,
+        transport_change_api_url=settings.transport_change_api_url,
+        notification_api_url=settings.notification_api_url,
+        calendar_api_url=settings.calendar_api_url,
+        permission_api_url="https://iam.example/check",
+        audit_log_api_url="https://audit.example/events",
+        alert_api_url="https://alerts.example/events",
+        oncall_api_url="https://oncall.example/tickets",
+        policy_api_token="policy-token",
+        transport_api_token="transport-token",
+        hotel_inventory_api_token="hotel-token",
+        oa_approval_api_token="oa-token",
+        order_api_token="order-token",
+        notification_api_token="notification-token",
+        calendar_api_token="calendar-token",
+        permission_api_token="iam-token",
+        audit_log_api_token="audit-token",
+        alert_api_token="alert-token",
+        oncall_api_token="oncall-token",
+        use_mock_fallback=False,
+        notification_use_mock_fallback=False,
+        calendar_use_mock_fallback=False,
+        session_store_backend="sqlite",
+        session_db_path=settings.session_db_path,
     )
 
 
@@ -1666,6 +2884,136 @@ class CapturingHttpClient(StubHttpClient):
     def post_json(self, url: str, payload: dict[str, Any], token: str | None = None) -> dict[str, Any]:
         del token
         self.payloads.setdefault(url, []).append(payload)
+        return self.responses[url]
+
+
+class CapturingAnyHttpClient:
+    def __init__(self, responses: dict[str, dict[str, Any]]) -> None:
+        self.responses = responses
+        self.calls: list[tuple[str, dict[str, Any], str | None]] = []
+
+    def post_json(self, url: str, payload: dict[str, Any], token: str | None = None) -> dict[str, Any]:
+        self.calls.append((url, payload, token))
+        return self.responses[url]
+
+
+class FakeSessionStoreHttpClient:
+    def __init__(self) -> None:
+        self.sessions: dict[str, dict[str, Any]] = {}
+        self.worker_runs: list[dict[str, Any]] = []
+        self.dashboard_snapshots: list[dict[str, Any]] = []
+        self.oncall_statuses: list[dict[str, Any]] = []
+        self.trend_alerts: list[dict[str, Any]] = []
+        self.action_items: list[dict[str, Any]] = []
+        self.knowledge_entries: list[dict[str, Any]] = []
+        self.calls: list[tuple[str, dict[str, Any], str | None]] = []
+
+    def post_json(self, url: str, payload: dict[str, Any], token: str | None = None) -> dict[str, Any]:
+        self.calls.append((url, payload, token))
+        path = "/" + url.split("/", 3)[3].split("/", 1)[1]
+        if path == "/sessions/save":
+            session_id = str(payload["session_id"])
+            existing = self.sessions.get(session_id)
+            version = int(existing["version"]) + 1 if existing else 1
+            self.sessions[session_id] = self._session_record(payload, version, existing)
+            return {"ok": True, "version": version}
+        if path == "/sessions/save-if-version":
+            session_id = str(payload["session_id"])
+            existing = self.sessions.get(session_id)
+            expected_version = int(payload["expected_version"])
+            if existing is None:
+                if expected_version != 0:
+                    return {"ok": False, "error": "version mismatch"}
+                version = 1
+            elif int(existing["version"]) != expected_version:
+                return {"ok": False, "error": "version mismatch"}
+            else:
+                version = expected_version + 1
+            self.sessions[session_id] = self._session_record(payload, version, existing)
+            return {"ok": True, "version": version}
+        if path == "/sessions/get":
+            return {"session": self.sessions[str(payload["session_id"])]}
+        if path == "/sessions/list-by-states":
+            states = set(payload["states"])
+            sessions = [session for session in self.sessions.values() if session["state"] in states]
+            return {"sessions": sessions[: int(payload["limit"])]}
+        if path == "/sessions/list-recent":
+            return {"sessions": list(reversed(list(self.sessions.values())))[0 : int(payload["limit"])]}
+        if path == "/worker-runs/record":
+            self.worker_runs.append(dict(payload["worker_run"]))
+            return {"ok": True}
+        if path == "/worker-runs/list":
+            return {"worker_runs": list(reversed(self.worker_runs))[0 : int(payload["limit"])]}
+        if path == "/operations/dashboard-snapshots/record":
+            self.dashboard_snapshots.append(dict(payload["snapshot"]))
+            return {"ok": True}
+        if path == "/operations/dashboard-snapshots/list":
+            return {"snapshots": list(reversed(self.dashboard_snapshots))[0 : int(payload["limit"])]}
+        if path == "/operations/oncall-statuses/record":
+            self.oncall_statuses.append(dict(payload["status"]))
+            return {"ok": True}
+        if path == "/operations/oncall-statuses/list":
+            return {"statuses": list(reversed(self.oncall_statuses))[0 : int(payload["limit"])]}
+        if path == "/operations/trend-alerts/record":
+            self.trend_alerts.append(dict(payload["alert"]))
+            return {"ok": True}
+        if path == "/operations/trend-alerts/list":
+            return {"alerts": list(reversed(self.trend_alerts))[0 : int(payload["limit"])]}
+        if path == "/operations/action-items/record":
+            self.action_items = [
+                item for item in self.action_items if item.get("action_id") != payload["item"].get("action_id")
+            ]
+            self.action_items.append(dict(payload["item"]))
+            return {"ok": True}
+        if path == "/operations/action-items/list":
+            return {"items": list(reversed(self.action_items))[0 : int(payload["limit"])]}
+        if path == "/operations/knowledge/record":
+            self.knowledge_entries.append(dict(payload["entry"]))
+            return {"ok": True}
+        if path == "/operations/knowledge/list":
+            return {"entries": list(reversed(self.knowledge_entries))[0 : int(payload["limit"])]}
+        if path == "/health":
+            return {
+                "backend": "http-json",
+                "ok": True,
+                "schema_version": 4,
+                "session_count": len(self.sessions),
+                "worker_run_count": len(self.worker_runs),
+                "details": {
+                    "contract": "session-store-v1",
+                    "dashboard_snapshots": str(len(self.dashboard_snapshots)),
+                    "oncall_ticket_statuses": str(len(self.oncall_statuses)),
+                    "operations_trend_alerts": str(len(self.trend_alerts)),
+                    "operations_action_items": str(len(self.action_items)),
+                    "operations_knowledge_entries": str(len(self.knowledge_entries)),
+                },
+            }
+        raise AssertionError(f"Unexpected HTTP store URL: {url}")
+
+    @staticmethod
+    def _session_record(
+        payload: dict[str, Any],
+        version: int,
+        existing: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        created_at = existing["created_at"] if existing else "2026-05-14T00:00:00+00:00"
+        return {
+            "session_id": payload["session_id"],
+            "state": payload["state"],
+            "payload": payload["payload"],
+            "version": version,
+            "created_at": created_at,
+            "updated_at": f"2026-05-14T00:00:0{version}+00:00",
+        }
+
+
+class SmokeProbeHttpClient:
+    def __init__(self, responses: dict[str, dict[str, Any]]) -> None:
+        self.responses = responses
+        self.calls: list[tuple[str, dict[str, Any], str | None]] = []
+
+    def post_json(self, url: str, payload: dict[str, Any], token: str | None = None) -> dict[str, Any]:
+        self.calls.append((url, payload, token))
         return self.responses[url]
 
 

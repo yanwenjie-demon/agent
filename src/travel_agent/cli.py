@@ -9,10 +9,75 @@ from typing import Callable
 from urllib.parse import urlsplit
 
 from .agent import build_default_agent
+from .acceptance import render_integration_acceptance_report, run_integration_acceptance_report
 from .config import IntegrationSettings
+from .evaluation import render_evaluation_report, run_evaluation_suite
+from .governance import render_release_readiness_report, run_release_readiness_report
 from .models import DeadLetterCalendarSync, DeadLetterNotification, TravelContext, TravelRequest, WorkerRunRecord
 from .observability import build_otlp_payloads, export_otlp_http
-from .storage import SessionStore
+from .operations import (
+    build_alert_route_rules,
+    build_operations_dashboard,
+    build_operations_dashboard_snapshot,
+    build_operations_dashboard_trend_report,
+    build_operations_action_sla_policy,
+    build_operations_closed_loop_report,
+    build_operations_knowledge_entries,
+    build_operations_multidimensional_view,
+    build_operations_postmortem_report,
+    build_operations_trend_alert_rules,
+    build_postmortem_action_items,
+    build_trend_alert_action_items,
+    close_operations_action_item,
+    evaluate_operations_action_sla,
+    evaluate_operations_drill_gate,
+    evaluate_operations_trend_alerts,
+    export_operations_alerts_http,
+    fetch_oncall_ticket_status_http,
+    open_oncall_ticket_http,
+    oncall_ticket_status_from_dict,
+    oncall_ticket_status_to_dict,
+    operations_action_item_from_dict,
+    operations_action_item_to_dict,
+    operations_dashboard_snapshot_from_dict,
+    operations_dashboard_snapshot_to_dict,
+    operations_knowledge_entry_from_dict,
+    operations_knowledge_entry_to_dict,
+    operations_trend_alert_from_dict,
+    operations_trend_alert_to_dict,
+    render_operations_alert_export_result,
+    render_operations_alerts,
+    render_operations_alerts_json,
+    render_operations_alerts_prometheus,
+    build_operations_drill_report,
+    build_operations_runbook,
+    render_alert_route_rules,
+    render_alert_route_rules_json,
+    render_operations_action_items,
+    render_operations_action_sla_report,
+    render_operations_closed_loop_report,
+    render_operations_dashboard_snapshots,
+    render_operations_dashboard_trend_report,
+    render_operations_knowledge_entries,
+    render_operations_knowledge_search_report,
+    render_operations_multidimensional_view,
+    render_operations_postmortem_report,
+    render_operations_trend_alerts,
+    render_operations_trend_alerts_json,
+    search_operations_knowledge,
+    render_oncall_ticket_status,
+    render_oncall_ticket_result,
+    render_operations_dashboard,
+    render_operations_drill_gate_result,
+    render_operations_drill_report,
+    render_operations_runbook,
+)
+from .integrations import JsonHttpClient
+from .permissions import PermissionPolicy, evaluate_permission, render_permission_decision
+from .release_gate import evaluate_release_gate, render_release_gate_result
+from .release_control import RolloutPolicy, evaluate_rollout, render_rollout_decision
+from .smoke import render_smoke_probe_report, run_smoke_probes
+from .storage import SessionStore, StorageHealth
 from .worker import WorkflowLoopResult, WorkflowRunResult, WorkflowWorker
 
 
@@ -259,6 +324,307 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Print generated OTLP trace and metric payloads instead of sending them.",
     )
+    parser.add_argument(
+        "--run-evaluation-suite",
+        action="store_true",
+        help="Run the built-in travel workflow evaluation suite.",
+    )
+    parser.add_argument(
+        "--storage-health",
+        action="store_true",
+        help="Check the configured persistent session store health.",
+    )
+    parser.add_argument(
+        "--run-integration-acceptance",
+        action="store_true",
+        help="Render a real-system integration acceptance report.",
+    )
+    parser.add_argument(
+        "--skip-acceptance-evaluation",
+        action="store_true",
+        help="Skip the built-in evaluation suite when rendering the acceptance report.",
+    )
+    parser.add_argument(
+        "--run-smoke-probes",
+        action="store_true",
+        help="POST dry-run smoke payloads to configured real-system endpoints.",
+    )
+    parser.add_argument(
+        "--skip-optional-smoke-probes",
+        action="store_true",
+        help="Skip optional smoke probes such as external session-store health.",
+    )
+    parser.add_argument(
+        "--release-readiness",
+        action="store_true",
+        help="Render production release readiness governance checks.",
+    )
+    parser.add_argument(
+        "--release-gate",
+        action="store_true",
+        help="Run release readiness as a CI/CD gate and exit non-zero on failure.",
+    )
+    parser.add_argument(
+        "--allow-action-required",
+        action="store_true",
+        help="Let --release-gate pass when readiness status is ACTION_REQUIRED.",
+    )
+    parser.add_argument(
+        "--include-acceptance",
+        action="store_true",
+        help="Include integration acceptance results in --release-readiness.",
+    )
+    parser.add_argument(
+        "--include-smoke-probes",
+        action="store_true",
+        help="Include dry-run smoke probe results in --release-readiness.",
+    )
+    parser.add_argument(
+        "--rollout-decision",
+        action="store_true",
+        help="Evaluate rollout and rollback policy for a user.",
+    )
+    parser.add_argument(
+        "--rollout-user",
+        default=None,
+        help="User id for --rollout-decision. Defaults to --user.",
+    )
+    parser.add_argument(
+        "--rollout-department",
+        default=None,
+        help="Department for --rollout-decision.",
+    )
+    parser.add_argument(
+        "--rollout-scenario",
+        default="default",
+        help="Scenario key for --rollout-decision.",
+    )
+    parser.add_argument(
+        "--permission-check",
+        action="store_true",
+        help="Evaluate permission policy for a user action.",
+    )
+    parser.add_argument(
+        "--permission-action",
+        default="plan_trip",
+        help="Action for --permission-check, for example plan_trip/create_approval/book_order.",
+    )
+    parser.add_argument(
+        "--permission-user",
+        default=None,
+        help="User id for --permission-check. Defaults to --user.",
+    )
+    parser.add_argument(
+        "--permission-department",
+        default=None,
+        help="Department for --permission-check.",
+    )
+    parser.add_argument(
+        "--permission-role",
+        action="append",
+        default=[],
+        help="Role for --permission-check. Can be repeated.",
+    )
+    parser.add_argument(
+        "--operations-runbook",
+        action="store_true",
+        help="Render the production operations runbook.",
+    )
+    parser.add_argument(
+        "--operations-drill",
+        action="store_true",
+        help="Run mock incident drills for permission, audit, supplier failure, and rollback scenarios.",
+    )
+    parser.add_argument(
+        "--operations-drill-gate",
+        action="store_true",
+        help="Run operations drills as a CI/CD gate and exit non-zero on WARN or FAIL.",
+    )
+    parser.add_argument(
+        "--allow-drill-warnings",
+        action="store_true",
+        help="Let --operations-drill-gate pass when drill status is WARN.",
+    )
+    parser.add_argument(
+        "--operations-alerts",
+        action="store_true",
+        help="Render operations alerts from the operations drill report.",
+    )
+    parser.add_argument(
+        "--operations-alert-format",
+        choices=("summary", "json", "prometheus"),
+        default="summary",
+        help="Output format for --operations-alerts.",
+    )
+    parser.add_argument(
+        "--export-operations-alerts",
+        action="store_true",
+        help="POST operations alerts to an alert sink.",
+    )
+    parser.add_argument(
+        "--operations-alert-endpoint",
+        default=None,
+        help="Alert sink endpoint. Defaults to TRAVEL_ALERT_API_URL.",
+    )
+    parser.add_argument(
+        "--operations-dashboard",
+        action="store_true",
+        help="Render an operations dashboard from persisted sessions, worker runs, dead letters, and alerts.",
+    )
+    parser.add_argument(
+        "--save-operations-dashboard",
+        action="store_true",
+        help="Persist the current operations dashboard snapshot to the configured session store.",
+    )
+    parser.add_argument(
+        "--list-operations-dashboard-snapshots",
+        action="store_true",
+        help="List persisted operations dashboard snapshots from the configured session store.",
+    )
+    parser.add_argument(
+        "--operations-dashboard-trend",
+        action="store_true",
+        help="Render trend analysis from persisted operations dashboard snapshots.",
+    )
+    parser.add_argument(
+        "--dashboard-trend-window",
+        type=int,
+        default=7,
+        help="Number of persisted dashboard snapshots to include in the trend analysis window.",
+    )
+    parser.add_argument(
+        "--operations-trend-alerts",
+        action="store_true",
+        help="Evaluate configurable threshold alerts from persisted operations dashboard trend snapshots.",
+    )
+    parser.add_argument(
+        "--trend-alert-format",
+        choices=("summary", "json"),
+        default="summary",
+        help="Output format for --operations-trend-alerts.",
+    )
+    parser.add_argument(
+        "--persist-trend-alerts",
+        action="store_true",
+        help="Persist generated trend alerts to the session store.",
+    )
+    parser.add_argument(
+        "--create-trend-action-items",
+        action="store_true",
+        help="Create operations action items from generated trend alerts.",
+    )
+    parser.add_argument(
+        "--operations-multidim-view",
+        action="store_true",
+        help="Render multi-dimensional operations views from persisted sessions and alerts.",
+    )
+    parser.add_argument(
+        "--multidim-limit",
+        type=int,
+        default=5,
+        help="Maximum rows to show per multi-dimensional slice.",
+    )
+    parser.add_argument(
+        "--operations-postmortem",
+        action="store_true",
+        help="Generate an incident postmortem from sessions, alerts, snapshots, and OnCall statuses.",
+    )
+    parser.add_argument(
+        "--create-postmortem-action-items",
+        action="store_true",
+        help="Create persistent operations action items from the generated postmortem.",
+    )
+    parser.add_argument(
+        "--action-owner",
+        default="travel-ops",
+        help="Default owner for generated operations action items.",
+    )
+    parser.add_argument(
+        "--action-eta",
+        default=None,
+        help="Optional ETA for generated operations action items.",
+    )
+    parser.add_argument(
+        "--list-operations-action-items",
+        action="store_true",
+        help="List persisted operations action items.",
+    )
+    parser.add_argument(
+        "--close-operations-action-item",
+        default=None,
+        help="Close a persisted operations action item by action id.",
+    )
+    parser.add_argument(
+        "--closure-note",
+        default="completed",
+        help="Closure note for --close-operations-action-item.",
+    )
+    parser.add_argument(
+        "--save-operations-knowledge",
+        action="store_true",
+        help="Save operations knowledge entries from trend alerts, postmortem, and closed action items.",
+    )
+    parser.add_argument(
+        "--list-operations-knowledge",
+        action="store_true",
+        help="List persisted operations knowledge entries.",
+    )
+    parser.add_argument(
+        "--search-operations-knowledge",
+        default=None,
+        help="Search persisted operations knowledge entries by topic, signal, summary, or recommended action.",
+    )
+    parser.add_argument(
+        "--operations-action-sla",
+        action="store_true",
+        help="Evaluate SLA and escalation reminders for open operations action items.",
+    )
+    parser.add_argument(
+        "--action-sla-now",
+        default=None,
+        help="Optional ISO timestamp used as the current time for --operations-action-sla.",
+    )
+    parser.add_argument(
+        "--operations-closed-loop-report",
+        action="store_true",
+        help="Summarize trend alerts, action item closure, SLA findings, and knowledge entries.",
+    )
+    parser.add_argument(
+        "--alert-rules",
+        action="store_true",
+        help="Render alert routing, escalation, and silence rule templates.",
+    )
+    parser.add_argument(
+        "--alert-rules-format",
+        choices=("summary", "json"),
+        default="summary",
+        help="Output format for --alert-rules.",
+    )
+    parser.add_argument(
+        "--open-oncall-ticket",
+        action="store_true",
+        help="Open an OnCall or incident ticket with the operations drill report.",
+    )
+    parser.add_argument(
+        "--oncall-endpoint",
+        default=None,
+        help="OnCall ticket endpoint. Defaults to TRAVEL_ONCALL_API_URL.",
+    )
+    parser.add_argument(
+        "--sync-oncall-ticket",
+        default=None,
+        help="Fetch and persist status for an OnCall ticket id.",
+    )
+    parser.add_argument(
+        "--oncall-status-endpoint",
+        default=None,
+        help="OnCall ticket status endpoint. Defaults to TRAVEL_ONCALL_STATUS_API_URL.",
+    )
+    parser.add_argument(
+        "--list-oncall-ticket-statuses",
+        action="store_true",
+        help="List persisted OnCall ticket statuses from the configured session store.",
+    )
     return parser.parse_args()
 
 
@@ -270,23 +636,423 @@ def main() -> None:
 
     agent = build_default_agent(settings=settings)
     if args.list_worker_runs:
-        _require_session_db(settings, "--list-worker-runs")
+        _require_persistent_session_store(settings, "--list-worker-runs")
         print(render_worker_runs(agent.session_store.list_worker_runs(args.observability_limit)))
         return
     if args.list_dead_letters:
-        _require_session_db(settings, "--list-dead-letters")
+        _require_persistent_session_store(settings, "--list-dead-letters")
         print(render_dead_letters(agent.session_store.list_dead_letter_notifications(args.observability_limit)))
         return
     if args.list_calendar_dead_letters:
-        _require_session_db(settings, "--list-calendar-dead-letters")
+        _require_persistent_session_store(settings, "--list-calendar-dead-letters")
         print(
             render_calendar_dead_letters(
                 agent.session_store.list_dead_letter_calendar_syncs(args.observability_limit)
             )
         )
         return
+    if args.run_evaluation_suite:
+        print(render_evaluation_report(run_evaluation_suite()))
+        return
+    if args.storage_health:
+        _require_persistent_session_store(settings, "--storage-health")
+        health_check = getattr(agent.session_store, "health_check", None)
+        if health_check is None:
+            raise SystemExit("--storage-health requires a session store with health_check support.")
+        print(render_storage_health(health_check()))
+        return
+    if args.run_integration_acceptance:
+        health = None
+        health_check = getattr(agent.session_store, "health_check", None)
+        if health_check is not None and _has_persistent_session_store(settings):
+            health = health_check()
+        report = run_integration_acceptance_report(
+            settings,
+            storage_health=health,
+            include_evaluation=not args.skip_acceptance_evaluation,
+        )
+        print(render_integration_acceptance_report(report))
+        return
+    if args.run_smoke_probes:
+        report = run_smoke_probes(
+            settings,
+            JsonHttpClient(settings.timeout_seconds),
+            include_optional=not args.skip_optional_smoke_probes,
+        )
+        print(render_smoke_probe_report(report))
+        return
+    if args.release_readiness or args.release_gate:
+        acceptance = None
+        smoke = None
+        if args.include_acceptance:
+            health = None
+            health_check = getattr(agent.session_store, "health_check", None)
+            if health_check is not None and _has_persistent_session_store(settings):
+                health = health_check()
+            acceptance = run_integration_acceptance_report(settings, storage_health=health)
+        if args.include_smoke_probes:
+            smoke = run_smoke_probes(
+                settings,
+                JsonHttpClient(settings.timeout_seconds),
+                include_optional=not args.skip_optional_smoke_probes,
+            )
+        report = run_release_readiness_report(settings, acceptance, smoke)
+        if args.release_gate:
+            gate = evaluate_release_gate(report, allow_action_required=args.allow_action_required)
+            print(render_release_gate_result(gate))
+            if gate.exit_code:
+                raise SystemExit(gate.exit_code)
+            return
+        print(render_release_readiness_report(report))
+        return
+    if args.rollout_decision:
+        decision = evaluate_rollout(
+            RolloutPolicy.from_env(),
+            user_id=args.rollout_user or args.user,
+            department=args.rollout_department,
+            scenario=args.rollout_scenario,
+        )
+        print(render_rollout_decision(decision))
+        return
+    if args.permission_check:
+        decision = evaluate_permission(
+            PermissionPolicy.from_env(),
+            user_id=args.permission_user or args.user,
+            action=args.permission_action,
+            department=args.permission_department,
+            roles=args.permission_role,
+        )
+        print(render_permission_decision(decision))
+        return
+    if args.operations_runbook:
+        print(render_operations_runbook(build_operations_runbook()))
+        return
+    if args.list_operations_dashboard_snapshots:
+        _require_persistent_session_store(settings, "--list-operations-dashboard-snapshots")
+        snapshots = [
+            operations_dashboard_snapshot_from_dict(item)
+            for item in agent.session_store.list_operations_dashboard_snapshots(args.observability_limit)
+        ]
+        print(render_operations_dashboard_snapshots(snapshots))
+        return
+    if args.operations_dashboard_trend:
+        _require_persistent_session_store(settings, "--operations-dashboard-trend")
+        snapshots = [
+            operations_dashboard_snapshot_from_dict(item)
+            for item in agent.session_store.list_operations_dashboard_snapshots(args.observability_limit)
+        ]
+        report = build_operations_dashboard_trend_report(snapshots, window=args.dashboard_trend_window)
+        print(render_operations_dashboard_trend_report(report))
+        return
+    if args.operations_trend_alerts:
+        _require_persistent_session_store(settings, "--operations-trend-alerts")
+        snapshots = [
+            operations_dashboard_snapshot_from_dict(item)
+            for item in agent.session_store.list_operations_dashboard_snapshots(args.observability_limit)
+        ]
+        trend_report = build_operations_dashboard_trend_report(snapshots, window=args.dashboard_trend_window)
+        alerts = evaluate_operations_trend_alerts(
+            trend_report,
+            build_operations_trend_alert_rules(settings.trend_alert_rules_json),
+        )
+        if args.persist_trend_alerts:
+            for alert in alerts:
+                agent.session_store.record_operations_trend_alert(operations_trend_alert_to_dict(alert))
+        action_items = []
+        if args.create_trend_action_items:
+            action_items = build_trend_alert_action_items(alerts, eta=args.action_eta)
+            for item in action_items:
+                agent.session_store.record_operations_action_item(operations_action_item_to_dict(item))
+        if args.trend_alert_format == "json":
+            print(render_operations_trend_alerts_json(alerts))
+        else:
+            print(render_operations_trend_alerts(alerts))
+            if action_items:
+                print(render_operations_action_items(action_items))
+        return
+    if args.operations_multidim_view:
+        _require_persistent_session_store(settings, "--operations-multidim-view")
+        worker_runs = agent.session_store.list_worker_runs(args.observability_limit)
+        dead_letters = agent.session_store.list_dead_letter_notifications(args.observability_limit)
+        calendar_dead_letters = agent.session_store.list_dead_letter_calendar_syncs(args.observability_limit)
+        sessions = agent.session_store.list_recent(args.observability_limit)
+        report = build_operations_multidimensional_view(
+            sessions=sessions,
+            alerts=build_operations_drill_report(
+                settings,
+                worker_runs=worker_runs,
+                dead_letters=dead_letters,
+                calendar_dead_letters=calendar_dead_letters,
+                sessions=sessions,
+                audit_sink_results=agent.gateway.audit_sink_results,
+            ).alerts,
+            worker_runs=worker_runs,
+            dead_letters=dead_letters,
+            calendar_dead_letters=calendar_dead_letters,
+            limit=args.multidim_limit,
+        )
+        print(render_operations_multidimensional_view(report))
+        return
+    if args.list_operations_action_items:
+        _require_persistent_session_store(settings, "--list-operations-action-items")
+        items = [
+            operations_action_item_from_dict(item)
+            for item in agent.session_store.list_operations_action_items(args.observability_limit)
+        ]
+        print(render_operations_action_items(items))
+        return
+    if args.close_operations_action_item:
+        _require_persistent_session_store(settings, "--close-operations-action-item")
+        items = [
+            operations_action_item_from_dict(item)
+            for item in agent.session_store.list_operations_action_items(args.observability_limit)
+        ]
+        item = next((candidate for candidate in items if candidate.action_id == args.close_operations_action_item), None)
+        if item is None:
+            raise SystemExit(f"Action item not found: {args.close_operations_action_item}")
+        closed = close_operations_action_item(item, args.closure_note)
+        agent.session_store.record_operations_action_item(operations_action_item_to_dict(closed))
+        print(render_operations_action_items([closed]))
+        return
+    if args.list_operations_knowledge:
+        _require_persistent_session_store(settings, "--list-operations-knowledge")
+        entries = [
+            operations_knowledge_entry_from_dict(item)
+            for item in agent.session_store.list_operations_knowledge_entries(args.observability_limit)
+        ]
+        print(render_operations_knowledge_entries(entries))
+        return
+    if args.search_operations_knowledge:
+        _require_persistent_session_store(settings, "--search-operations-knowledge")
+        entries = [
+            operations_knowledge_entry_from_dict(item)
+            for item in agent.session_store.list_operations_knowledge_entries(args.observability_limit)
+        ]
+        report = search_operations_knowledge(entries, args.search_operations_knowledge, limit=args.observability_limit)
+        print(render_operations_knowledge_search_report(report))
+        return
+    if args.operations_action_sla:
+        _require_persistent_session_store(settings, "--operations-action-sla")
+        items = [
+            operations_action_item_from_dict(item)
+            for item in agent.session_store.list_operations_action_items(args.observability_limit)
+        ]
+        report = evaluate_operations_action_sla(
+            items,
+            policy=build_operations_action_sla_policy(settings.action_sla_policy_json),
+            now=args.action_sla_now,
+        )
+        print(render_operations_action_sla_report(report))
+        return
+    if args.operations_closed_loop_report:
+        _require_persistent_session_store(settings, "--operations-closed-loop-report")
+        trend_alerts = [
+            operations_trend_alert_from_dict(item)
+            for item in agent.session_store.list_operations_trend_alerts(args.observability_limit)
+        ]
+        action_items = [
+            operations_action_item_from_dict(item)
+            for item in agent.session_store.list_operations_action_items(args.observability_limit)
+        ]
+        knowledge_entries = [
+            operations_knowledge_entry_from_dict(item)
+            for item in agent.session_store.list_operations_knowledge_entries(args.observability_limit)
+        ]
+        sla_report = evaluate_operations_action_sla(
+            action_items,
+            policy=build_operations_action_sla_policy(settings.action_sla_policy_json),
+            now=args.action_sla_now,
+        )
+        report = build_operations_closed_loop_report(
+            trend_alerts=trend_alerts,
+            action_items=action_items,
+            knowledge_entries=knowledge_entries,
+            sla_report=sla_report,
+        )
+        print(render_operations_closed_loop_report(report))
+        return
+    if args.list_oncall_ticket_statuses:
+        _require_persistent_session_store(settings, "--list-oncall-ticket-statuses")
+        statuses = [
+            oncall_ticket_status_from_dict(item)
+            for item in agent.session_store.list_oncall_ticket_statuses(args.observability_limit)
+        ]
+        lines = ["OnCall ticket statuses:"]
+        if not statuses:
+            lines.append("- none")
+        else:
+            for status in statuses:
+                lines.append(f"- {status.ticket_id}: {status.status} assignee={status.assignee or '-'} updated_at={status.updated_at}")
+        print("\n".join(lines))
+        return
+    if args.sync_oncall_ticket:
+        _require_persistent_session_store(settings, "--sync-oncall-ticket")
+        endpoint = args.oncall_status_endpoint or settings.oncall_status_api_url
+        if not endpoint:
+            raise SystemExit("--sync-oncall-ticket requires --oncall-status-endpoint or TRAVEL_ONCALL_STATUS_API_URL.")
+        status = fetch_oncall_ticket_status_http(
+            args.sync_oncall_ticket,
+            endpoint=endpoint,
+            token=settings.oncall_api_token,
+        )
+        agent.session_store.record_oncall_ticket_status(oncall_ticket_status_to_dict(status))
+        print(render_oncall_ticket_status(status))
+        if status.status == "SYNC_FAILED":
+            raise SystemExit(1)
+        return
+    if args.alert_rules:
+        rules = build_alert_route_rules(settings.alert_rules_json)
+        if args.alert_rules_format == "json":
+            print(render_alert_route_rules_json(rules))
+        else:
+            print(render_alert_route_rules(rules))
+        return
+    if args.operations_postmortem:
+        _require_persistent_session_store(settings, "--operations-postmortem")
+        worker_runs = agent.session_store.list_worker_runs(args.observability_limit)
+        dead_letters = agent.session_store.list_dead_letter_notifications(args.observability_limit)
+        calendar_dead_letters = agent.session_store.list_dead_letter_calendar_syncs(args.observability_limit)
+        sessions = agent.session_store.list_recent(args.observability_limit)
+        snapshots = [
+            operations_dashboard_snapshot_from_dict(item)
+            for item in agent.session_store.list_operations_dashboard_snapshots(args.observability_limit)
+        ]
+        statuses = [
+            oncall_ticket_status_from_dict(item)
+            for item in agent.session_store.list_oncall_ticket_statuses(args.observability_limit)
+        ]
+        drill_report = build_operations_drill_report(
+            settings,
+            worker_runs=worker_runs,
+            dead_letters=dead_letters,
+            calendar_dead_letters=calendar_dead_letters,
+            sessions=sessions,
+            audit_sink_results=agent.gateway.audit_sink_results,
+        )
+        report = build_operations_postmortem_report(
+            sessions=sessions,
+            snapshots=snapshots,
+            oncall_statuses=statuses,
+            alerts=drill_report.alerts,
+            worker_runs=worker_runs,
+            dead_letters=dead_letters,
+            calendar_dead_letters=calendar_dead_letters,
+            drill_report=drill_report,
+        )
+        print(render_operations_postmortem_report(report))
+        if args.create_postmortem_action_items:
+            action_items = build_postmortem_action_items(report, owner=args.action_owner, eta=args.action_eta)
+            for item in action_items:
+                agent.session_store.record_operations_action_item(operations_action_item_to_dict(item))
+            print(render_operations_action_items(action_items))
+        if args.save_operations_knowledge:
+            trend_report = build_operations_dashboard_trend_report(snapshots, window=args.dashboard_trend_window)
+            trend_alerts = evaluate_operations_trend_alerts(
+                trend_report,
+                build_operations_trend_alert_rules(settings.trend_alert_rules_json),
+            )
+            action_items = [
+                operations_action_item_from_dict(item)
+                for item in agent.session_store.list_operations_action_items(args.observability_limit)
+            ]
+            entries = build_operations_knowledge_entries(
+                postmortem=report,
+                trend_alerts=trend_alerts,
+                action_items=action_items,
+            )
+            for entry in entries:
+                agent.session_store.record_operations_knowledge_entry(operations_knowledge_entry_to_dict(entry))
+            print(render_operations_knowledge_entries(entries))
+        return
+    if (
+        args.operations_drill
+        or args.operations_drill_gate
+        or args.operations_alerts
+        or args.export_operations_alerts
+        or args.operations_dashboard
+        or args.save_operations_dashboard
+        or args.open_oncall_ticket
+        or args.operations_multidim_view
+    ):
+        worker_runs: list[WorkerRunRecord] = []
+        dead_letters: list[DeadLetterNotification] = []
+        calendar_dead_letters: list[DeadLetterCalendarSync] = []
+        sessions: list[TravelContext] = []
+        if _has_persistent_session_store(settings):
+            worker_runs = agent.session_store.list_worker_runs(args.observability_limit)
+            dead_letters = agent.session_store.list_dead_letter_notifications(args.observability_limit)
+            calendar_dead_letters = agent.session_store.list_dead_letter_calendar_syncs(args.observability_limit)
+            sessions = agent.session_store.list_recent(args.observability_limit)
+        report = build_operations_drill_report(
+            settings,
+            worker_runs=worker_runs,
+            dead_letters=dead_letters,
+            calendar_dead_letters=calendar_dead_letters,
+            sessions=sessions,
+            audit_sink_results=agent.gateway.audit_sink_results,
+        )
+        if args.operations_dashboard or args.save_operations_dashboard:
+            dashboard = build_operations_dashboard(
+                worker_runs=worker_runs,
+                dead_letters=dead_letters,
+                calendar_dead_letters=calendar_dead_letters,
+                sessions=sessions,
+                alerts=report.alerts,
+            )
+            if args.save_operations_dashboard:
+                _require_persistent_session_store(settings, "--save-operations-dashboard")
+                snapshot = build_operations_dashboard_snapshot(dashboard, report.alerts)
+                agent.session_store.record_operations_dashboard_snapshot(
+                    operations_dashboard_snapshot_to_dict(snapshot)
+                )
+                print(render_operations_dashboard_snapshots([snapshot]))
+                return
+            print(render_operations_dashboard(dashboard))
+            return
+        if args.operations_alerts:
+            if args.operations_alert_format == "json":
+                print(render_operations_alerts_json(report.alerts))
+            elif args.operations_alert_format == "prometheus":
+                print(render_operations_alerts_prometheus(report.alerts))
+            else:
+                print(render_operations_alerts(report.alerts))
+            return
+        if args.export_operations_alerts:
+            endpoint = args.operations_alert_endpoint or settings.alert_api_url
+            if not endpoint:
+                raise SystemExit("--export-operations-alerts requires --operations-alert-endpoint or TRAVEL_ALERT_API_URL.")
+            result = export_operations_alerts_http(
+                report.alerts,
+                endpoint=endpoint,
+                token=settings.alert_api_token,
+            )
+            print(render_operations_alert_export_result(result))
+            if not result.ok:
+                raise SystemExit(1)
+            return
+        if args.open_oncall_ticket:
+            endpoint = args.oncall_endpoint or settings.oncall_api_url
+            if not endpoint:
+                raise SystemExit("--open-oncall-ticket requires --oncall-endpoint or TRAVEL_ONCALL_API_URL.")
+            result = open_oncall_ticket_http(
+                report,
+                endpoint=endpoint,
+                token=settings.oncall_api_token,
+            )
+            print(render_oncall_ticket_result(result))
+            if not result.ok:
+                raise SystemExit(1)
+            return
+        if args.operations_drill_gate:
+            gate = evaluate_operations_drill_gate(report, allow_warnings=args.allow_drill_warnings)
+            print(render_operations_drill_gate_result(gate))
+            if gate.exit_code:
+                raise SystemExit(gate.exit_code)
+            return
+        print(render_operations_drill_report(report))
+        return
     if args.metrics:
-        _require_session_db(settings, "--metrics")
+        _require_persistent_session_store(settings, "--metrics")
         worker_runs = agent.session_store.list_worker_runs(args.observability_limit)
         dead_letters = agent.session_store.list_dead_letter_notifications(args.observability_limit)
         sessions = agent.session_store.list_recent(args.observability_limit)
@@ -296,7 +1062,7 @@ def main() -> None:
             print(render_metrics(worker_runs, dead_letters, sessions))
         return
     if args.serve_metrics:
-        _require_session_db(settings, "--serve-metrics")
+        _require_persistent_session_store(settings, "--serve-metrics")
         serve_metrics(
             session_store=agent.session_store,
             host=args.metrics_host,
@@ -305,7 +1071,7 @@ def main() -> None:
         )
         return
     if args.export_otlp:
-        _require_session_db(settings, "--export-otlp")
+        _require_persistent_session_store(settings, "--export-otlp")
         endpoint = args.otlp_endpoint or settings.otlp_http_endpoint
         if not endpoint and not args.print_otlp_payload:
             raise SystemExit("--export-otlp requires --otlp-endpoint or TRAVEL_OTLP_HTTP_ENDPOINT.")
@@ -330,7 +1096,7 @@ def main() -> None:
         print(render_otlp_export_result(result))
         return
     if args.replay_dead_letter_session or args.replay_dead_letter_event:
-        _require_session_db(settings, "--replay-dead-letter-session")
+        _require_persistent_session_store(settings, "--replay-dead-letter-session")
         if not args.replay_dead_letter_session or not args.replay_dead_letter_event:
             raise SystemExit("--replay-dead-letter-session requires --replay-dead-letter-event.")
         context = agent.get_session(args.replay_dead_letter_session)
@@ -338,7 +1104,7 @@ def main() -> None:
         print(render_context(context))
         return
     if args.replay_calendar_dead_letter_session or args.replay_calendar_dead_letter_event:
-        _require_session_db(settings, "--replay-calendar-dead-letter-session")
+        _require_persistent_session_store(settings, "--replay-calendar-dead-letter-session")
         if not args.replay_calendar_dead_letter_session or not args.replay_calendar_dead_letter_event:
             raise SystemExit(
                 "--replay-calendar-dead-letter-session requires --replay-calendar-dead-letter-event."
@@ -360,7 +1126,7 @@ def main() -> None:
         print(render_context(context))
         return
     if args.run_worker_once:
-        _require_session_db(settings, "--run-worker-once")
+        _require_persistent_session_store(settings, "--run-worker-once")
         if args.worker_iterations <= 1:
             result = WorkflowWorker(agent).run_once(limit=args.worker_limit)
             print(render_worker_result(result))
@@ -428,6 +1194,8 @@ def main() -> None:
         venue=args.venue,
         budget_per_night=args.budget,
         preferences=args.preference,
+        department=args.permission_department,
+        roles=args.permission_role,
     )
 
     if args.auto_book:
@@ -661,6 +1429,20 @@ def render_otlp_export_result(result: object) -> str:
     )
 
 
+def render_storage_health(health: StorageHealth) -> str:
+    lines = [
+        "Storage health:",
+        f"- backend: {health.backend}",
+        f"- ok: {health.ok}",
+        f"- schema_version: {health.schema_version}",
+        f"- sessions: {health.session_count}",
+        f"- worker_runs: {health.worker_run_count}",
+    ]
+    for key, value in sorted(health.details.items()):
+        lines.append(f"- {key}: {value}")
+    return "\n".join(lines)
+
+
 def build_prometheus_metrics(session_store: SessionStore, limit: int = 50) -> str:
     return render_prometheus_metrics(
         worker_runs=session_store.list_worker_runs(limit),
@@ -761,6 +1543,14 @@ def _replace_session_db(settings: IntegrationSettings, session_db_path: str) -> 
         transport_change_api_url=settings.transport_change_api_url,
         notification_api_url=settings.notification_api_url,
         calendar_api_url=settings.calendar_api_url,
+        permission_api_url=settings.permission_api_url,
+        audit_log_api_url=settings.audit_log_api_url,
+        alert_api_url=settings.alert_api_url,
+        oncall_api_url=settings.oncall_api_url,
+        oncall_status_api_url=settings.oncall_status_api_url,
+        alert_rules_json=settings.alert_rules_json,
+        trend_alert_rules_json=settings.trend_alert_rules_json,
+        action_sla_policy_json=settings.action_sla_policy_json,
         otlp_http_endpoint=settings.otlp_http_endpoint,
         policy_api_token=settings.policy_api_token,
         transport_api_token=settings.transport_api_token,
@@ -769,18 +1559,45 @@ def _replace_session_db(settings: IntegrationSettings, session_db_path: str) -> 
         order_api_token=settings.order_api_token,
         notification_api_token=settings.notification_api_token,
         calendar_api_token=settings.calendar_api_token,
+        permission_api_token=settings.permission_api_token,
+        audit_log_api_token=settings.audit_log_api_token,
+        alert_api_token=settings.alert_api_token,
+        oncall_api_token=settings.oncall_api_token,
         otlp_api_token=settings.otlp_api_token,
         use_mock_fallback=settings.use_mock_fallback,
         notification_use_mock_fallback=settings.notification_use_mock_fallback,
         calendar_use_mock_fallback=settings.calendar_use_mock_fallback,
         timeout_seconds=settings.timeout_seconds,
         session_db_path=session_db_path,
+        session_store_backend=settings.session_store_backend,
+        session_store_api_url=settings.session_store_api_url,
+        session_store_api_token=settings.session_store_api_token,
     )
 
 
-def _require_session_db(settings: IntegrationSettings, command_name: str) -> None:
-    if not settings.session_db_path:
+def _require_persistent_session_store(settings: IntegrationSettings, command_name: str) -> None:
+    backend = settings.session_store_backend.strip().lower()
+    has_sqlite = bool(settings.session_db_path)
+    has_http = bool(settings.session_store_api_url)
+    if backend == "memory":
+        raise SystemExit(
+            f"{command_name} requires a persistent session store; configure SQLite or HTTP session store."
+        )
+    if backend == "sqlite" and not has_sqlite:
         raise SystemExit(f"{command_name} requires --session-db or TRAVEL_SESSION_DB_PATH.")
+    if backend == "http" and not has_http:
+        raise SystemExit(f"{command_name} requires TRAVEL_SESSION_STORE_API_URL.")
+    if backend == "auto" and not has_sqlite and not has_http:
+        raise SystemExit(
+            f"{command_name} requires --session-db, TRAVEL_SESSION_DB_PATH, or TRAVEL_SESSION_STORE_API_URL."
+        )
+
+
+def _has_persistent_session_store(settings: IntegrationSettings) -> bool:
+    backend = settings.session_store_backend.strip().lower()
+    if backend == "memory":
+        return False
+    return bool(settings.session_db_path or settings.session_store_api_url)
 
 
 def _validate_required_trip_args(args: argparse.Namespace) -> None:

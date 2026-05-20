@@ -2,10 +2,11 @@ from __future__ import annotations
 
 from dataclasses import asdict, replace
 from datetime import date, datetime, timezone
-from typing import Optional
+from typing import Any, Optional
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from .config import IntegrationSettings
+from .data_governance import AuditSink, build_audit_sink
 from .domain_agents import AgentTeam, build_agent_team
 from .integrations import HttpJsonClient, TravelSystemIntegrations
 from .mock_tools import plan_itinerary
@@ -22,8 +23,9 @@ from .models import (
     TravelRequest,
     TransportOption,
 )
+from .permissions import PermissionPolicy, ensure_permission, evaluate_permission
 from .state import TravelState, WorkflowStateMachine
-from .storage import InMemorySessionStore, SQLiteSessionStore, SessionStore
+from .storage import HttpSessionStore, InMemorySessionStore, SQLiteSessionStore, SessionStore, StoreHttpClient
 from .tools import ToolGateway
 
 
@@ -115,14 +117,23 @@ class TravelAgent:
         state_machine: Optional[WorkflowStateMachine] = None,
         session_store: Optional[SessionStore] = None,
         agent_team: Optional[AgentTeam] = None,
+        permission_policy: PermissionPolicy | None = None,
+        permission_http_client: Any | None = None,
+        audit_sink: AuditSink | None = None,
     ) -> None:
         self.gateway = gateway
         self.planner = planner or SimpleTaskPlanner()
         self.state_machine = state_machine or WorkflowStateMachine()
         self.session_store = session_store or InMemorySessionStore()
         self.agent_team = agent_team or build_agent_team(gateway)
+        self.permission_policy = permission_policy or PermissionPolicy.from_env()
+        self.permission_http_client = permission_http_client
+        self.audit_sink = audit_sink
+        if audit_sink is not None:
+            self.gateway.audit_sink = audit_sink
 
     def plan(self, request: TravelRequest) -> TravelContext:
+        self._require_permission_for_request(request, "plan_trip")
         context = TravelContext(
             session_id=str(uuid4()),
             request=request,
@@ -182,6 +193,7 @@ class TravelAgent:
         selected_hotel_id: Optional[str] = None,
         selected_transport_id: Optional[str] = None,
     ) -> TravelContext:
+        self._require_permission(context, "create_approval")
         selected_hotel = self._select_hotel(context.hotel_options, selected_hotel_id)
         selected_transport = self._select_transport(context.transport_options, selected_transport_id)
         context.selected_hotel = selected_hotel
@@ -227,6 +239,7 @@ class TravelAgent:
         return context
 
     def book_after_approval(self, context: TravelContext) -> TravelContext:
+        self._require_permission(context, "book_order")
         if context.state != TravelState.APPROVAL_APPROVED.value:
             raise ValueError("Booking requires APPROVAL_APPROVED state.")
         if context.selected_hotel is None:
@@ -515,6 +528,7 @@ class TravelAgent:
         return self.confirm_and_create_approval(context, selected_hotel_id, selected_transport_id)
 
     def replay_dead_letter_notification(self, context: TravelContext, event_type: str) -> TravelContext:
+        self._require_permission(context, "replay_dead_letter")
         existing = self._find_notification(context, event_type, context.workflow_generation)
         if existing is None:
             raise ValueError(f"No notification found for event type: {event_type}")
@@ -547,6 +561,7 @@ class TravelAgent:
         context: TravelContext,
         reason: str = "user_cancelled",
     ) -> TravelContext:
+        self._require_permission(context, "cancel_trip")
         if context.order is None and context.transport_order is None:
             raise ValueError("Refund estimate requires at least one created order.")
 
@@ -563,6 +578,7 @@ class TravelAgent:
         new_check_out: date | None = None,
         reason: str = "user_change_requested",
     ) -> TravelContext:
+        self._require_permission(context, "change_trip")
         if context.state not in {TravelState.ORDER_CREATED.value, TravelState.COMPLETED.value}:
             raise ValueError("Trip change requires ORDER_CREATED or COMPLETED state.")
         if new_depart_at is None and (new_check_in is None or new_check_out is None):
@@ -619,6 +635,7 @@ class TravelAgent:
         attendees: list[str] | None = None,
         existing: CalendarSyncRecord | None = None,
     ) -> TravelContext:
+        self._require_permission(context, "sync_calendar")
         resolved_event_type = event_type or self._calendar_event_type(context)
         if resolved_event_type is None:
             raise ValueError(f"Calendar sync is not supported for state: {context.state}")
@@ -640,6 +657,7 @@ class TravelAgent:
         return context
 
     def replay_dead_letter_calendar_sync(self, context: TravelContext, event_type: str) -> TravelContext:
+        self._require_permission(context, "replay_dead_letter")
         existing = self._find_calendar_sync(context, event_type, context.workflow_generation)
         if existing is None:
             raise ValueError(f"No calendar sync found for event type: {event_type}")
@@ -658,6 +676,7 @@ class TravelAgent:
         return context
 
     def cancel_trip(self, context: TravelContext, reason: str = "user_cancelled") -> TravelContext:
+        self._require_permission(context, "cancel_trip")
         if context.transport_order is not None and not self._compensation_done(context.transport_order_cancellation):
             transport_cancellation = self.agent_team.transport.cancel_order(context, reason)
             if transport_cancellation is not None:
@@ -690,6 +709,20 @@ class TravelAgent:
         if request.budget_per_night is None:
             return approved_budget
         return min(request.budget_per_night, approved_budget)
+
+    def _require_permission(self, context: TravelContext, action: str) -> None:
+        self._require_permission_for_request(context.request, action)
+
+    def _require_permission_for_request(self, request: TravelRequest, action: str) -> None:
+        decision = evaluate_permission(
+            self.permission_policy,
+            user_id=request.user_id,
+            action=action,
+            department=request.department,
+            roles=request.roles,
+            http_client=self.permission_http_client,
+        )
+        ensure_permission(decision)
 
     @staticmethod
     def _select_hotel(
@@ -1178,10 +1211,17 @@ class TravelAgent:
 def build_default_agent(
     settings: IntegrationSettings | None = None,
     http_client: HttpJsonClient | None = None,
+    store_http_client: StoreHttpClient | None = None,
     session_store: SessionStore | None = None,
+    permission_policy: PermissionPolicy | None = None,
+    permission_http_client: Any | None = None,
+    audit_sink: AuditSink | None = None,
 ) -> TravelAgent:
     gateway = ToolGateway()
     resolved_settings = settings or IntegrationSettings.from_env()
+    if audit_sink is None:
+        audit_sink = build_audit_sink(resolved_settings, http_client=http_client)
+    gateway.audit_sink = audit_sink
     integrations = TravelSystemIntegrations(settings=resolved_settings, http_client=http_client)
     gateway.register(
         name="check_policy",
@@ -1348,6 +1388,46 @@ def build_default_agent(
         required=("session_id", "user_id", "event_type", "title", "start_at", "end_at", "payload"),
         handler=integrations.sync_calendar_event,
     )
-    if session_store is None and resolved_settings.session_db_path:
-        session_store = SQLiteSessionStore(resolved_settings.session_db_path)
-    return TravelAgent(gateway=gateway, session_store=session_store)
+    if session_store is None:
+        session_store = build_session_store(resolved_settings, store_http_client=store_http_client)
+    return TravelAgent(
+        gateway=gateway,
+        session_store=session_store,
+        permission_policy=permission_policy,
+        permission_http_client=permission_http_client or http_client,
+        audit_sink=audit_sink,
+    )
+
+
+def build_session_store(
+    settings: IntegrationSettings,
+    store_http_client: StoreHttpClient | None = None,
+) -> SessionStore | None:
+    backend = settings.session_store_backend.strip().lower()
+    if backend == "http":
+        if not settings.session_store_api_url:
+            raise ValueError("TRAVEL_SESSION_STORE_API_URL is required when session store backend is http.")
+        return HttpSessionStore(
+            base_url=settings.session_store_api_url,
+            token=settings.session_store_api_token,
+            http_client=store_http_client,
+            timeout_seconds=settings.timeout_seconds,
+        )
+    if backend == "sqlite":
+        if not settings.session_db_path:
+            raise ValueError("TRAVEL_SESSION_DB_PATH is required when session store backend is sqlite.")
+        return SQLiteSessionStore(settings.session_db_path)
+    if backend == "memory":
+        return InMemorySessionStore()
+    if backend != "auto":
+        raise ValueError(f"Unsupported session store backend: {settings.session_store_backend}")
+    if settings.session_store_api_url:
+        return HttpSessionStore(
+            base_url=settings.session_store_api_url,
+            token=settings.session_store_api_token,
+            http_client=store_http_client,
+            timeout_seconds=settings.timeout_seconds,
+        )
+    if settings.session_db_path:
+        return SQLiteSessionStore(settings.session_db_path)
+    return None

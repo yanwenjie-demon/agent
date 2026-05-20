@@ -17,6 +17,8 @@ class TravelRequest:
     budget_per_night: int | None = None
     require_approval: bool = True
     preferences: list[str] = field(default_factory=list)
+    department: str | None = None
+    roles: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if self.end_date <= self.start_date:
