@@ -904,6 +904,62 @@ def close_operations_action_item(
     )
 
 
+def sync_operations_action_items_from_oncall(
+    items: list[OperationsActionItem],
+    statuses: list[OnCallTicketStatus],
+    updated_at: str | None = None,
+) -> OperationsActionStatusSyncReport:
+    updated_at = updated_at or datetime.now(timezone.utc).isoformat()
+    status_map = {status.ticket_id: status for status in statuses}
+    closed_items: list[OperationsActionItem] = []
+    skipped_items: list[str] = []
+    for item in items:
+        if item.status.upper() == "CLOSED":
+            skipped_items.append(f"{item.action_id}: already closed")
+            continue
+        status = _matching_oncall_status(item, status_map)
+        if status is None:
+            skipped_items.append(f"{item.action_id}: no matching ticket status")
+            continue
+        if status.status.upper() not in {"RESOLVED", "CLOSED", "DONE"}:
+            skipped_items.append(f"{item.action_id}: ticket {status.ticket_id} is {status.status}")
+            continue
+        closed_items.append(
+            close_operations_action_item(
+                item,
+                f"OnCall ticket {status.ticket_id} {status.status}: {status.detail}",
+                updated_at=updated_at,
+            )
+        )
+    return OperationsActionStatusSyncReport(
+        scanned_statuses=len(statuses),
+        matched_items=len(closed_items),
+        closed_items=closed_items,
+        skipped_items=skipped_items,
+    )
+
+
+def render_operations_action_status_sync_report(report: OperationsActionStatusSyncReport) -> str:
+    lines = [
+        "Operations action status sync:",
+        f"- scanned_statuses: {report.scanned_statuses}",
+        f"- matched_items: {report.matched_items}",
+        "- closed_items:",
+    ]
+    if not report.closed_items:
+        lines.append("  - none")
+    else:
+        for item in report.closed_items:
+            lines.append(f"  - {item.action_id}: {item.closure_note}")
+    lines.append("- skipped_items:")
+    if not report.skipped_items:
+        lines.append("  - none")
+    else:
+        for item in report.skipped_items:
+            lines.append(f"  - {item}")
+    return "\n".join(lines)
+
+
 def operations_action_item_to_dict(item: OperationsActionItem) -> dict[str, Any]:
     return {
         "action_id": item.action_id,
@@ -2673,6 +2729,19 @@ def _closed_loop_recommendations(
     if knowledge_entries and closure_rate >= 80.0 and not action_items_overdue:
         recommendations.append("Closed-loop health is stable; reuse knowledge entries in future planning.")
     return _dedupe(recommendations) or ["No immediate closed-loop follow-up required."]
+
+
+def _matching_oncall_status(
+    item: OperationsActionItem,
+    status_map: dict[str, OnCallTicketStatus],
+) -> OnCallTicketStatus | None:
+    candidates = [item.source_id, item.title, item.action_id, *item.evidence]
+    lowered_candidates = [candidate.lower() for candidate in candidates if candidate]
+    for status in status_map.values():
+        ticket_key = status.ticket_id.lower()
+        if any(ticket_key == candidate or ticket_key in candidate or candidate in ticket_key for candidate in lowered_candidates):
+            return status
+    return None
 
 
 def _trend_alert_reason(
