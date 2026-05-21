@@ -147,8 +147,11 @@ Order Tool 创建订单
 - 运营知识检索增强已支持按 query 检索知识条目，并返回命中、匹配词和推荐处置动作。
 - 行动项 SLA 与升级已支持按可配置阈值评估 open action item，并输出 owner route、严重级别和提醒文本。
 - 运营闭环报表已支持汇总趋势告警、行动项关闭率、SLA 发现、知识主题和后续建议。
+- 知识检索接入 Agent 规划已支持 `TravelAgent.plan()` 自动读取持久化运营知识，将命中知识和推荐动作写入 `TaskPlan`，并记录 `PlanningKnowledgeAgent` 执行摘要。
+- SLA 自动通知联动已支持通过现有通知工具发送行动项超时升级提醒，真实通知系统未配置时使用 mock fallback。
+- 闭环指标外部导出已支持运营闭环报表 summary、JSON、Prometheus 输出和 HTTP sink 推送。
 
-第一阶段历史范围曾暂不包含真实库存、真实 OA、订单创建、补偿和多 Agent。当前实现已推进到真实系统适配、酒店 + 交通组合下单、异常恢复、通知死信、多 Agent 协作深化、改签/退订深化、日历同步重试/死信、Prometheus 文本指标出口、HTTP `/metrics` 服务、OTLP/HTTP 导出、内置评测集、生产化存储准备、外部生产存储适配、联调验收报告、真实端到端探活、发布准入门禁、灰度发布决策、权限策略检查、脱敏审计事件、外部权限/审计适配、CI/CD 发布 gate、生产运行 runbook、SLO 告警聚合、事故演练自动化、告警平台接入、演练流水线化、生产运行看板、告警规则模板、真实值班闭环、看板数据落库、工单状态回写、告警规则配置化、看板趋势分析、多维运行视图、事故复盘自动化、趋势阈值告警自动化、复盘行动项闭环、运营知识库沉淀、运营知识检索增强、行动项 SLA 与升级和运营闭环报表；下一阶段主线转为知识检索接入 Agent 规划、SLA 自动通知联动和闭环指标外部导出。
+第一阶段历史范围曾暂不包含真实库存、真实 OA、订单创建、补偿和多 Agent。当前实现已推进到真实系统适配、酒店 + 交通组合下单、异常恢复、通知死信、多 Agent 协作深化、改签/退订深化、日历同步重试/死信、Prometheus 文本指标出口、HTTP `/metrics` 服务、OTLP/HTTP 导出、内置评测集、生产化存储准备、外部生产存储适配、联调验收报告、真实端到端探活、发布准入门禁、灰度发布决策、权限策略检查、脱敏审计事件、外部权限/审计适配、CI/CD 发布 gate、生产运行 runbook、SLO 告警聚合、事故演练自动化、告警平台接入、演练流水线化、生产运行看板、告警规则模板、真实值班闭环、看板数据落库、工单状态回写、告警规则配置化、看板趋势分析、多维运行视图、事故复盘自动化、趋势阈值告警自动化、复盘行动项闭环、运营知识库沉淀、运营知识检索增强、行动项 SLA 与升级、运营闭环报表、知识检索接入 Agent 规划、SLA 自动通知联动和闭环指标外部导出；下一阶段主线转为知识驱动异常恢复深化、SLA 回执与工单闭环和闭环指标定时化/看板接入。
 
 ## 4. 单 Agent 架构
 
@@ -550,7 +553,11 @@ python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --list-ope
 python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --list-operations-knowledge
 python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --search-operations-knowledge "critical alerts"
 python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --operations-action-sla
+python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --operations-action-sla --notify-action-sla --action-sla-channel im
 python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --operations-closed-loop-report
+python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --operations-closed-loop-report --operations-closed-loop-format json
+python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --operations-closed-loop-report --operations-closed-loop-format prometheus
+python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --operations-closed-loop-report --export-operations-closed-loop --closed-loop-endpoint "https://bi.example.com/travel/closed-loop"
 python -m travel_agent.cli --alert-rules
 python -m travel_agent.cli --alert-rules --alert-rules-format json
 python -m travel_agent.cli --open-oncall-ticket
@@ -558,7 +565,7 @@ python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --sync-onc
 python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --list-oncall-ticket-statuses
 ```
 
-`--operations-runbook` 会输出上线、灰度、回滚、死信处理、人工补偿、权限中心不可用和审计 sink 不可用的操作手册。`--operations-drill` 会汇总 release readiness、SLO 告警和演练结果；当真实系统或持久化存储未就绪时，使用 mock 信号模拟权限中心不可用、审计 sink 不可用、供应商订单失败和回滚开关触发。`--operations-alerts` 支持 summary、JSON 和 Prometheus 输出；`--export-operations-alerts` 可通过 `TRAVEL_ALERT_API_URL` / `TRAVEL_ALERT_API_TOKEN` 推送到企业告警平台；`--operations-drill-gate` 可用于 CI/CD 或预发巡检。`--operations-dashboard` 汇总运行看板，`--save-operations-dashboard` 会保存 dashboard snapshot，`--operations-dashboard-trend` 会基于持久化快照计算趋势、环比和异常波动，`--operations-trend-alerts` 会根据默认规则或 `TRAVEL_TREND_ALERT_RULES_JSON` 生成趋势阈值告警，并可落库和生成行动项。`--operations-multidim-view` 会按部门、用户、路线、城市、供应商和政策来源拆分运行数据，`--operations-postmortem` 会自动关联告警、快照、worker run、OnCall 状态、补偿/恢复记录和演练结果生成事故复盘，并可生成行动项和知识条目。`--list-operations-action-items`、`--close-operations-action-item`、`--list-operations-knowledge` 用于查询和维护闭环产物。`--search-operations-knowledge` 可检索历史知识条目并返回推荐处置动作，`--operations-action-sla` 可按 `TRAVEL_ACTION_SLA_POLICY_JSON` 或默认阈值评估行动项超时升级，`--operations-closed-loop-report` 可汇总趋势告警、行动项关闭率、知识主题和闭环建议。`--alert-rules` 输出告警路由/升级/静默模板并可由 `TRAVEL_ALERT_RULES_JSON` 覆盖，`--open-oncall-ticket` 可通过 `TRAVEL_ONCALL_API_URL` / `TRAVEL_ONCALL_API_TOKEN` 创建真实值班工单，`--sync-oncall-ticket` 可通过 `TRAVEL_ONCALL_STATUS_API_URL` 同步状态。
+`--operations-runbook` 会输出上线、灰度、回滚、死信处理、人工补偿、权限中心不可用和审计 sink 不可用的操作手册。`--operations-drill` 会汇总 release readiness、SLO 告警和演练结果；当真实系统或持久化存储未就绪时，使用 mock 信号模拟权限中心不可用、审计 sink 不可用、供应商订单失败和回滚开关触发。`--operations-alerts` 支持 summary、JSON 和 Prometheus 输出；`--export-operations-alerts` 可通过 `TRAVEL_ALERT_API_URL` / `TRAVEL_ALERT_API_TOKEN` 推送到企业告警平台；`--operations-drill-gate` 可用于 CI/CD 或预发巡检。`--operations-dashboard` 汇总运行看板，`--save-operations-dashboard` 会保存 dashboard snapshot，`--operations-dashboard-trend` 会基于持久化快照计算趋势、环比和异常波动，`--operations-trend-alerts` 会根据默认规则或 `TRAVEL_TREND_ALERT_RULES_JSON` 生成趋势阈值告警，并可落库和生成行动项。`--operations-multidim-view` 会按部门、用户、路线、城市、供应商和政策来源拆分运行数据，`--operations-postmortem` 会自动关联告警、快照、worker run、OnCall 状态、补偿/恢复记录和演练结果生成事故复盘，并可生成行动项和知识条目。`--list-operations-action-items`、`--close-operations-action-item`、`--list-operations-knowledge` 用于查询和维护闭环产物。`--search-operations-knowledge` 可检索历史知识条目并返回推荐处置动作；当存在持久化知识命中时，`TravelAgent.plan()` 会将知识引用和推荐动作写入 `TaskPlan`。`--operations-action-sla` 可按 `TRAVEL_ACTION_SLA_POLICY_JSON` 或默认阈值评估行动项超时升级，`--notify-action-sla` 会通过通知工具发送升级提醒。`--operations-closed-loop-report` 可汇总趋势告警、行动项关闭率、知识主题和闭环建议，并支持 summary/JSON/Prometheus 输出；`--export-operations-closed-loop` 可通过 `TRAVEL_CLOSED_LOOP_API_URL` / `TRAVEL_CLOSED_LOOP_API_TOKEN` 推送到外部 BI 或运营看板。`--alert-rules` 输出告警路由/升级/静默模板并可由 `TRAVEL_ALERT_RULES_JSON` 覆盖，`--open-oncall-ticket` 可通过 `TRAVEL_ONCALL_API_URL` / `TRAVEL_ONCALL_API_TOKEN` 创建真实值班工单，`--sync-oncall-ticket` 可通过 `TRAVEL_ONCALL_STATUS_API_URL` 同步状态。
 
 灰度发布决策：
 
@@ -622,6 +629,6 @@ python -m unittest discover -s tests
 
 下一阶段主线：
 
-- 知识检索接入 Agent 规划：让历史复盘和处置知识参与行程规划、异常恢复和告警解释。
-- SLA 自动通知联动：将行动项超时升级推送到通知、OnCall 或企业工单系统。
-- 闭环指标外部导出：将闭环报表输出为 Prometheus/JSON/HTTP sink，接入 BI 或运营大盘。
+- 知识驱动异常恢复深化：将历史复盘和处置知识进一步接入价格变化、库存失效、审批驳回和订单失败的恢复策略选择。
+- SLA 回执与工单闭环：同步通知、OnCall 和企业工单状态，形成提醒、认领、处理、关闭的可追踪链路。
+- 闭环指标定时化和看板接入：沉淀 BI schema、定时导出任务和运营看板消费契约。

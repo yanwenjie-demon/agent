@@ -32,6 +32,7 @@ from .operations import (
     evaluate_operations_action_sla,
     evaluate_operations_drill_gate,
     evaluate_operations_trend_alerts,
+    export_operations_closed_loop_report_http,
     export_operations_alerts_http,
     fetch_oncall_ticket_status_http,
     open_oncall_ticket_http,
@@ -54,8 +55,12 @@ from .operations import (
     render_alert_route_rules,
     render_alert_route_rules_json,
     render_operations_action_items,
+    render_operations_action_sla_notifications,
     render_operations_action_sla_report,
+    render_operations_closed_loop_export_result,
     render_operations_closed_loop_report,
+    render_operations_closed_loop_report_json,
+    render_operations_closed_loop_report_prometheus,
     render_operations_dashboard_snapshots,
     render_operations_dashboard_trend_report,
     render_operations_knowledge_entries,
@@ -580,6 +585,16 @@ def parse_args() -> argparse.Namespace:
         help="Evaluate SLA and escalation reminders for open operations action items.",
     )
     parser.add_argument(
+        "--notify-action-sla",
+        action="store_true",
+        help="Send SLA escalation reminders through the configured notification integration.",
+    )
+    parser.add_argument(
+        "--action-sla-channel",
+        default="im",
+        help="Notification channel for --notify-action-sla.",
+    )
+    parser.add_argument(
         "--action-sla-now",
         default=None,
         help="Optional ISO timestamp used as the current time for --operations-action-sla.",
@@ -588,6 +603,22 @@ def parse_args() -> argparse.Namespace:
         "--operations-closed-loop-report",
         action="store_true",
         help="Summarize trend alerts, action item closure, SLA findings, and knowledge entries.",
+    )
+    parser.add_argument(
+        "--operations-closed-loop-format",
+        choices=("summary", "json", "prometheus"),
+        default="summary",
+        help="Output format for --operations-closed-loop-report.",
+    )
+    parser.add_argument(
+        "--export-operations-closed-loop",
+        action="store_true",
+        help="Export the closed-loop report to an HTTP JSON sink.",
+    )
+    parser.add_argument(
+        "--closed-loop-endpoint",
+        default=None,
+        help="Closed-loop report sink endpoint. Defaults to TRAVEL_CLOSED_LOOP_API_URL.",
     )
     parser.add_argument(
         "--alert-rules",
@@ -831,7 +862,7 @@ def main() -> None:
         report = search_operations_knowledge(entries, args.search_operations_knowledge, limit=args.observability_limit)
         print(render_operations_knowledge_search_report(report))
         return
-    if args.operations_action_sla:
+    if args.operations_action_sla or args.notify_action_sla:
         _require_persistent_session_store(settings, "--operations-action-sla")
         items = [
             operations_action_item_from_dict(item)
@@ -843,8 +874,11 @@ def main() -> None:
             now=args.action_sla_now,
         )
         print(render_operations_action_sla_report(report))
+        if args.notify_action_sla:
+            notification_report = agent.notify_operations_action_sla(report, channel=args.action_sla_channel)
+            print(render_operations_action_sla_notifications(notification_report))
         return
-    if args.operations_closed_loop_report:
+    if args.operations_closed_loop_report or args.export_operations_closed_loop:
         _require_persistent_session_store(settings, "--operations-closed-loop-report")
         trend_alerts = [
             operations_trend_alert_from_dict(item)
@@ -869,7 +903,24 @@ def main() -> None:
             knowledge_entries=knowledge_entries,
             sla_report=sla_report,
         )
-        print(render_operations_closed_loop_report(report))
+        if args.operations_closed_loop_format == "json":
+            print(render_operations_closed_loop_report_json(report))
+        elif args.operations_closed_loop_format == "prometheus":
+            print(render_operations_closed_loop_report_prometheus(report))
+        else:
+            print(render_operations_closed_loop_report(report))
+        if args.export_operations_closed_loop:
+            endpoint = args.closed_loop_endpoint or settings.closed_loop_api_url
+            if not endpoint:
+                raise SystemExit(
+                    "--export-operations-closed-loop requires --closed-loop-endpoint or TRAVEL_CLOSED_LOOP_API_URL."
+                )
+            result = export_operations_closed_loop_report_http(
+                report,
+                endpoint=endpoint,
+                token=settings.closed_loop_api_token,
+            )
+            print(render_operations_closed_loop_export_result(result))
         return
     if args.list_oncall_ticket_statuses:
         _require_persistent_session_store(settings, "--list-oncall-ticket-statuses")
@@ -1548,6 +1599,7 @@ def _replace_session_db(settings: IntegrationSettings, session_db_path: str) -> 
         alert_api_url=settings.alert_api_url,
         oncall_api_url=settings.oncall_api_url,
         oncall_status_api_url=settings.oncall_status_api_url,
+        closed_loop_api_url=settings.closed_loop_api_url,
         alert_rules_json=settings.alert_rules_json,
         trend_alert_rules_json=settings.trend_alert_rules_json,
         action_sla_policy_json=settings.action_sla_policy_json,
@@ -1563,6 +1615,7 @@ def _replace_session_db(settings: IntegrationSettings, session_db_path: str) -> 
         audit_log_api_token=settings.audit_log_api_token,
         alert_api_token=settings.alert_api_token,
         oncall_api_token=settings.oncall_api_token,
+        closed_loop_api_token=settings.closed_loop_api_token,
         otlp_api_token=settings.otlp_api_token,
         use_mock_fallback=settings.use_mock_fallback,
         notification_use_mock_fallback=settings.notification_use_mock_fallback,
@@ -1623,6 +1676,12 @@ def render_context(context: TravelContext) -> str:
         for task in context.task_plan.tasks:
             deps = f" depends_on={','.join(task.depends_on)}" if task.depends_on else ""
             lines.append(f"- {task.task_id}: {task.description}{deps}")
+        if context.task_plan.knowledge_refs or context.task_plan.guidance:
+            lines.extend(["", "规划知识:"])
+            if context.task_plan.knowledge_refs:
+                lines.append(f"- 命中知识: {', '.join(context.task_plan.knowledge_refs)}")
+            for action in context.task_plan.guidance:
+                lines.append(f"- 建议: {action}")
 
     if context.policy_result:
         lines.extend(

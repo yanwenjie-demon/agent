@@ -41,6 +41,7 @@
 - 运营洞察分析：支持基于 dashboard 快照的趋势/环比分析、多维运行视图，以及自动事故复盘报告
 - 运营闭环沉淀：支持趋势阈值告警、复盘/趋势行动项持久化、行动项关闭和运营知识库条目沉淀
 - 运营闭环增强：支持运营知识检索、行动项 SLA/升级评估和运营闭环报表
+- 运营闭环外联：支持将运营知识检索接入 Agent 规划、行动项 SLA 自动通知，以及闭环报表 summary/JSON/Prometheus/HTTP sink 导出
 - 内存会话状态和确定性工作流状态机
 
 架构说明见 [docs/travel-agent-architecture.md](docs/travel-agent-architecture.md)。
@@ -532,11 +533,16 @@ python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --list-ope
 python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --list-operations-knowledge
 python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --search-operations-knowledge "critical alerts"
 python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --operations-action-sla
+python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --operations-action-sla --notify-action-sla --action-sla-channel im
 python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --operations-closed-loop-report
+python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --operations-closed-loop-report --operations-closed-loop-format json
+python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --operations-closed-loop-report --operations-closed-loop-format prometheus
+python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --operations-closed-loop-report --export-operations-closed-loop --closed-loop-endpoint "https://bi.example.com/travel/closed-loop"
 ```
 
 `TRAVEL_TREND_ALERT_RULES_JSON` 可覆盖默认趋势阈值规则，格式为 `{"rules":[{"metric":"critical_alerts","severity":"critical","route":"ops","owner":"ops","delta_threshold":1}]}`。
 `TRAVEL_ACTION_SLA_POLICY_JSON` 可覆盖行动项 SLA 阈值和 owner 路由，格式为 `{"warning_after_hours":12,"critical_after_hours":24,"owner_routes":{"platform-oncall":"incident-oncall"}}`。
+`TRAVEL_CLOSED_LOOP_API_URL` / `TRAVEL_CLOSED_LOOP_API_TOKEN` 可配置闭环报表 HTTP sink。持久化知识库存在命中时，`TravelAgent.plan()` 会自动将知识条目和推荐动作写入任务计划，CLI 输出中会展示“规划知识”。
 
 输出告警路由、升级和静默规则模板：
 
@@ -581,6 +587,6 @@ python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --storage-
 
 ## 下一阶段建议
 
-- 知识检索接入 Agent 规划：让历史复盘和处置知识参与行程规划、异常恢复和告警解释。
-- SLA 自动通知联动：将行动项超时升级推送到通知、OnCall 或企业工单系统。
-- 闭环指标外部导出：将闭环报表输出为 Prometheus/JSON/HTTP sink，接入 BI 或运营大盘。
+- 知识驱动异常恢复深化：将历史复盘和处置知识进一步接入价格变化、库存失效、审批驳回和订单失败的恢复策略选择。
+- SLA 回执与工单闭环：同步通知、OnCall 和企业工单状态，形成提醒、认领、处理、关闭的可追踪链路。
+- 闭环指标定时化和看板接入：沉淀 BI schema、定时导出任务和运营看板消费契约。

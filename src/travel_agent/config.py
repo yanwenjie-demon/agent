@@ -39,6 +39,7 @@ class IntegrationSettings:
     alert_api_url: str | None = None
     oncall_api_url: str | None = None
     oncall_status_api_url: str | None = None
+    closed_loop_api_url: str | None = None
     alert_rules_json: str | None = None
     trend_alert_rules_json: str | None = None
     action_sla_policy_json: str | None = None
@@ -54,6 +55,7 @@ class IntegrationSettings:
     audit_log_api_token: str | None = None
     alert_api_token: str | None = None
     oncall_api_token: str | None = None
+    closed_loop_api_token: str | None = None
     otlp_api_token: str | None = None
     use_mock_fallback: bool = True
     notification_use_mock_fallback: bool = True
@@ -96,6 +98,7 @@ class IntegrationSettings:
             alert_api_url=_optional_env("TRAVEL_ALERT_API_URL"),
             oncall_api_url=_optional_env("TRAVEL_ONCALL_API_URL"),
             oncall_status_api_url=_optional_env("TRAVEL_ONCALL_STATUS_API_URL"),
+            closed_loop_api_url=_optional_env("TRAVEL_CLOSED_LOOP_API_URL"),
             alert_rules_json=_optional_env("TRAVEL_ALERT_RULES_JSON"),
             trend_alert_rules_json=_optional_env("TRAVEL_TREND_ALERT_RULES_JSON"),
             action_sla_policy_json=_optional_env("TRAVEL_ACTION_SLA_POLICY_JSON"),
@@ -111,6 +114,7 @@ class IntegrationSettings:
             audit_log_api_token=_optional_env("TRAVEL_AUDIT_LOG_API_TOKEN"),
             alert_api_token=_optional_env("TRAVEL_ALERT_API_TOKEN"),
             oncall_api_token=_optional_env("TRAVEL_ONCALL_API_TOKEN"),
+            closed_loop_api_token=_optional_env("TRAVEL_CLOSED_LOOP_API_TOKEN"),
             otlp_api_token=_optional_env("TRAVEL_OTLP_API_TOKEN"),
             use_mock_fallback=_bool_env("TRAVEL_USE_MOCK_FALLBACK", True),
             notification_use_mock_fallback=_bool_env("TRAVEL_NOTIFICATION_USE_MOCK_FALLBACK", True),

@@ -61,6 +61,7 @@ from travel_agent.operations import (
     build_operations_runbook,
     evaluate_operations_drill_gate,
     evaluate_operations_trend_alerts,
+    export_operations_closed_loop_report_http,
     export_operations_alerts_http,
     fetch_oncall_ticket_status_http,
     open_oncall_ticket_http,
@@ -68,6 +69,7 @@ from travel_agent.operations import (
     oncall_ticket_status_to_dict,
     operations_action_item_from_dict,
     operations_action_item_to_dict,
+    operations_closed_loop_report_to_dict,
     operations_dashboard_snapshot_from_dict,
     operations_dashboard_snapshot_to_dict,
     operations_knowledge_entry_from_dict,
@@ -77,8 +79,12 @@ from travel_agent.operations import (
     render_alert_route_rules,
     render_alert_route_rules_json,
     render_operations_action_items,
+    render_operations_action_sla_notifications,
     render_operations_action_sla_report,
+    render_operations_closed_loop_export_result,
     render_operations_closed_loop_report,
+    render_operations_closed_loop_report_json,
+    render_operations_closed_loop_report_prometheus,
     render_oncall_ticket_status,
     render_oncall_ticket_result,
     render_operations_alert_export_result,
@@ -126,6 +132,32 @@ class TravelAgentFlowTest(unittest.TestCase):
         self.assertGreater(len(context.hotel_options), 0)
         self.assertGreater(len(context.transport_options), 0)
         self.assertIsNone(context.approval)
+
+    def test_plan_uses_persisted_operations_knowledge(self) -> None:
+        store = InMemorySessionStore()
+        store.record_operations_knowledge_entry(
+            {
+                "entry_id": "KB-PLAN",
+                "topic": "hotel_inventory",
+                "title": "Hotel inventory fallback",
+                "summary": "Use fallback checks when Shanghai hotel inventory is unstable.",
+                "signals": ["hotel", "inventory", "Shanghai"],
+                "recommended_actions": ["Check hotel inventory fallback before approval."],
+                "source_refs": ["INC-PLAN"],
+                "created_at": "2026-05-20T00:00:00+00:00",
+                "updated_at": "2026-05-20T00:00:00+00:00",
+            }
+        )
+        agent = build_default_agent(session_store=store)
+
+        context = agent.plan(_request())
+        task_ids = [task.task_id for task in context.task_plan.tasks]
+
+        self.assertIn("KB-PLAN", context.task_plan.knowledge_refs)
+        self.assertIn("Check hotel inventory fallback before approval.", context.task_plan.guidance)
+        self.assertIn("apply_operations_knowledge", task_ids)
+        self.assertTrue(any(record.agent_name == "PlanningKnowledgeAgent" for record in context.agent_executions))
+        self.assertIn("规划知识", render_context(context))
 
     def test_run_to_approval_creates_draft(self) -> None:
         agent = build_default_agent()
@@ -2568,8 +2600,25 @@ class OperationsReadinessTest(unittest.TestCase):
         self.assertTrue(search.hits)
         self.assertEqual(closed_loop.closure_rate, 100.0)
         self.assertEqual(closed_loop.action_items_closed, 1)
+        self.assertEqual(operations_closed_loop_report_to_dict(closed_loop)["closure_rate"], 100.0)
         self.assertIn("Operations knowledge search:", render_operations_knowledge_search_report(search))
         self.assertIn("Operations closed-loop report:", render_operations_closed_loop_report(closed_loop))
+        self.assertIn('"closure_rate": 100.0', render_operations_closed_loop_report_json(closed_loop))
+        self.assertIn(
+            "travel_operations_closed_loop_action_items",
+            render_operations_closed_loop_report_prometheus(closed_loop),
+        )
+        http = CapturingAnyHttpClient({"https://closed-loop.example/sink": {"ok": True, "accepted": 1}})
+        export = export_operations_closed_loop_report_http(
+            closed_loop,
+            "https://closed-loop.example/sink",
+            token="closed-loop-token",
+            http_client=http,
+        )
+
+        self.assertTrue(export.ok)
+        self.assertEqual(http.calls[0][2], "closed-loop-token")
+        self.assertIn("Operations closed-loop export:", render_operations_closed_loop_export_result(export))
 
     def test_action_sla_escalates_overdue_open_items(self) -> None:
         item = operations_action_item_from_dict(
@@ -2597,11 +2646,15 @@ class OperationsReadinessTest(unittest.TestCase):
             now="2026-05-20T00:00:00+00:00",
         )
         rendered = render_operations_action_sla_report(report)
+        notification_report = build_default_agent().notify_operations_action_sla(report)
 
         self.assertEqual(len(report.findings), 1)
         self.assertEqual(report.findings[0].severity, "critical")
         self.assertEqual(report.findings[0].route, "compliance-route")
+        self.assertEqual(notification_report.notification_count, 1)
+        self.assertEqual(notification_report.notifications[0].recipient_id, "compliance-platform-oncall")
         self.assertIn("Operations action SLA:", rendered)
+        self.assertIn("Operations action SLA notifications:", render_operations_action_sla_notifications(notification_report))
 
 
 class PermissionPolicyTest(unittest.TestCase):

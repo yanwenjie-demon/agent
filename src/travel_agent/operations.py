@@ -11,7 +11,13 @@ from uuid import uuid4
 from .config import IntegrationSettings
 from .data_governance import AuditSinkResult
 from .governance import ReleaseReadinessReport, run_release_readiness_report
-from .models import DeadLetterCalendarSync, DeadLetterNotification, TravelContext, WorkerRunRecord
+from .models import (
+    DeadLetterCalendarSync,
+    DeadLetterNotification,
+    NotificationRecord,
+    TravelContext,
+    WorkerRunRecord,
+)
 from .observability import build_sla_alerts
 from .permissions import PermissionDecision, PermissionPolicy, evaluate_permission
 from .release_control import RolloutDecision, RolloutPolicy, evaluate_rollout
@@ -53,6 +59,15 @@ class OperationsDrillReport:
 
 @dataclass(frozen=True)
 class OperationsAlertExportResult:
+    ok: bool
+    endpoint: str
+    delivered: int
+    failed: int
+    detail: str
+
+
+@dataclass(frozen=True)
+class OperationsClosedLoopExportResult:
     ok: bool
     endpoint: str
     delivered: int
@@ -296,6 +311,13 @@ class OperationsActionSlaReport:
 
 
 @dataclass(frozen=True)
+class OperationsActionSlaNotificationReport:
+    notification_count: int
+    failed_count: int
+    notifications: list[NotificationRecord]
+
+
+@dataclass(frozen=True)
 class OperationsClosedLoopReport:
     generated_at: str
     trend_alerts: int
@@ -308,6 +330,21 @@ class OperationsClosedLoopReport:
     knowledge_topics: dict[str, int]
     source_counts: dict[str, int]
     recommendations: list[str]
+
+
+@dataclass(frozen=True)
+class OperationsClosedLoopSnapshot:
+    snapshot_id: str
+    created_at: str
+    report: OperationsClosedLoopReport
+
+
+@dataclass(frozen=True)
+class OperationsActionStatusSyncReport:
+    scanned_statuses: int
+    matched_items: int
+    closed_items: list[OperationsActionItem]
+    skipped_items: list[str]
 
 
 def build_operations_runbook() -> OperationsRunbook:
@@ -1141,6 +1178,26 @@ def render_operations_action_sla_report(report: OperationsActionSlaReport) -> st
     return "\n".join(lines)
 
 
+def render_operations_action_sla_notifications(report: OperationsActionSlaNotificationReport) -> str:
+    lines = [
+        "Operations action SLA notifications:",
+        f"- notification_count: {report.notification_count}",
+        f"- failed_count: {report.failed_count}",
+        "- notifications:",
+    ]
+    if not report.notifications:
+        lines.append("  - none")
+        return "\n".join(lines)
+    for notification in report.notifications:
+        lines.append(
+            f"  - {notification.event_type}: {notification.status} "
+            f"recipient={notification.recipient_id} source={notification.source}"
+        )
+        if notification.last_error:
+            lines.append(f"    error: {notification.last_error}")
+    return "\n".join(lines)
+
+
 def build_operations_closed_loop_report(
     trend_alerts: list[OperationsTrendAlert] | None = None,
     action_items: list[OperationsActionItem] | None = None,
@@ -1197,6 +1254,116 @@ def render_operations_closed_loop_report(report: OperationsClosedLoopReport) -> 
     _append_count_section(lines, "action_sources", report.source_counts)
     _append_list_section(lines, "recommendations", report.recommendations)
     return "\n".join(lines)
+
+
+def operations_closed_loop_report_to_dict(report: OperationsClosedLoopReport) -> dict[str, Any]:
+    return {
+        "generated_at": report.generated_at,
+        "trend_alerts": report.trend_alerts,
+        "action_items_total": report.action_items_total,
+        "action_items_open": report.action_items_open,
+        "action_items_closed": report.action_items_closed,
+        "action_items_overdue": report.action_items_overdue,
+        "closure_rate": report.closure_rate,
+        "knowledge_entries": report.knowledge_entries,
+        "knowledge_topics": report.knowledge_topics,
+        "source_counts": report.source_counts,
+        "recommendations": report.recommendations,
+    }
+
+
+def render_operations_closed_loop_report_json(report: OperationsClosedLoopReport) -> str:
+    return json.dumps({"closed_loop": operations_closed_loop_report_to_dict(report)}, ensure_ascii=False)
+
+
+def render_operations_closed_loop_report_prometheus(report: OperationsClosedLoopReport) -> str:
+    lines = [
+        "# HELP travel_operations_closed_loop_action_items Operations closed-loop action item counts.",
+        "# TYPE travel_operations_closed_loop_action_items gauge",
+        f'travel_operations_closed_loop_action_items{{status="total"}} {report.action_items_total}',
+        f'travel_operations_closed_loop_action_items{{status="open"}} {report.action_items_open}',
+        f'travel_operations_closed_loop_action_items{{status="closed"}} {report.action_items_closed}',
+        f'travel_operations_closed_loop_action_items{{status="overdue"}} {report.action_items_overdue}',
+        "# HELP travel_operations_closed_loop_trend_alerts Trend alerts included in the closed-loop report.",
+        "# TYPE travel_operations_closed_loop_trend_alerts gauge",
+        f"travel_operations_closed_loop_trend_alerts {report.trend_alerts}",
+        "# HELP travel_operations_closed_loop_closure_rate_percent Closed action item percentage.",
+        "# TYPE travel_operations_closed_loop_closure_rate_percent gauge",
+        f"travel_operations_closed_loop_closure_rate_percent {report.closure_rate:.1f}",
+        "# HELP travel_operations_closed_loop_knowledge_entries Knowledge entries included in the closed-loop report.",
+        "# TYPE travel_operations_closed_loop_knowledge_entries gauge",
+        f"travel_operations_closed_loop_knowledge_entries {report.knowledge_entries}",
+        "# HELP travel_operations_closed_loop_knowledge_topics Knowledge entries by topic.",
+        "# TYPE travel_operations_closed_loop_knowledge_topics gauge",
+    ]
+    if report.knowledge_topics:
+        for topic, count in _sorted_count_items(report.knowledge_topics):
+            lines.append(
+                f'travel_operations_closed_loop_knowledge_topics{{topic="{_metric_label(topic)}"}} {count}'
+            )
+    else:
+        lines.append('travel_operations_closed_loop_knowledge_topics{topic="none"} 0')
+    lines.extend(
+        [
+            "# HELP travel_operations_closed_loop_action_sources Action items by source type.",
+            "# TYPE travel_operations_closed_loop_action_sources gauge",
+        ]
+    )
+    if report.source_counts:
+        for source, count in _sorted_count_items(report.source_counts):
+            lines.append(
+                f'travel_operations_closed_loop_action_sources{{source_type="{_metric_label(source)}"}} {count}'
+            )
+    else:
+        lines.append('travel_operations_closed_loop_action_sources{source_type="none"} 0')
+    return "\n".join(lines)
+
+
+def export_operations_closed_loop_report_http(
+    report: OperationsClosedLoopReport,
+    endpoint: str,
+    token: str | None = None,
+    http_client: Any | None = None,
+) -> OperationsClosedLoopExportResult:
+    from .integrations import JsonHttpClient
+
+    payload = {
+        "source": "travel-agent",
+        "closed_loop": operations_closed_loop_report_to_dict(report),
+    }
+    try:
+        client = http_client or JsonHttpClient()
+        response = client.post_json(endpoint, payload, token)
+    except Exception as exc:
+        return OperationsClosedLoopExportResult(
+            ok=False,
+            endpoint=endpoint,
+            delivered=0,
+            failed=1,
+            detail=str(exc),
+        )
+    delivered = int(response.get("accepted") or response.get("delivered") or 1)
+    failed = 0 if delivered > 0 else 1
+    return OperationsClosedLoopExportResult(
+        ok=bool(response.get("ok", failed == 0)),
+        endpoint=endpoint,
+        delivered=delivered,
+        failed=failed,
+        detail=str(response.get("detail") or "sent to closed-loop sink"),
+    )
+
+
+def render_operations_closed_loop_export_result(result: OperationsClosedLoopExportResult) -> str:
+    return "\n".join(
+        [
+            "Operations closed-loop export:",
+            f"- ok: {result.ok}",
+            f"- endpoint: {result.endpoint}",
+            f"- delivered: {result.delivered}",
+            f"- failed: {result.failed}",
+            f"- detail: {result.detail}",
+        ]
+    )
 
 
 def build_operations_multidimensional_view(
@@ -2596,6 +2763,7 @@ def _profile_name(settings: IntegrationSettings) -> str:
             settings.audit_log_api_url,
             settings.alert_api_url,
             settings.oncall_api_url,
+            settings.closed_loop_api_url,
             settings.session_store_api_url,
             settings.session_db_path,
         ]

@@ -1064,6 +1064,8 @@ def _task_plan(payload: dict[str, Any] | None) -> TaskPlan | None:
     return TaskPlan(
         goal=payload["goal"],
         tasks=[Task(**task) for task in payload.get("tasks", [])],
+        knowledge_refs=[str(item) for item in payload.get("knowledge_refs", [])],
+        guidance=[str(item) for item in payload.get("guidance", [])],
     )
 
 

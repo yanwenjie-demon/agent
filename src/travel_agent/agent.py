@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, replace
 from datetime import date, datetime, timezone
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from .config import IntegrationSettings
@@ -11,6 +11,7 @@ from .domain_agents import AgentTeam, build_agent_team
 from .integrations import HttpJsonClient, TravelSystemIntegrations
 from .mock_tools import plan_itinerary
 from .models import (
+    AgentExecutionRecord,
     CalendarSyncRecord,
     ChangeRecord,
     HotelOption,
@@ -28,85 +29,120 @@ from .state import TravelState, WorkflowStateMachine
 from .storage import HttpSessionStore, InMemorySessionStore, SQLiteSessionStore, SessionStore, StoreHttpClient
 from .tools import ToolGateway
 
+if TYPE_CHECKING:
+    from .operations import (
+        OperationsActionSlaNotificationReport,
+        OperationsActionSlaReport,
+        OperationsKnowledgeSearchReport,
+    )
+
 
 class SimpleTaskPlanner:
     """Deterministic planner for the policy, hotel, and OA approval workflow."""
 
-    def build_plan(self, request: TravelRequest) -> TaskPlan:
+    def build_plan(
+        self,
+        request: TravelRequest,
+        knowledge_refs: list[str] | None = None,
+        guidance: list[str] | None = None,
+    ) -> TaskPlan:
+        knowledge_refs = knowledge_refs or []
+        guidance = guidance or []
         tasks = [
             Task(
                 task_id="check_policy",
                 task_type="tool",
                 description=f"Check enterprise travel policy for {request.destination_city}.",
             ),
-            Task(
-                task_id="plan_itinerary",
-                task_type="tool",
-                description="Create a basic business trip itinerary.",
-                depends_on=["check_policy"],
-            ),
-            Task(
-                task_id="check_transport_policy",
-                task_type="tool",
-                description="Check enterprise transport policy for the trip route.",
-                depends_on=["check_policy"],
-            ),
-            Task(
-                task_id="search_hotels",
-                task_type="tool",
-                description="Search live hotel inventory or mock fallback near the venue.",
-                depends_on=["check_policy", "plan_itinerary"],
-            ),
-            Task(
-                task_id="search_transport",
-                task_type="tool",
-                description="Search flight or train inventory for the outbound trip.",
-                depends_on=["check_transport_policy", "plan_itinerary"],
-            ),
-            Task(
-                task_id="create_approval",
-                task_type="tool",
-                description="Create an OA approval record after user confirmation.",
-                depends_on=["search_hotels", "search_transport", "user_confirmation"],
-            ),
-            Task(
-                task_id="get_approval_status",
-                task_type="tool",
-                description="Track OA approval status before booking.",
-                depends_on=["create_approval"],
-            ),
-            Task(
-                task_id="lock_hotel_inventory",
-                task_type="tool",
-                description="Lock selected hotel inventory after approval.",
-                depends_on=["get_approval_status"],
-            ),
-            Task(
-                task_id="create_transport_order",
-                task_type="tool",
-                description="Create a transport order after approval.",
-                depends_on=["get_approval_status"],
-            ),
-            Task(
-                task_id="verify_hotel_price",
-                task_type="tool",
-                description="Verify current hotel price before order creation.",
-                depends_on=["lock_hotel_inventory"],
-            ),
-            Task(
-                task_id="create_order",
-                task_type="tool",
-                description="Create a hotel order with the approval and inventory lock.",
-                depends_on=["verify_hotel_price"],
-            ),
-            Task(
-                task_id="get_order_status",
-                task_type="tool",
-                description="Refresh order status after order creation.",
-                depends_on=["create_order"],
-            ),
         ]
-        return TaskPlan(goal="Create a compliant travel plan, OA approval, transport order, and hotel order.", tasks=tasks)
+        if guidance:
+            tasks.append(
+                Task(
+                    task_id="apply_operations_knowledge",
+                    task_type="agent",
+                    description="Apply historical operations knowledge to planning risk checks and fallback hints.",
+                    depends_on=["check_policy"],
+                )
+            )
+            planning_dependencies = ["apply_operations_knowledge"]
+        else:
+            planning_dependencies = ["check_policy"]
+        tasks.extend(
+            [
+                Task(
+                    task_id="plan_itinerary",
+                    task_type="tool",
+                    description="Create a basic business trip itinerary.",
+                    depends_on=planning_dependencies,
+                ),
+                Task(
+                    task_id="check_transport_policy",
+                    task_type="tool",
+                    description="Check enterprise transport policy for the trip route.",
+                    depends_on=["check_policy"],
+                ),
+                Task(
+                    task_id="search_hotels",
+                    task_type="tool",
+                    description="Search live hotel inventory or mock fallback near the venue.",
+                    depends_on=["check_policy", "plan_itinerary"],
+                ),
+                Task(
+                    task_id="search_transport",
+                    task_type="tool",
+                    description="Search flight or train inventory for the outbound trip.",
+                    depends_on=["check_transport_policy", "plan_itinerary"],
+                ),
+                Task(
+                    task_id="create_approval",
+                    task_type="tool",
+                    description="Create an OA approval record after user confirmation.",
+                    depends_on=["search_hotels", "search_transport", "user_confirmation"],
+                ),
+                Task(
+                    task_id="get_approval_status",
+                    task_type="tool",
+                    description="Track OA approval status before booking.",
+                    depends_on=["create_approval"],
+                ),
+                Task(
+                    task_id="lock_hotel_inventory",
+                    task_type="tool",
+                    description="Lock selected hotel inventory after approval.",
+                    depends_on=["get_approval_status"],
+                ),
+                Task(
+                    task_id="create_transport_order",
+                    task_type="tool",
+                    description="Create a transport order after approval.",
+                    depends_on=["get_approval_status"],
+                ),
+                Task(
+                    task_id="verify_hotel_price",
+                    task_type="tool",
+                    description="Verify current hotel price before order creation.",
+                    depends_on=["lock_hotel_inventory"],
+                ),
+                Task(
+                    task_id="create_order",
+                    task_type="tool",
+                    description="Create a hotel order with the approval and inventory lock.",
+                    depends_on=["verify_hotel_price"],
+                ),
+                Task(
+                    task_id="get_order_status",
+                    task_type="tool",
+                    description="Refresh order status after order creation.",
+                    depends_on=["create_order"],
+                ),
+            ]
+        )
+        return TaskPlan(
+            goal="Create a compliant travel plan, OA approval, transport order, and hotel order.",
+            tasks=tasks,
+            knowledge_refs=knowledge_refs,
+            guidance=guidance,
+        )
 
 
 class TravelAgent:
@@ -141,6 +177,7 @@ class TravelAgent:
             task_plan=self.planner.build_plan(request),
         )
         context.append_event("Created travel planning session.")
+        self._attach_planning_knowledge(context)
 
         context = self.agent_team.policy.check(context)
         policy = context.policy_result
@@ -186,6 +223,72 @@ class TravelAgent:
         context.append_event(f"Notification {event_type} -> {record.status}.")
         self.session_store.save(context)
         return context
+
+    def notify_operations_action_sla(
+        self,
+        report: OperationsActionSlaReport,
+        channel: str = "im",
+    ) -> OperationsActionSlaNotificationReport:
+        from .operations import OperationsActionSlaNotificationReport
+
+        notifications: list[NotificationRecord] = []
+        for finding in report.findings:
+            event_type = f"OPERATIONS_ACTION_SLA_{finding.action_id}"
+            title = f"Operations action SLA {finding.severity}: {finding.action_id}"
+            message = f"{finding.escalation}. {finding.reason}"
+            payload = {
+                "action_id": finding.action_id,
+                "severity": finding.severity,
+                "owner": finding.owner,
+                "route": finding.route,
+                "age_hours": finding.age_hours,
+                "overdue_hours": finding.overdue_hours,
+                "reason": finding.reason,
+                "reminder": finding.reminder,
+                "sla_now": report.now,
+            }
+            try:
+                record = self.gateway.call(
+                    "send_notification",
+                    session_id="operations-action-sla",
+                    user_id=finding.owner,
+                    event_type=event_type,
+                    title=title,
+                    message=message,
+                    channel=channel,
+                    payload=payload,
+                    workflow_generation=1,
+                )
+            except Exception as exc:
+                notification_id = "NTF-" + uuid5(
+                    NAMESPACE_URL,
+                    f"operations-action-sla:{finding.action_id}:{finding.owner}",
+                ).hex[:10].upper()
+                record = NotificationRecord(
+                    notification_id=notification_id,
+                    event_type=event_type,
+                    channel=channel,
+                    recipient_id=finding.owner,
+                    title=title,
+                    message=message,
+                    status="FAILED",
+                    payload=payload,
+                    source="local",
+                    retry_count=1,
+                    max_retries=1,
+                    last_error=str(exc),
+                )
+            notifications.append(record)
+        failed_count = sum(
+            1
+            for notification in notifications
+            if notification.status.upper() in {"FAILED", "DEAD_LETTER", "ERROR"}
+        )
+        return OperationsActionSlaNotificationReport(
+            notification_count=len(notifications),
+            failed_count=failed_count,
+            notifications=notifications,
+        )
 
     def confirm_and_create_approval(
         self,
@@ -703,6 +806,75 @@ class TravelAgent:
             self.state_machine.transition(context, TravelState.USER_CANCELLED)
         self.session_store.save(context)
         return context
+
+    def _attach_planning_knowledge(self, context: TravelContext) -> None:
+        try:
+            report = self._search_planning_knowledge(context.request)
+        except Exception as exc:
+            context.append_event(f"Operations knowledge planning search skipped: {exc}")
+            return
+        if report is None or not report.hits:
+            return
+
+        knowledge_refs = [hit.entry.entry_id for hit in report.hits]
+        guidance = report.suggested_actions
+        context.task_plan = self.planner.build_plan(
+            context.request,
+            knowledge_refs=knowledge_refs,
+            guidance=guidance,
+        )
+        context.append_event(
+            f"Operations knowledge applied to planning: {len(knowledge_refs)} hits, {len(guidance)} suggested actions."
+        )
+        context.agent_executions.append(
+            AgentExecutionRecord(
+                agent_name="PlanningKnowledgeAgent",
+                action="search_operations_knowledge",
+                status="SUCCESS",
+                input_refs={
+                    "session_id": context.session_id,
+                    "workflow_generation": context.workflow_generation,
+                    "query": report.query,
+                },
+                output_refs={
+                    "knowledge_refs": knowledge_refs,
+                    "suggested_actions": guidance,
+                },
+                message="Historical operations knowledge attached to task plan.",
+                created_at=datetime.now(timezone.utc).isoformat(),
+            )
+        )
+
+    def _search_planning_knowledge(self, request: TravelRequest) -> OperationsKnowledgeSearchReport | None:
+        from .operations import operations_knowledge_entry_from_dict, search_operations_knowledge
+
+        entries = [
+            operations_knowledge_entry_from_dict(item)
+            for item in self.session_store.list_operations_knowledge_entries(limit=20)
+        ]
+        if not entries:
+            return None
+        return search_operations_knowledge(entries, self._planning_knowledge_query(request), limit=5)
+
+    @staticmethod
+    def _planning_knowledge_query(request: TravelRequest) -> str:
+        tokens = [
+            request.origin_city,
+            request.destination_city,
+            request.purpose,
+            request.venue,
+            request.department or "",
+            *request.preferences,
+            "policy",
+            "hotel",
+            "transport",
+            "approval",
+            "inventory",
+            "order",
+            "notification",
+            "calendar",
+        ]
+        return " ".join(token for token in tokens if token)
 
     @staticmethod
     def _effective_hotel_budget(request: TravelRequest, approved_budget: int) -> int:
