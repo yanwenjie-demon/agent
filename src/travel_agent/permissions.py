@@ -14,6 +14,12 @@ KNOWN_ACTIONS = {
     "sync_calendar",
     "replay_dead_letter",
     "run_worker",
+    "view_operations_console",
+    "create_replay_job",
+    "execute_replay_job",
+    "run_operations_schedule",
+    "publish_closed_loop_schema",
+    "update_governance_policy",
 }
 
 

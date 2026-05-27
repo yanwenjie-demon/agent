@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
+import json
 import sys
 import tempfile
 import unittest
 from datetime import date
 from pathlib import Path
 from typing import Any
-from urllib.request import urlopen
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -14,6 +18,13 @@ sys.path.insert(0, str(ROOT / "src"))
 from travel_agent.agent import build_default_agent, build_session_store
 from travel_agent.acceptance import render_integration_acceptance_report, run_integration_acceptance_report
 from travel_agent.cli import (
+    build_operations_closed_loop_dashboard_json,
+    build_operations_console_overview_json,
+    build_operations_console_view_html,
+    build_operations_console_view_json,
+    build_oncall_webhook_ops_console_json,
+    build_oncall_webhook_replay_jobs_json,
+    create_operations_dashboard_server,
     create_metrics_server,
     render_calendar_dead_letters,
     render_context,
@@ -30,7 +41,7 @@ from travel_agent.evaluation import render_evaluation_report, run_evaluation_sui
 from travel_agent.domain_agents import ApprovalAgent, BookingAgent, HotelAgent, PolicyAgent, TransportAgent
 from travel_agent.governance import render_release_readiness_report, run_release_readiness_report
 from travel_agent.integrations import IntegrationError
-from travel_agent.data_governance import HttpAuditSink, build_audit_event, redact_payload
+from travel_agent.data_governance import HttpAuditSink, InMemoryAuditSink, build_audit_event, redact_payload
 from travel_agent.permissions import PermissionDeniedError, PermissionPolicy, evaluate_permission, render_permission_decision
 from travel_agent.models import (
     CalendarSyncRecord,
@@ -42,38 +53,83 @@ from travel_agent.models import (
 )
 from travel_agent.observability import build_otlp_payloads, build_sla_alerts, export_otlp_http
 from travel_agent.operations import (
+    advance_operations_scheduled_task,
+    authorize_operations_action,
+    build_operations_closed_loop_acceptance_report,
+    build_operations_closed_loop_checkpoint_plan,
     build_alert_route_rules,
     build_operations_alerts,
     build_operations_dashboard,
     build_operations_dashboard_snapshot,
     build_operations_action_sla_policy,
     build_operations_closed_loop_report,
+    build_operations_closed_loop_snapshot,
+    build_operations_console_overview,
+    build_operations_console_view,
+    build_operations_closed_loop_dashboard,
     build_operations_dashboard_trend_report,
     build_operations_knowledge_entries,
     build_operations_drill_report,
     build_operations_multidimensional_view,
     build_operations_postmortem_report,
     build_operations_trend_alert_rules,
+    build_oncall_webhook_event,
+    build_oncall_webhook_ops_console,
+    build_operations_closed_loop_json_schema,
+    build_operations_closed_loop_openapi_spec,
+    build_operations_scheduled_tasks,
+    build_operations_scheduler_health_report,
+    build_recovery_strategy_metrics,
+    build_oncall_webhook_replay_job,
+    build_recovery_approval_sla_policy,
+    build_recovery_governance_policy_audit,
+    collect_recovery_approval_receipts,
     build_postmortem_action_items,
     build_trend_alert_action_items,
     close_operations_action_item,
     evaluate_operations_action_sla,
+    evaluate_operations_closed_loop_quality,
+    execute_oncall_webhook_replay_job,
     build_operations_runbook,
     evaluate_operations_drill_gate,
     evaluate_operations_trend_alerts,
+    evaluate_recovery_strategy_gate,
+    evaluate_recovery_approval_sla,
+    export_recovery_approval_receipt_http,
     export_operations_closed_loop_report_http,
     export_operations_alerts_http,
+    fetch_recovery_governance_policy_http,
     fetch_oncall_ticket_status_http,
     open_oncall_ticket_http,
     oncall_ticket_status_from_dict,
+    oncall_ticket_status_from_webhook,
     oncall_ticket_status_to_dict,
+    open_recovery_failure_ticket_http,
+    oncall_webhook_replay_job_from_dict,
+    oncall_webhook_replay_job_to_dict,
+    oncall_webhook_event_from_dict,
+    oncall_webhook_event_to_dict,
+    list_dead_letter_oncall_webhook_events,
+    patch_oncall_webhook_event_payload,
+    replay_dead_letter_oncall_webhook_events,
+    oncall_webhook_replay_batch_result_from_dict,
+    oncall_webhook_replay_batch_result_to_dict,
+    oncall_webhook_replay_result_from_dict,
+    oncall_webhook_replay_result_to_dict,
     operations_action_item_from_dict,
     operations_action_item_to_dict,
+    operations_closed_loop_snapshot_from_dict,
+    operations_closed_loop_snapshot_to_dict,
     operations_closed_loop_report_to_dict,
+    operations_closed_loop_dashboard_to_dict,
     operations_dashboard_snapshot_from_dict,
     operations_dashboard_snapshot_to_dict,
     operations_knowledge_entry_from_dict,
     operations_knowledge_entry_to_dict,
+    operations_scheduled_task_from_dict,
+    operations_scheduled_task_to_dict,
+    operations_scheduler_run_report_from_dict,
+    operations_scheduler_run_report_to_dict,
     operations_trend_alert_from_dict,
     operations_trend_alert_to_dict,
     render_alert_route_rules,
@@ -81,19 +137,38 @@ from travel_agent.operations import (
     render_operations_action_items,
     render_operations_action_sla_notifications,
     render_operations_action_sla_report,
+    render_operations_action_status_sync_report,
     render_operations_closed_loop_export_result,
     render_operations_closed_loop_report,
+    render_operations_closed_loop_dashboard_json,
     render_operations_closed_loop_report_json,
     render_operations_closed_loop_report_prometheus,
+    render_operations_closed_loop_snapshots,
+    render_operations_closed_loop_json_schema,
+    render_operations_closed_loop_openapi_spec,
+    render_operations_closed_loop_contract_validation,
+    publish_operations_closed_loop_schema_http,
     render_oncall_ticket_status,
+    render_oncall_webhook_event,
+    render_oncall_webhook_ops_console,
+    render_oncall_webhook_ops_console_json,
+    render_oncall_webhook_replay_audit_json,
+    render_oncall_webhook_replay_batch_result,
+    render_oncall_webhook_replay_result,
+    render_oncall_webhook_replay_jobs,
+    render_oncall_webhook_replay_jobs_json,
     render_oncall_ticket_result,
     render_operations_alert_export_result,
     render_operations_alerts,
     render_operations_alerts_json,
     render_operations_alerts_prometheus,
+    render_operations_action_authorization,
     render_operations_dashboard,
     render_operations_dashboard_snapshots,
     render_operations_dashboard_trend_report,
+    render_operations_console_overview_json,
+    render_operations_console_view_html,
+    render_operations_console_view_json,
     render_operations_knowledge_entries,
     render_operations_knowledge_search_report,
     render_operations_drill_gate_result,
@@ -103,7 +178,35 @@ from travel_agent.operations import (
     render_operations_trend_alerts,
     render_operations_trend_alerts_json,
     render_operations_runbook,
+    render_recovery_strategy_decision,
+    render_recovery_strategy_execution_result,
+    render_recovery_governance_decision,
+    render_recovery_approval_sla_report,
+    render_recovery_governance_policy_audit,
+    render_recovery_governance_policy_fetch_result,
+    render_operations_closed_loop_acceptance_report,
+    render_operations_closed_loop_checkpoint_plan,
+    render_operations_closed_loop_quality_report,
+    render_operations_closed_loop_schema_publish_result,
+    render_operations_scheduled_tasks,
+    render_operations_scheduler_health_report,
+    render_operations_scheduler_run_report,
+    render_recovery_approval_export_result,
+    render_recovery_strategy_metrics_prometheus,
+    render_recovery_strategy_gate_result,
+    render_oncall_webhook_replay_job_execution,
+    recovery_strategy_decision_from_dict,
+    recovery_governance_policy_from_dict,
+    recovery_governance_policy_from_json,
+    recovery_governance_decision_from_dict,
+    recovery_strategy_execution_result_from_dict,
+    recovery_strategy_execution_result_to_dict,
+    recovery_strategy_gate_result_from_dict,
+    replay_dead_letter_oncall_webhook_event,
+    validate_operations_closed_loop_dashboard_contract,
     search_operations_knowledge,
+    sync_operations_action_items_from_oncall,
+    run_operations_scheduled_tasks,
 )
 from travel_agent.release_gate import evaluate_release_gate, render_release_gate_result
 from travel_agent.release_control import RolloutPolicy, evaluate_rollout
@@ -1035,7 +1138,21 @@ class IntegrationAdapterTest(unittest.TestCase):
             oa_approval_api_url="https://oa.example/create",
             oa_approval_status_api_url="https://oa.example/status",
         )
-        agent = build_default_agent(settings=settings, http_client=http)
+        store = InMemorySessionStore()
+        store.record_operations_knowledge_entry(
+            {
+                "entry_id": "KB-RECOVERY",
+                "topic": "APPROVAL_REJECTED",
+                "title": "Approval rejected recovery",
+                "summary": "When approval is rejected, replan with a lower hotel price and resubmit.",
+                "signals": ["APPROVAL_REJECTED", "approval", "recovery"],
+                "recommended_actions": ["Select a lower-price compliant hotel before resubmitting approval."],
+                "source_refs": ["INC-APPROVAL"],
+                "created_at": "2026-05-20T00:00:00+00:00",
+                "updated_at": "2026-05-20T00:00:00+00:00",
+            }
+        )
+        agent = build_default_agent(settings=settings, http_client=http, session_store=store)
         context = agent.run_to_order(_request())
 
         replanned = agent.replan_after_exception(context, reason="approval_rejected_replan")
@@ -1046,6 +1163,20 @@ class IntegrationAdapterTest(unittest.TestCase):
         self.assertEqual(new_approval.approval.approval_id, "REMOTE-APPROVAL-NEW")
         self.assertEqual(new_approval.approval.payload["workflow_generation"], 2)
         self.assertEqual(new_approval.recovery_records[0].from_state, TravelState.APPROVAL_REJECTED.value)
+        self.assertIn("KB-RECOVERY", new_approval.recovery_records[0].payload["knowledge_refs"])
+        decision = recovery_strategy_decision_from_dict(
+            new_approval.recovery_records[0].payload["strategy_decision"]
+        )
+        gate = recovery_strategy_gate_result_from_dict(new_approval.recovery_records[0].payload["strategy_gate"])
+        self.assertEqual(decision.action, "knowledge_guided_replan")
+        self.assertEqual(decision.severity, "warning")
+        self.assertTrue(gate.allow_automation)
+        self.assertIn("KB-RECOVERY", decision.knowledge_refs)
+        self.assertIn("Recovery strategy decision:", render_recovery_strategy_decision(decision))
+        self.assertIn("Recovery strategy gate:", render_recovery_strategy_gate_result(gate))
+        self.assertIn("Select a lower-price compliant hotel before resubmitting approval.", new_approval.task_plan.guidance)
+        self.assertTrue(any(record.agent_name == "RecoveryStrategyAgent" for record in new_approval.agent_executions))
+        self.assertTrue(any(record.agent_name == "RecoveryKnowledgeAgent" for record in new_approval.agent_executions))
 
     def test_replans_after_price_change_releases_inventory(self) -> None:
         http = StubHttpClient(
@@ -1149,6 +1280,247 @@ class IntegrationAdapterTest(unittest.TestCase):
         self.assertIn("order_cancellation", replanned.recovery_records[0].payload["compensations"])
         self.assertIsNone(new_approval.order)
         self.assertEqual(http.payloads["https://oa.example/create"][-1]["idempotency_key"], f"travel-approval:{context.session_id}:2:u-demo")
+
+    def test_executes_recovery_strategy_with_gate_override(self) -> None:
+        http = CapturingHttpClient(
+            _remote_order_responses(
+                order={
+                    "order": {
+                        "order_id": "REMOTE-ORDER-1",
+                        "status": "FAILED",
+                        "total_amount": 1320,
+                        "currency": "CNY",
+                    }
+                }
+            )
+            | {
+                "https://order.example/cancel": {
+                    "compensation": {
+                        "action": "cancel_order",
+                        "target_id": "REMOTE-ORDER-1",
+                        "status": "CANCELLED",
+                    }
+                },
+                "https://transport.example/cancel": {
+                    "compensation": {
+                        "action": "cancel_transport_order",
+                        "target_id": "REMOTE-TRANSPORT-ORDER-1",
+                        "status": "CANCELLED",
+                    }
+                },
+                "https://hotel.example/release": {
+                    "compensation": {
+                        "action": "release_hotel_inventory",
+                        "target_id": "REMOTE-LOCK-1",
+                        "status": "RELEASED",
+                    }
+                },
+                "https://oa.example/cancel": {
+                    "compensation": {
+                        "action": "cancel_approval",
+                        "target_id": "REMOTE-APPROVAL-1",
+                        "status": "CANCELLED",
+                    }
+                },
+            }
+        )
+        settings = _remote_order_settings(
+            order_cancel_api_url="https://order.example/cancel",
+            transport_order_cancel_api_url="https://transport.example/cancel",
+            hotel_inventory_release_api_url="https://hotel.example/release",
+            oa_approval_cancel_api_url="https://oa.example/cancel",
+        )
+        agent = build_default_agent(settings=settings, http_client=http)
+        context = agent.run_to_order(_request())
+
+        blocked = agent.execute_recovery_strategy(context, reason="order_failed_strategy", enforce_strategy_gate=True)
+        blocked_execution = recovery_strategy_execution_result_from_dict(
+            blocked.recovery_records[-1].payload["strategy_execution"]
+        )
+        duplicate_blocked = agent.execute_recovery_strategy(
+            blocked,
+            reason="order_failed_strategy",
+            enforce_strategy_gate=True,
+        )
+        duplicate_blocked_payload = duplicate_blocked.recovery_records[-1].payload["strategy_execution"]
+        duplicate_blocked_execution = recovery_strategy_execution_result_from_dict(
+            duplicate_blocked_payload
+        )
+        blocked_state = blocked.state
+        recovered = agent.execute_recovery_strategy(
+            blocked,
+            reason="order_failed_strategy",
+            enforce_strategy_gate=True,
+            approval_override=True,
+            approved_by="ops-lead",
+            approval_reason="incident approved",
+        )
+        execution = recovery_strategy_execution_result_from_dict(
+            recovered.recovery_records[-1].payload["strategy_execution"]
+        )
+        serialized = recovery_strategy_execution_result_to_dict(execution)
+        metrics = build_recovery_strategy_metrics([recovered])
+        prometheus = render_recovery_strategy_metrics_prometheus([recovered])
+
+        self.assertEqual(blocked_state, TravelState.ORDER_FAILED.value)
+        self.assertEqual(blocked_execution.status, "BLOCKED")
+        self.assertEqual(duplicate_blocked_execution.status, "SKIPPED")
+        self.assertTrue(duplicate_blocked_payload["idempotent"])
+        self.assertEqual(recovered.state, TravelState.PLAN_GENERATED.value)
+        self.assertEqual(recovered.workflow_generation, 2)
+        self.assertEqual(execution.action, "compensate_then_replan")
+        self.assertEqual(execution.status, "EXECUTED")
+        self.assertTrue(execution.approval_override)
+        self.assertIsNotNone(execution.approval_receipt)
+        self.assertEqual(execution.approval_receipt["approved_by"], "ops-lead")
+        self.assertTrue(execution.idempotency_key.startswith(f"recovery-execution:{context.session_id}:"))
+        self.assertIn("strategy_execution", recovered.recovery_records[-1].payload)
+        self.assertIn("Recovery strategy execution:", render_recovery_strategy_execution_result(execution))
+        self.assertEqual(serialized["status"], "EXECUTED")
+        self.assertEqual(serialized["approval_receipt"]["reason"], "incident approved")
+        self.assertGreaterEqual(metrics["status:EXECUTED"], 1)
+        self.assertGreaterEqual(metrics["approval_receipt"], 1)
+        self.assertIn("travel_recovery_strategy_executions_total", prometheus)
+        self.assertTrue(any(record.agent_name == "RecoveryStrategyExecutor" for record in recovered.agent_executions))
+
+    def test_recovery_governance_blocks_exports_receipts_and_opens_failure_ticket(self) -> None:
+        http = CapturingHttpClient(
+            _remote_order_responses(
+                order={
+                    "order": {
+                        "order_id": "REMOTE-ORDER-1",
+                        "status": "FAILED",
+                        "total_amount": 1320,
+                        "currency": "CNY",
+                    }
+                }
+            )
+            | {
+                "https://order.example/cancel": {
+                    "compensation": {
+                        "action": "cancel_order",
+                        "target_id": "REMOTE-ORDER-1",
+                        "status": "CANCELLED",
+                    }
+                },
+                "https://transport.example/cancel": {
+                    "compensation": {
+                        "action": "cancel_transport_order",
+                        "target_id": "REMOTE-TRANSPORT-ORDER-1",
+                        "status": "CANCELLED",
+                    }
+                },
+                "https://hotel.example/release": {
+                    "compensation": {
+                        "action": "release_hotel_inventory",
+                        "target_id": "REMOTE-LOCK-1",
+                        "status": "RELEASED",
+                    }
+                },
+                "https://oa.example/cancel": {
+                    "compensation": {
+                        "action": "cancel_approval",
+                        "target_id": "REMOTE-APPROVAL-1",
+                        "status": "CANCELLED",
+                    }
+                },
+            }
+        )
+        settings = _remote_order_settings(
+            order_cancel_api_url="https://order.example/cancel",
+            transport_order_cancel_api_url="https://transport.example/cancel",
+            hotel_inventory_release_api_url="https://hotel.example/release",
+            oa_approval_cancel_api_url="https://oa.example/cancel",
+        )
+        agent = build_default_agent(settings=settings, http_client=http)
+        context = agent.run_to_order(_request())
+        blocked_policy = recovery_governance_policy_from_dict({"blocked_actions": ["compensate_then_replan"]})
+
+        blocked = agent.execute_recovery_strategy(
+            context,
+            reason="governance_block",
+            enforce_strategy_gate=True,
+            approval_override=True,
+            approved_by="ops-lead",
+            approval_reason="approved but blocked by policy",
+            governance_policy=blocked_policy,
+        )
+        blocked_execution_payload = blocked.recovery_records[-1].payload["strategy_execution"]
+        blocked_execution = recovery_strategy_execution_result_from_dict(blocked_execution_payload)
+        governance = recovery_governance_decision_from_dict(blocked.recovery_records[-1].payload["strategy_governance"])
+        audit_http = CapturingAnyHttpClient({"https://audit.example/recovery": {"ok": True, "accepted": 1}})
+        ticket_http = CapturingAnyHttpClient({"https://oncall.example/tickets": {"ok": True, "ticket_id": "INC-RECOVERY"}})
+        receipts = collect_recovery_approval_receipts([blocked])
+        export_result = export_recovery_approval_receipt_http(
+            receipts[0],
+            "https://audit.example/recovery",
+            token="audit-token",
+            http_client=audit_http,
+        )
+        ticket_result = open_recovery_failure_ticket_http(
+            blocked,
+            blocked_execution,
+            "https://oncall.example/tickets",
+            token="oncall-token",
+            http_client=ticket_http,
+        )
+
+        self.assertEqual(blocked.state, TravelState.ORDER_FAILED.value)
+        self.assertEqual(blocked_execution.status, "BLOCKED")
+        self.assertEqual(blocked_execution.gate_status, "GOVERNANCE_BLOCKED")
+        self.assertFalse(governance.allow_automation)
+        self.assertIn("Recovery governance decision:", render_recovery_governance_decision(governance))
+        self.assertEqual(receipts[0].approved_by, "ops-lead")
+        self.assertTrue(export_result.ok)
+        self.assertIn("Recovery approval export:", render_recovery_approval_export_result(export_result))
+        self.assertEqual(audit_http.calls[0][2], "audit-token")
+        self.assertEqual(ticket_result.ticket_id, "INC-RECOVERY")
+        self.assertEqual(ticket_http.calls[0][1]["recovery_execution"]["status"], "BLOCKED")
+        self.assertEqual(recovery_governance_policy_from_json('{"max_executions_per_session":1}').max_executions_per_session, 1)
+        config_http = CapturingAnyHttpClient(
+            {
+                "https://config.example/recovery-governance": {
+                    "source": "config-center",
+                    "policy": {
+                        "allowed_actions": ["compensate_then_replan"],
+                        "max_executions_per_session": 3,
+                    },
+                }
+            }
+        )
+        fetched = fetch_recovery_governance_policy_http(
+            "https://config.example/recovery-governance",
+            token="config-token",
+            http_client=config_http,
+            fallback_policy=blocked_policy,
+        )
+        fallback = fetch_recovery_governance_policy_http(
+            "https://config.example/recovery-governance",
+            http_client=FailingHttpClient(),
+            fallback_policy=blocked_policy,
+        )
+        policy_audit = build_recovery_governance_policy_audit(
+            blocked_policy,
+            fetched.policy,
+            changed_by="platform",
+            changed_at="2026-05-20T01:00:00+00:00",
+        )
+        sla_report = evaluate_recovery_approval_sla(
+            [blocked],
+            policy=build_recovery_approval_sla_policy('{"allowed_approvers":["security-lead"]}'),
+            now=receipts[0].approved_at,
+        )
+
+        self.assertTrue(fetched.ok)
+        self.assertEqual(fetched.policy.allowed_actions, ["compensate_then_replan"])
+        self.assertEqual(config_http.calls[0][2], "config-token")
+        self.assertFalse(fallback.ok)
+        self.assertEqual(fallback.policy.blocked_actions, ["compensate_then_replan"])
+        self.assertTrue(policy_audit.changes)
+        self.assertIn("Recovery governance policy fetch:", render_recovery_governance_policy_fetch_result(fetched))
+        self.assertIn("Recovery governance policy audit:", render_recovery_governance_policy_audit(policy_audit))
+        self.assertEqual(sla_report.findings[0].severity, "critical")
+        self.assertIn("Recovery approval SLA:", render_recovery_approval_sla_report(sla_report))
 
     def test_falls_back_to_mock_when_real_system_fails(self) -> None:
         settings = IntegrationSettings(
@@ -1295,7 +1667,33 @@ class SessionStoreTest(unittest.TestCase):
         )
 
         store.record_operations_dashboard_snapshot(operations_dashboard_snapshot_to_dict(snapshot))
+        closed_loop_report = build_operations_closed_loop_report(generated_at="2026-05-19T10:10:00+00:00")
+        closed_loop_snapshot = build_operations_closed_loop_snapshot(
+            closed_loop_report,
+            snapshot_id="CLP-HTTP",
+            created_at="2026-05-19T10:10:00+00:00",
+        )
+        store.record_operations_closed_loop_snapshot(operations_closed_loop_snapshot_to_dict(closed_loop_snapshot))
         store.record_oncall_ticket_status(status)
+        webhook_event = build_oncall_webhook_event(
+            {
+                "event_id": "WHK-HTTP",
+                "data": {
+                    "ticket_id": "INC-HTTP",
+                    "status": "RESOLVED",
+                    "updated_at": "2026-05-19T10:06:00+00:00",
+                },
+            },
+            now="2026-05-19T10:07:00+00:00",
+        )
+        store.record_oncall_webhook_event(oncall_webhook_event_to_dict(webhook_event))
+        replay_job = build_oncall_webhook_replay_job(
+            [webhook_event.event_id],
+            requested_by="ops",
+            patch_template_id="missing_ticket_status",
+            created_at="2026-05-19T10:08:00+00:00",
+        )
+        store.record_oncall_webhook_replay_job(oncall_webhook_replay_job_to_dict(replay_job))
         store.record_operations_trend_alert(
             {
                 "alert_id": "TREND-HTTP",
@@ -1340,17 +1738,50 @@ class SessionStoreTest(unittest.TestCase):
                 "updated_at": "2026-05-19T10:00:00+00:00",
             }
         )
+        schedule_task = build_operations_scheduled_tasks(now="2026-05-19T10:00:00+00:00")[0]
+        store.record_operations_scheduled_task(operations_scheduled_task_to_dict(schedule_task))
+        claimed_tasks = store.claim_due_operations_scheduled_tasks(
+            owner="worker-a",
+            now="2026-05-19T10:01:00+00:00",
+            lease_seconds=120,
+            limit=1,
+        )
+        store.complete_operations_scheduled_task(
+            {
+                **claimed_tasks[0],
+                "next_run_at": "2026-05-19T11:01:00+00:00",
+                "lease_owner": None,
+                "lease_expires_at": None,
+            }
+        )
+        scheduler_report = run_operations_scheduled_tasks(
+            [operations_scheduled_task_from_dict(claimed_tasks[0])],
+            {"closed_loop_snapshot": lambda task: {"ok": True}},
+            now="2026-05-19T10:02:00+00:00",
+        )
+        store.record_operations_scheduler_run(operations_scheduler_run_report_to_dict(scheduler_report))
 
         self.assertEqual(store.list_operations_dashboard_snapshots()[0]["snapshot_id"], "DASH-HTTP")
+        self.assertEqual(store.list_operations_closed_loop_snapshots()[0]["snapshot_id"], "CLP-HTTP")
         self.assertEqual(store.list_oncall_ticket_statuses()[0]["status"], "ACKED")
+        self.assertEqual(store.list_oncall_webhook_events()[0]["event_id"], "WHK-HTTP")
+        self.assertEqual(store.list_oncall_webhook_replay_jobs()[0]["job_id"], replay_job.job_id)
         self.assertEqual(store.list_operations_trend_alerts()[0]["alert_id"], "TREND-HTTP")
         self.assertEqual(store.list_operations_action_items()[0]["action_id"], "ACT-HTTP")
         self.assertEqual(store.list_operations_knowledge_entries()[0]["entry_id"], "KB-HTTP")
+        self.assertEqual(claimed_tasks[0]["lease_owner"], "worker-a")
+        self.assertEqual(store.list_operations_scheduled_tasks()[0]["next_run_at"], "2026-05-19T11:01:00+00:00")
+        self.assertEqual(store.list_operations_scheduler_runs()[0]["run_id"], scheduler_report.run_id)
         self.assertTrue(any(call[0].endswith("/operations/dashboard-snapshots/record") for call in http.calls))
+        self.assertTrue(any(call[0].endswith("/operations/closed-loop-snapshots/record") for call in http.calls))
         self.assertTrue(any(call[0].endswith("/operations/oncall-statuses/record") for call in http.calls))
+        self.assertTrue(any(call[0].endswith("/operations/oncall-webhooks/record") for call in http.calls))
+        self.assertTrue(any(call[0].endswith("/operations/oncall-webhook-replay-jobs/record") for call in http.calls))
         self.assertTrue(any(call[0].endswith("/operations/trend-alerts/record") for call in http.calls))
         self.assertTrue(any(call[0].endswith("/operations/action-items/record") for call in http.calls))
         self.assertTrue(any(call[0].endswith("/operations/knowledge/record") for call in http.calls))
+        self.assertTrue(any(call[0].endswith("/operations/scheduled-tasks/claim-due") for call in http.calls))
+        self.assertTrue(any(call[0].endswith("/operations/scheduler-runs/record") for call in http.calls))
 
     def test_build_session_store_selects_configured_backends(self) -> None:
         http = FakeSessionStoreHttpClient()
@@ -1435,6 +1866,25 @@ class SessionStoreTest(unittest.TestCase):
 
             store.record_operations_dashboard_snapshot(operations_dashboard_snapshot_to_dict(snapshot))
             store.record_oncall_ticket_status(oncall_ticket_status_to_dict(status))
+            webhook_event = build_oncall_webhook_event(
+                {
+                    "event_id": "WHK-SQL",
+                    "data": {
+                        "ticket_id": "INC-SQL",
+                        "status": "RESOLVED",
+                        "updated_at": "2026-05-19T10:06:00+00:00",
+                    },
+                },
+                now="2026-05-19T10:07:00+00:00",
+            )
+            store.record_oncall_webhook_event(oncall_webhook_event_to_dict(webhook_event))
+            replay_job = build_oncall_webhook_replay_job(
+                [webhook_event.event_id],
+                requested_by="ops",
+                patch_template_id="missing_ticket_status",
+                created_at="2026-05-19T10:08:00+00:00",
+            )
+            store.record_oncall_webhook_replay_job(oncall_webhook_replay_job_to_dict(replay_job))
             trend = build_operations_dashboard_trend_report([snapshot], window=1)
             trend_alerts = evaluate_operations_trend_alerts(trend)
             action_items = build_trend_alert_action_items(trend_alerts, eta="2026-05-20T12:00:00+00:00")
@@ -1445,25 +1895,94 @@ class SessionStoreTest(unittest.TestCase):
                 store.record_operations_action_item(operations_action_item_to_dict(item))
             for entry in entries:
                 store.record_operations_knowledge_entry(operations_knowledge_entry_to_dict(entry))
+            schedule_task = build_operations_scheduled_tasks(now="2026-05-19T10:00:00+00:00")[0]
+            store.record_operations_scheduled_task(operations_scheduled_task_to_dict(schedule_task))
+            claimed = store.claim_due_operations_scheduled_tasks(
+                owner="worker-a",
+                now="2026-05-19T10:01:00+00:00",
+                lease_seconds=120,
+                limit=1,
+            )
+            still_locked = store.claim_due_operations_scheduled_tasks(
+                owner="worker-b",
+                now="2026-05-19T10:02:00+00:00",
+                lease_seconds=120,
+                limit=1,
+            )
+            expired_claim = store.claim_due_operations_scheduled_tasks(
+                owner="worker-b",
+                now="2026-05-19T10:04:00+00:00",
+                lease_seconds=120,
+                limit=1,
+            )
+            advanced_task = advance_operations_scheduled_task(
+                operations_scheduled_task_from_dict(expired_claim[0]),
+                run_operations_scheduled_tasks(
+                    [operations_scheduled_task_from_dict(expired_claim[0])],
+                    {"closed_loop_snapshot": lambda task: {"ok": True}},
+                    now="2026-05-19T10:04:00+00:00",
+                ).results[0],
+            )
+            store.complete_operations_scheduled_task(operations_scheduled_task_to_dict(advanced_task))
+            scheduler_report = run_operations_scheduled_tasks(
+                [operations_scheduled_task_from_dict(expired_claim[0])],
+                {"closed_loop_snapshot": lambda task: {"ok": True}},
+                now="2026-05-19T10:04:00+00:00",
+            )
+            store.record_operations_scheduler_run(operations_scheduler_run_report_to_dict(scheduler_report))
+            closed_loop = build_operations_closed_loop_report(
+                trend_alerts=trend_alerts,
+                action_items=action_items,
+                knowledge_entries=entries,
+                generated_at="2026-05-19T10:15:00+00:00",
+            )
+            closed_loop_snapshot = build_operations_closed_loop_snapshot(
+                closed_loop,
+                snapshot_id="CLP-SQL",
+                created_at="2026-05-19T10:15:00+00:00",
+            )
+            store.record_operations_closed_loop_snapshot(operations_closed_loop_snapshot_to_dict(closed_loop_snapshot))
 
             reloaded_snapshot = operations_dashboard_snapshot_from_dict(store.list_operations_dashboard_snapshots()[0])
+            reloaded_closed_loop_snapshot = operations_closed_loop_snapshot_from_dict(
+                store.list_operations_closed_loop_snapshots()[0]
+            )
             reloaded_status = oncall_ticket_status_from_dict(store.list_oncall_ticket_statuses()[0])
+            reloaded_webhook_event = oncall_webhook_event_from_dict(store.list_oncall_webhook_events()[0])
+            reloaded_replay_job = oncall_webhook_replay_job_from_dict(store.list_oncall_webhook_replay_jobs()[0])
             reloaded_alert = operations_trend_alert_from_dict(store.list_operations_trend_alerts()[0])
             reloaded_action = operations_action_item_from_dict(store.list_operations_action_items()[0])
             reloaded_entry = operations_knowledge_entry_from_dict(store.list_operations_knowledge_entries()[0])
+            reloaded_task = operations_scheduled_task_from_dict(store.list_operations_scheduled_tasks()[0])
+            reloaded_run = operations_scheduler_run_report_from_dict(store.list_operations_scheduler_runs()[0])
             health = store.health_check()
 
             self.assertEqual(reloaded_snapshot.snapshot_id, "DASH-SQL")
+            self.assertEqual(reloaded_closed_loop_snapshot.snapshot_id, "CLP-SQL")
             self.assertEqual(reloaded_status.status, "RESOLVED")
+            self.assertEqual(reloaded_webhook_event.event_id, "WHK-SQL")
+            self.assertEqual(reloaded_replay_job.job_id, replay_job.job_id)
             self.assertEqual(reloaded_alert.metric, "critical_alerts")
             self.assertEqual(reloaded_action.status, "OPEN")
             self.assertEqual(reloaded_entry.topic, "critical_alerts")
-            self.assertGreaterEqual(health.schema_version, 4)
+            self.assertEqual(claimed[0]["lease_owner"], "worker-a")
+            self.assertEqual(still_locked, [])
+            self.assertEqual(expired_claim[0]["lease_owner"], "worker-b")
+            self.assertEqual(reloaded_task.run_count, 1)
+            self.assertIsNone(reloaded_task.lease_owner)
+            self.assertGreater(reloaded_task.next_run_at, "2026-05-19T10:04:00+00:00")
+            self.assertEqual(reloaded_run.run_id, scheduler_report.run_id)
+            self.assertGreaterEqual(health.schema_version, 9)
             self.assertEqual(health.details["dashboard_snapshots"], "1")
+            self.assertEqual(health.details["closed_loop_snapshots"], "1")
             self.assertEqual(health.details["oncall_ticket_statuses"], "1")
+            self.assertEqual(health.details["oncall_webhook_events"], "1")
+            self.assertEqual(health.details["oncall_webhook_replay_jobs"], "1")
             self.assertEqual(health.details["operations_trend_alerts"], "1")
             self.assertEqual(health.details["operations_action_items"], "1")
             self.assertEqual(health.details["operations_knowledge_entries"], "1")
+            self.assertEqual(health.details["operations_scheduled_tasks"], "1")
+            self.assertEqual(health.details["operations_scheduler_runs"], "1")
 
     def test_sqlite_session_store_tracks_metadata_and_versions(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1661,6 +2180,129 @@ class WorkflowWorkerTest(unittest.TestCase):
         self.assertEqual(updated.state, TravelState.PRICE_CHANGED.value)
         self.assertIsNone(updated.order)
         self.assertEqual(updated.notifications[0].event_type, "PRICE_CHANGE_CONFIRMATION_REQUIRED")
+
+    def test_worker_auto_recovers_rejected_approval_when_enabled(self) -> None:
+        store = InMemorySessionStore()
+        http = StubHttpClient(
+            {
+                "https://policy.example/check": {
+                    "policy": {
+                        "policy_id": "REMOTE-POLICY-1",
+                        "max_hotel_price": 700,
+                        "approved_budget": 680,
+                        "compliant": True,
+                    }
+                },
+                "https://hotel.example/search": {
+                    "hotels": [
+                        {
+                            "hotel_id": "REMOTE-HOTEL-1",
+                            "name": "Remote Hotel",
+                            "city": "上海",
+                            "address": "Remote Road",
+                            "nightly_price": 660,
+                            "distance_km": 0.6,
+                            "rating": 4.9,
+                            "refundable": True,
+                        }
+                    ]
+                },
+                "https://oa.example/create": {
+                    "approval": {
+                        "approval_id": "REMOTE-APPROVAL-1",
+                        "status": "PENDING_APPROVAL",
+                    }
+                },
+                "https://oa.example/status": {
+                    "approval": {
+                        "approval_id": "REMOTE-APPROVAL-1",
+                        "status": "REJECTED",
+                    }
+                },
+            }
+        )
+        settings = IntegrationSettings(
+            policy_api_url="https://policy.example/check",
+            hotel_inventory_api_url="https://hotel.example/search",
+            oa_approval_api_url="https://oa.example/create",
+            oa_approval_status_api_url="https://oa.example/status",
+        )
+        agent = build_default_agent(settings=settings, http_client=http, session_store=store)
+        context = agent.run_to_order(_request())
+
+        result = WorkflowWorker(agent, auto_recover=True).run_once()
+        updated = store.get(context.session_id)
+        execution = recovery_strategy_execution_result_from_dict(
+            updated.recovery_records[-1].payload["strategy_execution"]
+        )
+
+        self.assertEqual(result.scanned, 1)
+        self.assertEqual(result.advanced, 1)
+        self.assertEqual(updated.state, TravelState.PLAN_GENERATED.value)
+        self.assertEqual(updated.workflow_generation, 2)
+        self.assertEqual(execution.action, "replan")
+        self.assertEqual(execution.status, "EXECUTED")
+        self.assertTrue(any(record.agent_name == "RecoveryStrategyExecutor" for record in updated.agent_executions))
+
+    def test_worker_auto_recovery_honors_rollout_policy(self) -> None:
+        store = InMemorySessionStore()
+        http = StubHttpClient(
+            {
+                "https://policy.example/check": {
+                    "policy": {
+                        "policy_id": "REMOTE-POLICY-1",
+                        "max_hotel_price": 700,
+                        "approved_budget": 680,
+                        "compliant": True,
+                    }
+                },
+                "https://hotel.example/search": {
+                    "hotels": [
+                        {
+                            "hotel_id": "REMOTE-HOTEL-1",
+                            "name": "Remote Hotel",
+                            "city": "上海",
+                            "address": "Remote Road",
+                            "nightly_price": 660,
+                            "distance_km": 0.6,
+                            "rating": 4.9,
+                            "refundable": True,
+                        }
+                    ]
+                },
+                "https://oa.example/create": {
+                    "approval": {
+                        "approval_id": "REMOTE-APPROVAL-1",
+                        "status": "PENDING_APPROVAL",
+                    }
+                },
+                "https://oa.example/status": {
+                    "approval": {
+                        "approval_id": "REMOTE-APPROVAL-1",
+                        "status": "REJECTED",
+                    }
+                },
+            }
+        )
+        settings = IntegrationSettings(
+            policy_api_url="https://policy.example/check",
+            hotel_inventory_api_url="https://hotel.example/search",
+            oa_approval_api_url="https://oa.example/create",
+            oa_approval_status_api_url="https://oa.example/status",
+        )
+        agent = build_default_agent(settings=settings, http_client=http, session_store=store)
+        context = agent.run_to_order(_request())
+
+        WorkflowWorker(
+            agent,
+            auto_recover=True,
+            recovery_rollout_policy=RolloutPolicy(enabled=True, percentage=0, salt="test"),
+        ).run_once()
+        updated = store.get(context.session_id)
+
+        self.assertEqual(updated.state, TravelState.APPROVAL_REJECTED.value)
+        self.assertEqual(updated.recovery_records, [])
+        self.assertTrue(any("Worker recovery rollout skipped" in event for event in updated.events))
 
     def test_worker_sends_notification_once_for_completed_order(self) -> None:
         store = InMemorySessionStore()
@@ -2596,13 +3238,23 @@ class OperationsReadinessTest(unittest.TestCase):
             knowledge_entries=entries,
             generated_at="2026-05-20T00:00:00+00:00",
         )
+        snapshot = build_operations_closed_loop_snapshot(
+            closed_loop,
+            snapshot_id="CLP-SEARCH",
+            created_at="2026-05-20T00:05:00+00:00",
+        )
+        reloaded_snapshot = operations_closed_loop_snapshot_from_dict(
+            operations_closed_loop_snapshot_to_dict(snapshot)
+        )
 
         self.assertTrue(search.hits)
         self.assertEqual(closed_loop.closure_rate, 100.0)
         self.assertEqual(closed_loop.action_items_closed, 1)
         self.assertEqual(operations_closed_loop_report_to_dict(closed_loop)["closure_rate"], 100.0)
+        self.assertEqual(reloaded_snapshot.snapshot_id, "CLP-SEARCH")
         self.assertIn("Operations knowledge search:", render_operations_knowledge_search_report(search))
         self.assertIn("Operations closed-loop report:", render_operations_closed_loop_report(closed_loop))
+        self.assertIn("Operations closed-loop snapshots:", render_operations_closed_loop_snapshots([snapshot]))
         self.assertIn('"closure_rate": 100.0', render_operations_closed_loop_report_json(closed_loop))
         self.assertIn(
             "travel_operations_closed_loop_action_items",
@@ -2655,6 +3307,795 @@ class OperationsReadinessTest(unittest.TestCase):
         self.assertEqual(notification_report.notifications[0].recipient_id, "compliance-platform-oncall")
         self.assertIn("Operations action SLA:", rendered)
         self.assertIn("Operations action SLA notifications:", render_operations_action_sla_notifications(notification_report))
+
+    def test_syncs_action_items_from_oncall_ticket_status(self) -> None:
+        item = operations_action_item_from_dict(
+            {
+                "action_id": "ACT-TICKET",
+                "source_type": "trend_alert",
+                "source_id": "TREND-TICKET",
+                "title": "Recover order workflow",
+                "owner": "booking-oncall",
+                "status": "OPEN",
+                "eta": None,
+                "created_at": "2026-05-20T00:00:00+00:00",
+                "updated_at": "2026-05-20T00:00:00+00:00",
+                "evidence": ["ticket=INC-TICKET", "metric=state:ORDER_FAILED"],
+                "closure_note": None,
+            }
+        )
+        status = oncall_ticket_status_from_dict(
+            {
+                "ticket_id": "INC-TICKET",
+                "status": "RESOLVED",
+                "assignee": "booking-oncall",
+                "updated_at": "2026-05-20T02:00:00+00:00",
+                "detail": "supplier reconciliation completed",
+            }
+        )
+
+        report = sync_operations_action_items_from_oncall(
+            [item],
+            [status],
+            updated_at="2026-05-20T02:05:00+00:00",
+        )
+        rendered = render_operations_action_status_sync_report(report)
+
+        self.assertEqual(report.matched_items, 1)
+        self.assertEqual(report.closed_items[0].status, "CLOSED")
+        self.assertIn("INC-TICKET", report.closed_items[0].closure_note)
+        self.assertIn("Operations action status sync:", rendered)
+
+    def test_recovery_strategy_gate_requires_approval_for_critical_paths(self) -> None:
+        decision = recovery_strategy_decision_from_dict(
+            {
+                "decision_id": "RSD-GATE",
+                "action": "compensate_then_replan",
+                "severity": "critical",
+                "reason": "state=ORDER_FAILED",
+                "from_state": "ORDER_FAILED",
+                "compensation_required": True,
+                "manual_escalation_required": False,
+                "knowledge_refs": [],
+                "guidance": [],
+                "recommended_next_steps": ["Complete compensation before resubmitting."],
+            }
+        )
+
+        blocked = evaluate_recovery_strategy_gate(decision)
+        approved = evaluate_recovery_strategy_gate(decision, approved=True)
+
+        self.assertEqual(blocked.status, "APPROVAL_REQUIRED")
+        self.assertFalse(blocked.allow_automation)
+        self.assertIn("critical_recovery_approval", blocked.required_approvals)
+        self.assertTrue(approved.allow_automation)
+        self.assertIn("Recovery strategy gate:", render_recovery_strategy_gate_result(blocked))
+
+    def test_parses_oncall_webhook_payloads_and_closes_action_items(self) -> None:
+        item = operations_action_item_from_dict(
+            {
+                "action_id": "ACT-WEBHOOK",
+                "source_type": "postmortem",
+                "source_id": "INC-WEBHOOK",
+                "title": "Close webhook related item",
+                "owner": "workflow-oncall",
+                "status": "OPEN",
+                "eta": None,
+                "created_at": "2026-05-20T00:00:00+00:00",
+                "updated_at": "2026-05-20T00:00:00+00:00",
+                "evidence": ["ticket=INC-WEBHOOK"],
+                "closure_note": None,
+            }
+        )
+        webhook_payload = {
+            "event_type": "ticket.updated",
+            "data": {
+                "ticket_id": "INC-WEBHOOK",
+                "status": "CLOSED",
+                "assignee": {"name": "workflow-oncall"},
+                "updated_at": "2026-05-20T03:00:00+00:00",
+                "detail": "resolved by webhook",
+            },
+        }
+
+        status = oncall_ticket_status_from_webhook(webhook_payload)
+        report = sync_operations_action_items_from_oncall([item], [status], updated_at="2026-05-20T03:05:00+00:00")
+        rendered = render_oncall_ticket_status(status)
+
+        self.assertEqual(status.ticket_id, "INC-WEBHOOK")
+        self.assertEqual(status.assignee, "workflow-oncall")
+        self.assertEqual(report.matched_items, 1)
+        self.assertIn("OnCall ticket status:", rendered)
+
+    def test_oncall_webhook_event_validates_signature_dedupe_and_replay(self) -> None:
+        payload = {
+            "event_id": "WHK-SECURE",
+            "data": {
+                "ticket_id": "INC-SECURE",
+                "status": "CLOSED",
+                "assignee": "ops",
+                "updated_at": "2026-05-20T03:00:00+00:00",
+                "detail": "resolved by signed webhook",
+            },
+        }
+        raw_body = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        secret = "webhook-secret"
+        signature = "sha256=" + hmac.new(secret.encode("utf-8"), raw_body.encode("utf-8"), hashlib.sha256).hexdigest()
+
+        accepted = build_oncall_webhook_event(
+            payload,
+            raw_body=raw_body,
+            secret=secret,
+            signature=signature,
+            now="2026-05-20T03:05:00+00:00",
+            replay_window_minutes=30,
+        )
+        duplicate = build_oncall_webhook_event(
+            payload,
+            raw_body=raw_body,
+            secret=secret,
+            signature=signature,
+            seen_event_ids={"WHK-SECURE"},
+            now="2026-05-20T03:05:00+00:00",
+            replay_window_minutes=30,
+        )
+        invalid_signature = build_oncall_webhook_event(
+            payload,
+            raw_body=raw_body,
+            secret=secret,
+            signature="sha256=bad",
+            now="2026-05-20T03:05:00+00:00",
+        )
+        replay = build_oncall_webhook_event(
+            payload,
+            raw_body=raw_body,
+            secret=secret,
+            signature=signature,
+            now="2026-05-21T03:05:00+00:00",
+            replay_window_minutes=30,
+        )
+        reloaded = oncall_webhook_event_from_dict(oncall_webhook_event_to_dict(accepted))
+
+        self.assertTrue(accepted.accepted)
+        self.assertTrue(accepted.signature_valid)
+        self.assertEqual(reloaded.event_id, "WHK-SECURE")
+        self.assertTrue(duplicate.duplicate)
+        self.assertFalse(duplicate.accepted)
+        self.assertFalse(invalid_signature.signature_valid)
+        self.assertTrue(invalid_signature.dead_letter)
+        self.assertTrue(replay.replay)
+        self.assertTrue(replay.dead_letter)
+        self.assertIn("OnCall webhook event:", render_oncall_webhook_event(accepted))
+
+    def test_replays_oncall_webhook_dead_letter(self) -> None:
+        payload = {
+            "event_id": "WHK-DEAD",
+            "data": {
+                "ticket_id": "INC-DEAD",
+                "status": "CLOSED",
+                "assignee": "ops",
+                "updated_at": "2026-05-20T03:00:00+00:00",
+                "detail": "resolved after webhook replay",
+            },
+        }
+        raw_body = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        event = build_oncall_webhook_event(
+            payload,
+            raw_body=raw_body,
+            secret="webhook-secret",
+            signature="sha256=bad",
+            now="2026-05-20T03:05:00+00:00",
+        )
+
+        replayed_event, status, replay_result = replay_dead_letter_oncall_webhook_event(
+            event,
+            replayed_at="2026-05-20T03:10:00+00:00",
+        )
+        reloaded = oncall_webhook_replay_result_from_dict(oncall_webhook_replay_result_to_dict(replay_result))
+
+        self.assertEqual([item.event_id for item in list_dead_letter_oncall_webhook_events([event])], ["WHK-DEAD"])
+        self.assertEqual(replayed_event.status, "REPLAYED")
+        self.assertFalse(replayed_event.dead_letter)
+        self.assertTrue(replay_result.accepted)
+        self.assertEqual(status.ticket_id, "INC-DEAD")
+        self.assertEqual(reloaded.source_event_id, "WHK-DEAD")
+        self.assertIn("OnCall webhook replay:", render_oncall_webhook_replay_result(replay_result))
+
+    def test_batches_and_patches_oncall_webhook_dead_letter_replay(self) -> None:
+        invalid_payload = {
+            "event_id": "WHK-PATCH",
+            "data": {
+                "status": "CLOSED",
+                "assignee": "ops",
+                "updated_at": "2026-05-20T03:00:00+00:00",
+                "detail": "resolved after batch replay",
+            },
+        }
+        event = build_oncall_webhook_event(
+            invalid_payload,
+            raw_body=json.dumps(invalid_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+            now="2026-05-20T03:05:00+00:00",
+        )
+        patched = patch_oncall_webhook_event_payload(
+            event,
+            {"ticket_status": {"ticket_id": "INC-PATCH", "status": "CLOSED", "updated_at": "2026-05-20T03:00:00+00:00"}},
+            patched_at="2026-05-20T03:09:00+00:00",
+        )
+
+        replayed_events, statuses, batch = replay_dead_letter_oncall_webhook_events(
+            [patched],
+            replayed_at="2026-05-20T03:10:00+00:00",
+        )
+        serialized = oncall_webhook_replay_batch_result_to_dict(batch)
+        reloaded = oncall_webhook_replay_batch_result_from_dict(serialized)
+        job = build_oncall_webhook_replay_job(
+            [result.source_event_id for result in batch.results],
+            requested_by="ops",
+            patch_template_id="missing_ticket_status",
+            batch_result=batch,
+            created_at="2026-05-20T03:11:00+00:00",
+        )
+        reloaded_job = oncall_webhook_replay_job_from_dict(oncall_webhook_replay_job_to_dict(job))
+
+        self.assertTrue(event.dead_letter)
+        self.assertEqual(replayed_events[0].status, "REPLAYED")
+        self.assertEqual(statuses[0].ticket_id, "INC-PATCH")
+        self.assertEqual(batch.accepted, 1)
+        self.assertEqual(reloaded.batch_id, batch.batch_id)
+        self.assertEqual(reloaded_job.status, "COMPLETED")
+        self.assertEqual(reloaded_job.batch_result.batch_id, batch.batch_id)
+        self.assertIn("OnCall webhook replay batch:", render_oncall_webhook_replay_batch_result(batch))
+        self.assertIn("oncall_webhook_replay_audit", render_oncall_webhook_replay_audit_json(batch))
+        self.assertIn("OnCall webhook replay jobs:", render_oncall_webhook_replay_jobs([job]))
+        self.assertIn("oncall_webhook_replay_jobs", render_oncall_webhook_replay_jobs_json([job]))
+
+    def test_builds_oncall_webhook_ops_console_with_templates(self) -> None:
+        payload = {
+            "event_id": "WHK-CONSOLE",
+            "data": {
+                "status": "CLOSED",
+                "assignee": "ops",
+                "updated_at": "2026-05-20T03:00:00+00:00",
+                "detail": "missing ticket id",
+            },
+        }
+        event = build_oncall_webhook_event(
+            payload,
+            raw_body=json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+            now="2026-05-20T03:05:00+00:00",
+        )
+
+        console = build_oncall_webhook_ops_console([event], generated_at="2026-05-20T03:10:00+00:00")
+        rendered = render_oncall_webhook_ops_console(console)
+        json_payload = json.loads(render_oncall_webhook_ops_console_json(console))
+
+        self.assertEqual(console.dead_letters, 1)
+        self.assertEqual(console.retryable_event_ids, [event.event_id])
+        self.assertEqual(console.failure_reasons["missing_ticket_id"], 1)
+        self.assertEqual(console.patch_templates[0].template_id, "missing_ticket_status")
+        self.assertIn("OnCall webhook operations console:", rendered)
+        self.assertEqual(json_payload["oncall_webhook_ops_console"]["dead_letters"], 1)
+
+    def test_authorizes_operations_action_and_writes_audit_event(self) -> None:
+        sink = InMemoryAuditSink()
+        policy = PermissionPolicy(enabled=True, required_roles={"ops"})
+
+        allowed = authorize_operations_action(
+            "execute_replay_job",
+            user_id="ops-user",
+            permission_policy=policy,
+            department="platform",
+            roles=["ops"],
+            audit_sink=sink,
+            payload={"ticket_id": "INC-1", "phone": "13800000000"},
+        )
+        denied = authorize_operations_action(
+            "execute_replay_job",
+            user_id="viewer",
+            permission_policy=policy,
+            roles=["viewer"],
+            audit_sink=sink,
+            payload={"ticket_id": "INC-2"},
+        )
+
+        self.assertTrue(allowed.allowed)
+        self.assertEqual(allowed.audit_result.delivered, 1)
+        self.assertFalse(denied.allowed)
+        self.assertEqual(len(sink.events), 2)
+        self.assertEqual(sink.events[0].event_type, "operations.execute_replay_job")
+        self.assertEqual(sink.events[0].redacted_payload["payload"]["phone"], "***")
+        self.assertIn("Operations action authorization:", render_operations_action_authorization(allowed))
+        self.assertIn("missing required role", denied.decision.reasons[0])
+
+    def test_executes_pending_oncall_webhook_replay_job(self) -> None:
+        payload = {
+            "event_id": "WHK-JOB",
+            "data": {
+                "status": "CLOSED",
+                "updated_at": "2026-05-20T03:00:00+00:00",
+                "detail": "missing ticket id",
+            },
+        }
+        event = build_oncall_webhook_event(
+            payload,
+            raw_body=json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+            now="2026-05-20T03:05:00+00:00",
+        )
+        job = build_oncall_webhook_replay_job(
+            [event.event_id],
+            requested_by="ops",
+            patch_template_id="missing_ticket_status",
+            created_at="2026-05-20T03:06:00+00:00",
+        )
+
+        execution = execute_oncall_webhook_replay_job(
+            job,
+            [event],
+            patches={
+                event.event_id: {
+                    "ticket_status": {
+                        "ticket_id": "INC-JOB",
+                        "status": "CLOSED",
+                        "updated_at": "2026-05-20T03:00:00+00:00",
+                    }
+                }
+            },
+            executed_at="2026-05-20T03:10:00+00:00",
+        )
+
+        self.assertEqual(execution.job.status, "COMPLETED")
+        self.assertEqual(execution.result.accepted, 1)
+        self.assertEqual(execution.statuses[0].ticket_id, "INC-JOB")
+        self.assertEqual(execution.replayed_events[0].status, "REPLAYED")
+        self.assertEqual(execution.job.audit["source"], "scheduler")
+        self.assertIn("OnCall webhook replay job execution:", render_oncall_webhook_replay_job_execution(execution))
+
+    def test_runs_operations_scheduled_tasks_with_registered_handlers(self) -> None:
+        tasks = build_operations_scheduled_tasks(now="2026-05-20T03:00:00+00:00")
+        calls: list[str] = []
+
+        def _handler(task: Any) -> dict[str, Any]:
+            calls.append(task.task_type)
+            return {"task_id": task.task_id}
+
+        report = run_operations_scheduled_tasks(
+            tasks,
+            {
+                "closed_loop_quality": _handler,
+                "webhook_replay_jobs": _handler,
+            },
+            now="2026-05-20T03:05:00+00:00",
+        )
+
+        self.assertEqual(report.due_count, 5)
+        self.assertEqual(report.executed_count, 2)
+        self.assertEqual(report.failed_count, 0)
+        self.assertEqual(calls, ["closed_loop_quality", "webhook_replay_jobs"])
+        self.assertIn("Operations scheduled tasks:", render_operations_scheduled_tasks(tasks))
+        self.assertIn("Operations scheduler run:", render_operations_scheduler_run_report(report))
+
+    def test_advances_operations_scheduled_task_after_success_and_failure(self) -> None:
+        task = build_operations_scheduled_tasks(now="2026-05-20T03:00:00+00:00")[0]
+        success = run_operations_scheduled_tasks(
+            [task],
+            {"closed_loop_snapshot": lambda item: {"ok": True}},
+            now="2026-05-20T03:05:00+00:00",
+        ).results[0]
+        failed = run_operations_scheduled_tasks(
+            [task],
+            {"closed_loop_snapshot": lambda item: (_ for _ in ()).throw(RuntimeError("boom"))},
+            now="2026-05-20T03:05:00+00:00",
+        ).results[0]
+
+        advanced_success = advance_operations_scheduled_task(task, success)
+        advanced_failure = advance_operations_scheduled_task(task, failed)
+
+        self.assertEqual(advanced_success.last_status, "SUCCESS")
+        self.assertEqual(advanced_success.run_count, 1)
+        self.assertEqual(advanced_success.failure_count, 0)
+        self.assertGreater(advanced_success.next_run_at, success.finished_at)
+        self.assertEqual(advanced_failure.last_status, "FAILED")
+        self.assertEqual(advanced_failure.failure_count, 1)
+        self.assertGreater(advanced_failure.next_run_at, failed.finished_at)
+
+    def test_builds_operations_scheduler_health_alerts(self) -> None:
+        task = build_operations_scheduled_tasks(now="2026-05-20T03:00:00+00:00")[0]
+        failed_run = run_operations_scheduled_tasks(
+            [task],
+            {"closed_loop_snapshot": lambda item: (_ for _ in ()).throw(RuntimeError("boom"))},
+            now="2026-05-20T03:05:00+00:00",
+        )
+        stale_task = operations_scheduled_task_from_dict(
+            {
+                **operations_scheduled_task_to_dict(task),
+                "failure_count": 3,
+                "lease_owner": "worker-a",
+                "lease_expires_at": "2026-05-20T03:00:00+00:00",
+                "last_run_at": "2026-05-19T03:00:00+00:00",
+            }
+        )
+
+        health = build_operations_scheduler_health_report(
+            [failed_run],
+            [stale_task],
+            now="2026-05-20T04:00:00+00:00",
+            stale_lease_seconds=300,
+            stale_task_seconds=3600,
+        )
+        rendered = render_operations_scheduler_health_report(health)
+
+        self.assertEqual(health.failed_runs, 1)
+        self.assertEqual(health.stale_leases, 1)
+        self.assertTrue(any(alert["alert_type"] == "operations_scheduler_run_failed" for alert in health.alerts))
+        self.assertTrue(any(alert["alert_type"] == "operations_scheduler_stale_lease" for alert in health.alerts))
+        self.assertTrue(any(alert["alert_type"] == "operations_scheduler_task_repeated_failures" for alert in health.alerts))
+        self.assertIn("Operations scheduler health:", rendered)
+
+    def test_builds_operations_console_overview_payload(self) -> None:
+        closed_loop = build_operations_closed_loop_report(generated_at="2026-05-20T03:00:00+00:00")
+        snapshot = build_operations_closed_loop_snapshot(
+            closed_loop,
+            snapshot_id="CLP-OVERVIEW",
+            created_at="2026-05-20T03:05:00+00:00",
+            metadata={"department": "finance", "tenant": "corp-a"},
+        )
+        dashboard = build_operations_closed_loop_dashboard([snapshot], generated_at="2026-05-20T03:10:00+00:00")
+        payload = {
+            "event_id": "WHK-OVERVIEW",
+            "data": {
+                "status": "CLOSED",
+                "updated_at": "2026-05-20T03:00:00+00:00",
+            },
+        }
+        event = build_oncall_webhook_event(
+            payload,
+            raw_body=json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+            now="2026-05-20T03:05:00+00:00",
+        )
+        job = build_oncall_webhook_replay_job(
+            [event.event_id],
+            requested_by="ops",
+            patch_template_id="missing_ticket_status",
+            created_at="2026-05-20T03:06:00+00:00",
+        )
+
+        overview = build_operations_console_overview(
+            dashboard,
+            build_oncall_webhook_ops_console([event], generated_at="2026-05-20T03:10:00+00:00"),
+            [job],
+            generated_at="2026-05-20T03:11:00+00:00",
+        )
+        json_payload = json.loads(render_operations_console_overview_json(overview))
+
+        self.assertIn("closed_loop_snapshots=1", overview.summary)
+        self.assertEqual(json_payload["operations_console_overview"]["webhook_ops"]["dead_letters"], 1)
+        self.assertEqual(json_payload["operations_console_overview"]["replay_jobs"][0]["status"], "PENDING")
+
+    def test_builds_operations_console_view_with_rbac_actions(self) -> None:
+        dashboard = build_operations_closed_loop_dashboard([], generated_at="2026-05-20T03:10:00+00:00")
+        overview = build_operations_console_overview(
+            dashboard,
+            build_oncall_webhook_ops_console([], generated_at="2026-05-20T03:10:00+00:00"),
+            [],
+            generated_at="2026-05-20T03:11:00+00:00",
+        )
+        policy = PermissionPolicy(enabled=True, required_roles={"ops"})
+
+        ops_view = build_operations_console_view(
+            overview,
+            actor="ops-user",
+            roles=["ops"],
+            department="platform",
+            permission_policy=policy,
+            generated_at="2026-05-20T03:12:00+00:00",
+        )
+        viewer_view = build_operations_console_view(
+            overview,
+            actor="viewer",
+            roles=["viewer"],
+            permission_policy=policy,
+            generated_at="2026-05-20T03:12:00+00:00",
+        )
+        ops_json = json.loads(render_operations_console_view_json(ops_view))
+        ops_html = render_operations_console_view_html(ops_view)
+        viewer_html = render_operations_console_view_html(viewer_view)
+
+        self.assertFalse(ops_view.read_only)
+        self.assertIn("replay_jobs", ops_view.visible_sections)
+        self.assertTrue(all(item["allowed"] for item in ops_view.actions))
+        self.assertTrue(viewer_view.read_only)
+        self.assertEqual(viewer_view.visible_sections, [])
+        self.assertEqual(ops_json["operations_console_view"]["actor"], "ops-user")
+        self.assertIn("Operations Console", ops_html)
+        self.assertIn("Access denied", viewer_html)
+
+    def test_builds_closed_loop_dashboard_payload_and_serves_it_over_http(self) -> None:
+        closed_loop = build_operations_closed_loop_report(
+            trend_alerts=[
+                operations_trend_alert_from_dict(
+                    {
+                        "alert_id": "TREND-DASH",
+                        "metric": "critical_alerts",
+                        "severity": "critical",
+                        "route": "ops",
+                        "escalation": "page",
+                        "owner": "ops",
+                        "current": 2,
+                        "previous": 1,
+                        "delta": 1,
+                        "delta_percent": 100.0,
+                        "reason": "growth",
+                        "action_item": "Handle critical alerts",
+                    }
+                )
+            ],
+            action_items=[
+                operations_action_item_from_dict(
+                    {
+                        "action_id": "ACT-DASH",
+                        "source_type": "trend_alert",
+                        "source_id": "TREND-DASH",
+                        "title": "Handle critical alerts",
+                        "owner": "ops",
+                        "status": "OPEN",
+                        "eta": None,
+                        "created_at": "2026-05-20T00:00:00+00:00",
+                        "updated_at": "2026-05-20T00:00:00+00:00",
+                        "evidence": ["metric=critical_alerts"],
+                        "closure_note": None,
+                    }
+                )
+            ],
+            knowledge_entries=[],
+            generated_at="2026-05-20T03:00:00+00:00",
+        )
+        snapshot = build_operations_closed_loop_snapshot(
+            closed_loop,
+            snapshot_id="CLP-DASH",
+            created_at="2026-05-20T03:05:00+00:00",
+            metadata={"department": "finance", "tenant": "corp-a"},
+        )
+        dashboard = build_operations_closed_loop_dashboard([snapshot], generated_at="2026-05-20T03:10:00+00:00")
+        filtered_dashboard = build_operations_closed_loop_dashboard(
+            [snapshot],
+            generated_at="2026-05-20T03:11:00+00:00",
+            owner="ops",
+            department="finance",
+            tenant="corp-a",
+        )
+        empty_dashboard = build_operations_closed_loop_dashboard(
+            [snapshot],
+            generated_at="2026-05-20T03:12:00+00:00",
+            department="sales",
+        )
+        dashboard_json = render_operations_closed_loop_dashboard_json(dashboard)
+        serialized = operations_closed_loop_dashboard_to_dict(dashboard)
+
+        store = InMemorySessionStore()
+        store.record_operations_closed_loop_snapshot(operations_closed_loop_snapshot_to_dict(snapshot))
+        dead_letter_payload = {
+            "event_id": "WHK-HTTP-CONSOLE",
+            "data": {
+                "status": "CLOSED",
+                "updated_at": "2026-05-20T03:00:00+00:00",
+            },
+        }
+        dead_letter_event = build_oncall_webhook_event(
+            dead_letter_payload,
+            raw_body=json.dumps(dead_letter_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+            now="2026-05-20T03:05:00+00:00",
+        )
+        store.record_oncall_webhook_event(oncall_webhook_event_to_dict(dead_letter_event))
+        replay_job = build_oncall_webhook_replay_job(
+            [dead_letter_event.event_id],
+            requested_by="ops",
+            patch_template_id="missing_ticket_status",
+            created_at="2026-05-20T03:06:00+00:00",
+        )
+        store.record_oncall_webhook_replay_job(oncall_webhook_replay_job_to_dict(replay_job))
+        server = create_operations_dashboard_server(store, port=0, limit=10, token="dash-token")
+        thread = run_metrics_server_in_thread(server)
+        host, port = server.server_address
+        try:
+            with self.assertRaises(HTTPError) as raised:
+                urlopen(f"http://{host}:{port}/operations/closed-loop", timeout=5)
+            self.assertEqual(raised.exception.code, 401)
+            request = Request(
+                f"http://{host}:{port}/operations/closed-loop?owner=ops&department=finance&tenant=corp-a",
+                headers={"Authorization": "Bearer dash-token"},
+            )
+            with urlopen(request, timeout=5) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            snapshots_request = Request(
+                f"http://{host}:{port}/operations/closed-loop/snapshots?owner=ops",
+                headers={"Authorization": "Bearer dash-token"},
+            )
+            with urlopen(snapshots_request, timeout=5) as response:
+                snapshots_payload = json.loads(response.read().decode("utf-8"))
+            webhook_ops_request = Request(
+                f"http://{host}:{port}/operations/oncall-webhook-ops",
+                headers={"X-Operations-Dashboard-Token": "dash-token"},
+            )
+            with urlopen(webhook_ops_request, timeout=5) as response:
+                webhook_ops_payload = json.loads(response.read().decode("utf-8"))
+            replay_jobs_request = Request(
+                f"http://{host}:{port}/operations/oncall-webhook-replay-jobs",
+                headers={"X-Operations-Dashboard-Token": "dash-token"},
+            )
+            with urlopen(replay_jobs_request, timeout=5) as response:
+                replay_jobs_payload = json.loads(response.read().decode("utf-8"))
+            console_request = Request(
+                f"http://{host}:{port}/operations/console?limit=10",
+                headers={"Authorization": "Bearer dash-token"},
+            )
+            with urlopen(console_request, timeout=5) as response:
+                console_payload = json.loads(response.read().decode("utf-8"))
+            console_view_request = Request(
+                f"http://{host}:{port}/operations/console/view?limit=10",
+                headers={
+                    "Authorization": "Bearer dash-token",
+                    "X-Operations-Actor": "ops-user",
+                    "X-Operations-Roles": "ops",
+                    "X-Operations-Department": "platform",
+                },
+            )
+            with urlopen(console_view_request, timeout=5) as response:
+                console_view_payload = json.loads(response.read().decode("utf-8"))
+            console_ui_request = Request(
+                f"http://{host}:{port}/operations/console/ui?limit=10",
+                headers={
+                    "Authorization": "Bearer dash-token",
+                    "X-Operations-Actor": "ops-user",
+                    "X-Operations-Roles": "ops",
+                },
+            )
+            with urlopen(console_ui_request, timeout=5) as response:
+                console_ui = response.read().decode("utf-8")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+        self.assertEqual(serialized["schema_version"], "travel.operations.closed_loop.v1")
+        self.assertEqual(dashboard.snapshot_count, 1)
+        self.assertEqual(filtered_dashboard.filters["owner"], "ops")
+        self.assertEqual(filtered_dashboard.filters["department"], "finance")
+        self.assertEqual(filtered_dashboard.filters["tenant"], "corp-a")
+        self.assertEqual(empty_dashboard.snapshot_count, 0)
+        self.assertEqual(serialized["latest_snapshot"]["metadata"]["tenant"], "corp-a")
+        self.assertEqual(serialized["checkpoint"], "2026-05-20T03:05:00+00:00")
+        self.assertIn("closed_loop_dashboard", dashboard_json)
+        self.assertEqual(payload["closed_loop_dashboard"]["snapshot_count"], 1)
+        self.assertEqual(payload["closed_loop_dashboard"]["filters"]["owner"], "ops")
+        self.assertEqual(payload["closed_loop_dashboard"]["filters"]["department"], "finance")
+        self.assertEqual(payload["closed_loop_dashboard"]["filters"]["tenant"], "corp-a")
+        self.assertEqual(snapshots_payload["closed_loop_dashboard"]["latest_snapshot"]["snapshot_id"], "CLP-DASH")
+        self.assertEqual(webhook_ops_payload["oncall_webhook_ops_console"]["dead_letters"], 1)
+        self.assertEqual(replay_jobs_payload["oncall_webhook_replay_jobs"][0]["job_id"], replay_job.job_id)
+        self.assertEqual(console_payload["operations_console_overview"]["webhook_ops"]["dead_letters"], 1)
+        self.assertEqual(console_payload["operations_console_overview"]["replay_jobs"][0]["job_id"], replay_job.job_id)
+        self.assertIn("closed_loop_snapshots=1", console_payload["operations_console_overview"]["summary"])
+        self.assertEqual(console_view_payload["operations_console_view"]["actor"], "ops-user")
+        self.assertIn("replay_jobs", console_view_payload["operations_console_view"]["visible_sections"])
+        self.assertIn("Operations Console", console_ui)
+        self.assertIn("Replay Jobs", console_ui)
+        self.assertIn("oncall_webhook_ops_console", build_oncall_webhook_ops_console_json(store))
+        self.assertIn("oncall_webhook_replay_jobs", build_oncall_webhook_replay_jobs_json(store))
+        self.assertIn("operations_console_overview", build_operations_console_overview_json(store))
+        self.assertIn("operations_console_view", build_operations_console_view_json(store, actor="ops-user", roles=["ops"]))
+        self.assertIn("Operations Console", build_operations_console_view_html(store, actor="ops-user", roles=["ops"]))
+
+    def test_closed_loop_dashboard_supports_cursor_pagination(self) -> None:
+        report = build_operations_closed_loop_report(generated_at="2026-05-20T03:00:00+00:00")
+        newest = build_operations_closed_loop_snapshot(
+            report,
+            snapshot_id="CLP-NEW",
+            created_at="2026-05-20T03:10:00+00:00",
+        )
+        older = build_operations_closed_loop_snapshot(
+            report,
+            snapshot_id="CLP-OLD",
+            created_at="2026-05-20T03:00:00+00:00",
+        )
+
+        first_page = build_operations_closed_loop_dashboard(
+            [older, newest],
+            generated_at="2026-05-20T03:11:00+00:00",
+            limit=1,
+        )
+        second_page = build_operations_closed_loop_dashboard(
+            [older, newest],
+            generated_at="2026-05-20T03:12:00+00:00",
+            limit=1,
+            cursor=first_page.next_cursor,
+        )
+        serialized = operations_closed_loop_dashboard_to_dict(first_page)
+        checkpoint_page = build_operations_closed_loop_dashboard(
+            [older, newest],
+            generated_at="2026-05-20T03:13:00+00:00",
+            limit=1,
+            checkpoint=first_page.checkpoint,
+        )
+        store = InMemorySessionStore()
+        store.record_operations_closed_loop_snapshot(operations_closed_loop_snapshot_to_dict(older))
+        store.record_operations_closed_loop_snapshot(operations_closed_loop_snapshot_to_dict(newest))
+        helper_payload = json.loads(build_operations_closed_loop_dashboard_json(store, limit=1))
+        helper_next_payload = json.loads(
+            build_operations_closed_loop_dashboard_json(
+                store,
+                limit=1,
+                cursor=helper_payload["closed_loop_dashboard"]["next_cursor"],
+            )
+        )
+
+        self.assertEqual(first_page.snapshot_count, 1)
+        self.assertTrue(first_page.has_more)
+        self.assertEqual(first_page.next_cursor, "2026-05-20T03:10:00+00:00")
+        self.assertEqual(second_page.snapshots[0].snapshot_id, "CLP-OLD")
+        self.assertEqual(first_page.checkpoint, "2026-05-20T03:10:00+00:00")
+        self.assertEqual(checkpoint_page.snapshots[0].snapshot_id, "CLP-OLD")
+        self.assertEqual(serialized["limit"], 1)
+        self.assertTrue(serialized["has_more"])
+        self.assertEqual(serialized["next_cursor"], "2026-05-20T03:10:00+00:00")
+        self.assertEqual(serialized["checkpoint"], "2026-05-20T03:10:00+00:00")
+        self.assertEqual(helper_payload["closed_loop_dashboard"]["limit"], 1)
+        self.assertEqual(
+            helper_next_payload["closed_loop_dashboard"]["latest_snapshot"]["snapshot_id"],
+            "CLP-OLD",
+        )
+
+    def test_closed_loop_contract_schema_openapi_and_validation(self) -> None:
+        report = build_operations_closed_loop_report(generated_at="2026-05-20T03:00:00+00:00")
+        snapshot = build_operations_closed_loop_snapshot(
+            report,
+            snapshot_id="CLP-CONTRACT",
+            created_at="2026-05-20T03:10:00+00:00",
+            metadata={"department": "finance", "tenant": "corp-a"},
+        )
+        dashboard = build_operations_closed_loop_dashboard(
+            [snapshot],
+            generated_at="2026-05-20T03:11:00+00:00",
+            department="finance",
+            tenant="corp-a",
+        )
+
+        schema = build_operations_closed_loop_json_schema()
+        openapi = build_operations_closed_loop_openapi_spec("https://ops.example")
+        validation = validate_operations_closed_loop_dashboard_contract(dashboard)
+        schema_http = CapturingAnyHttpClient({"https://schema.example/registry": {"ok": True, "accepted": 1}})
+        publish = publish_operations_closed_loop_schema_http(
+            "https://schema.example/registry",
+            token="schema-token",
+            http_client=schema_http,
+            server_url="https://ops.example",
+        )
+        quality = evaluate_operations_closed_loop_quality(dashboard, generated_at="2026-05-20T03:12:00+00:00")
+        checkpoint = build_operations_closed_loop_checkpoint_plan(
+            dashboard,
+            generated_at="2026-05-20T03:13:00+00:00",
+        )
+        acceptance = build_operations_closed_loop_acceptance_report(
+            dashboard,
+            generated_at="2026-05-20T03:14:00+00:00",
+        )
+
+        self.assertEqual(schema["properties"]["closed_loop_dashboard"]["properties"]["schema_version"]["const"], "travel.operations.closed_loop.v1")
+        self.assertEqual(openapi["servers"][0]["url"], "https://ops.example")
+        self.assertTrue(validation["ok"])
+        self.assertTrue(publish.ok)
+        self.assertEqual(schema_http.calls[0][2], "schema-token")
+        self.assertEqual(schema_http.calls[0][1]["schema_version"], "travel.operations.closed_loop.v1")
+        self.assertTrue(quality.ok)
+        self.assertTrue(checkpoint.ready)
+        self.assertEqual(checkpoint.next_checkpoint, "2026-05-20T03:10:00+00:00")
+        self.assertTrue(acceptance.ok)
+        self.assertIn("travel.operations.closed_loop.v1", render_operations_closed_loop_json_schema())
+        self.assertIn("/operations/closed-loop", render_operations_closed_loop_openapi_spec("https://ops.example"))
+        self.assertIn("Operations closed-loop contract validation:", render_operations_closed_loop_contract_validation(validation))
+        self.assertIn("Operations closed-loop schema publish:", render_operations_closed_loop_schema_publish_result(publish))
+        self.assertIn("Operations closed-loop quality:", render_operations_closed_loop_quality_report(quality))
+        self.assertIn("Operations closed-loop checkpoint plan:", render_operations_closed_loop_checkpoint_plan(checkpoint))
+        self.assertIn("Operations closed-loop acceptance:", render_operations_closed_loop_acceptance_report(acceptance))
 
 
 class PermissionPolicyTest(unittest.TestCase):
@@ -2950,15 +4391,35 @@ class CapturingAnyHttpClient:
         return self.responses[url]
 
 
+class FailingHttpClient:
+    def post_json(self, url: str, payload: dict[str, Any], token: str | None = None) -> dict[str, Any]:
+        del url, payload, token
+        raise RuntimeError("remote config unavailable")
+
+
+def _test_add_seconds(value: str, seconds: int) -> str:
+    from datetime import datetime, timezone
+
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return datetime.fromtimestamp(parsed.timestamp() + seconds, timezone.utc).isoformat()
+
+
 class FakeSessionStoreHttpClient:
     def __init__(self) -> None:
         self.sessions: dict[str, dict[str, Any]] = {}
         self.worker_runs: list[dict[str, Any]] = []
         self.dashboard_snapshots: list[dict[str, Any]] = []
+        self.closed_loop_snapshots: list[dict[str, Any]] = []
         self.oncall_statuses: list[dict[str, Any]] = []
+        self.oncall_webhook_events: list[dict[str, Any]] = []
+        self.oncall_webhook_replay_jobs: list[dict[str, Any]] = []
         self.trend_alerts: list[dict[str, Any]] = []
         self.action_items: list[dict[str, Any]] = []
         self.knowledge_entries: list[dict[str, Any]] = []
+        self.scheduled_tasks: list[dict[str, Any]] = []
+        self.scheduler_runs: list[dict[str, Any]] = []
         self.calls: list[tuple[str, dict[str, Any], str | None]] = []
 
     def post_json(self, url: str, payload: dict[str, Any], token: str | None = None) -> dict[str, Any]:
@@ -3002,11 +4463,41 @@ class FakeSessionStoreHttpClient:
             return {"ok": True}
         if path == "/operations/dashboard-snapshots/list":
             return {"snapshots": list(reversed(self.dashboard_snapshots))[0 : int(payload["limit"])]}
+        if path == "/operations/closed-loop-snapshots/record":
+            self.closed_loop_snapshots = [
+                snapshot
+                for snapshot in self.closed_loop_snapshots
+                if snapshot.get("snapshot_id") != payload["snapshot"].get("snapshot_id")
+            ]
+            self.closed_loop_snapshots.append(dict(payload["snapshot"]))
+            return {"ok": True}
+        if path == "/operations/closed-loop-snapshots/list":
+            return {"snapshots": list(reversed(self.closed_loop_snapshots))[0 : int(payload["limit"])]}
         if path == "/operations/oncall-statuses/record":
             self.oncall_statuses.append(dict(payload["status"]))
             return {"ok": True}
         if path == "/operations/oncall-statuses/list":
             return {"statuses": list(reversed(self.oncall_statuses))[0 : int(payload["limit"])]}
+        if path == "/operations/oncall-webhooks/record":
+            self.oncall_webhook_events = [
+                event
+                for event in self.oncall_webhook_events
+                if event.get("event_id") != payload["event"].get("event_id")
+            ]
+            self.oncall_webhook_events.append(dict(payload["event"]))
+            return {"ok": True}
+        if path == "/operations/oncall-webhooks/list":
+            return {"events": list(reversed(self.oncall_webhook_events))[0 : int(payload["limit"])]}
+        if path == "/operations/oncall-webhook-replay-jobs/record":
+            self.oncall_webhook_replay_jobs = [
+                job
+                for job in self.oncall_webhook_replay_jobs
+                if job.get("job_id") != payload["job"].get("job_id")
+            ]
+            self.oncall_webhook_replay_jobs.append(dict(payload["job"]))
+            return {"ok": True}
+        if path == "/operations/oncall-webhook-replay-jobs/list":
+            return {"jobs": list(reversed(self.oncall_webhook_replay_jobs))[0 : int(payload["limit"])]}
         if path == "/operations/trend-alerts/record":
             self.trend_alerts.append(dict(payload["alert"]))
             return {"ok": True}
@@ -3025,20 +4516,65 @@ class FakeSessionStoreHttpClient:
             return {"ok": True}
         if path == "/operations/knowledge/list":
             return {"entries": list(reversed(self.knowledge_entries))[0 : int(payload["limit"])]}
+        if path == "/operations/scheduled-tasks/record":
+            self.scheduled_tasks = [
+                task for task in self.scheduled_tasks if task.get("task_id") != payload["task"].get("task_id")
+            ]
+            self.scheduled_tasks.append(dict(payload["task"]))
+            return {"ok": True}
+        if path == "/operations/scheduled-tasks/list":
+            return {"tasks": sorted(self.scheduled_tasks, key=lambda task: task.get("next_run_at", ""))[0 : int(payload["limit"])]}
+        if path == "/operations/scheduled-tasks/claim-due":
+            owner = str(payload["owner"])
+            now = str(payload["now"])
+            lease_seconds = int(payload["lease_seconds"])
+            lease_expires_at = _test_add_seconds(now, lease_seconds)
+            claimed = []
+            for task in sorted(self.scheduled_tasks, key=lambda item: item.get("next_run_at", "")):
+                if len(claimed) >= int(payload["limit"]):
+                    break
+                if not task.get("enabled", True) or str(task.get("next_run_at") or "") > now:
+                    continue
+                lease_owner = str(task.get("lease_owner") or "")
+                lease_expires = str(task.get("lease_expires_at") or "")
+                if lease_owner and lease_expires > now:
+                    continue
+                task.update({"lease_owner": owner, "lease_expires_at": lease_expires_at})
+                claimed.append(dict(task))
+            return {"tasks": claimed}
+        if path == "/operations/scheduled-tasks/complete":
+            self.scheduled_tasks = [
+                task for task in self.scheduled_tasks if task.get("task_id") != payload["task"].get("task_id")
+            ]
+            self.scheduled_tasks.append(dict(payload["task"]))
+            return {"ok": True}
+        if path == "/operations/scheduler-runs/record":
+            self.scheduler_runs = [
+                run for run in self.scheduler_runs if run.get("run_id") != payload["run"].get("run_id")
+            ]
+            self.scheduler_runs.append(dict(payload["run"]))
+            return {"ok": True}
+        if path == "/operations/scheduler-runs/list":
+            return {"runs": list(reversed(self.scheduler_runs))[0 : int(payload["limit"])]}
         if path == "/health":
             return {
                 "backend": "http-json",
                 "ok": True,
-                "schema_version": 4,
+                "schema_version": 8,
                 "session_count": len(self.sessions),
                 "worker_run_count": len(self.worker_runs),
                 "details": {
                     "contract": "session-store-v1",
                     "dashboard_snapshots": str(len(self.dashboard_snapshots)),
+                    "closed_loop_snapshots": str(len(self.closed_loop_snapshots)),
                     "oncall_ticket_statuses": str(len(self.oncall_statuses)),
+                    "oncall_webhook_events": str(len(self.oncall_webhook_events)),
+                    "oncall_webhook_replay_jobs": str(len(self.oncall_webhook_replay_jobs)),
                     "operations_trend_alerts": str(len(self.trend_alerts)),
                     "operations_action_items": str(len(self.action_items)),
                     "operations_knowledge_entries": str(len(self.knowledge_entries)),
+                    "operations_scheduled_tasks": str(len(self.scheduled_tasks)),
+                    "operations_scheduler_runs": str(len(self.scheduler_runs)),
                 },
             }
         raise AssertionError(f"Unexpected HTTP store URL: {url}")

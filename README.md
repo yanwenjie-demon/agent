@@ -42,6 +42,17 @@
 - 运营闭环沉淀：支持趋势阈值告警、复盘/趋势行动项持久化、行动项关闭和运营知识库条目沉淀
 - 运营闭环增强：支持运营知识检索、行动项 SLA/升级评估和运营闭环报表
 - 运营闭环外联：支持将运营知识检索接入 Agent 规划、行动项 SLA 自动通知，以及闭环报表 summary/JSON/Prometheus/HTTP sink 导出
+- 运营闭环深化：支持异常恢复时自动引用运营知识、按 OnCall/工单状态关闭行动项，并持久化闭环报表 snapshot 供定时导出和看板消费
+- 运营闭环服务化：异常恢复会记录 `RecoveryStrategyAgent` 自动策略决策和策略 gate，OnCall webhook 支持事件验签、幂等、回放窗口和死信记录，闭环 snapshot 可通过带 token 的 HTTP `/operations/closed-loop` 按 owner 查询
+- 运营闭环自动恢复：`execute_recovery_strategy()` 可执行 gate 通过的恢复策略，支持状态刷新、知识重规划、补偿后重规划和审批 override，worker 可通过 `--worker-auto-recover` 显式开启异常状态自动恢复
+- Webhook 死信重放与闭环看板增量视图：支持查询/重放 OnCall webhook dead-letter、重放后同步工单状态和行动项关闭，并支持闭环看板 cursor、limit、since、owner 过滤和 `next_cursor`
+- 自动恢复治理、Webhook 批处理与 BI 契约深化：恢复执行支持 idempotency key、审批回执、worker 灰度和恢复指标；Webhook dead-letter 支持 payload patch、批量重放和审计 JSON；闭环看板支持部门/租户 metadata 过滤和 checkpoint
+- 恢复治理外部化、Webhook 运营控制台与 BI 契约发布：支持恢复策略白名单/黑名单/限流、审批回执外发和恢复失败开 OnCall 工单，Webhook ops console 可汇总死信原因和 patch 模板，闭环看板可输出 JSON Schema、OpenAPI、兼容矩阵和契约校验
+- 治理策略中心化、Webhook 控制台服务化与 BI 发布自动化：支持从远端配置中心拉取恢复治理策略、审批回执 SLA/审批人校验和策略变更审计；`--serve-operations-dashboard` 暴露 OnCall webhook ops/replay job 只读接口并复用 token 鉴权；闭环 BI 支持 schema registry 发布、数据质量校验、checkpoint 计划和消费验收报告
+- 运维调度、权限审计与控制台聚合：支持默认 operations schedule plan、周期执行闭环 snapshot/checkpoint/质量/SLA/replay job 任务、pending replay job 执行器、运维动作权限 + 脱敏审计，以及 `/operations/console` 聚合 API
+- 持久化运维调度与租约锁：支持 `--init-operations-schedule`、`--list-operations-schedule`、`--run-persisted-operations-schedule`，可将 schedule plan 落库到内存、SQLite 或 HTTP store，通过 `lease_owner`/`lease_expires_at` claim due task，并在执行后推进 `next_run_at`、`run_count`、`failure_count` 和失败重试时间
+- 调度运行历史与健康告警：scheduler run report 会落库到内存、SQLite 或 HTTP store，`--operations-scheduler-health` 可聚合 run history 和 scheduled task，识别失败 run、过期租约、长期未运行任务和连续失败任务
+- Web 控制台与 RBAC 视图：`--serve-operations-dashboard` 新增 `/operations/console/view` 和 `/operations/console/ui`，可按 `X-Operations-Actor`、`X-Operations-Roles`、`X-Operations-Department` 构建 RBAC-aware 控制台视图，展示可见 sections、可执行 actions、权限状态和只读 HTML 页面
 - 内存会话状态和确定性工作流状态机
 
 架构说明见 [docs/travel-agent-architecture.md](docs/travel-agent-architecture.md)。
@@ -135,6 +146,7 @@ python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --sync-cal
 ```powershell
 $env:PYTHONPATH = "src"
 python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --run-worker-once --worker-limit 50
+python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --run-worker-once --worker-auto-recover --worker-recovery-approval-override --worker-limit 50
 ```
 
 运行多轮 worker loop：
@@ -151,6 +163,7 @@ worker 会自动处理：
 - `ORDER_CREATED` / `COMPLETED`：刷新订单状态。
 
 worker 不会自动接受价格变化；`PRICE_CHANGED` 必须由用户或策略显式确认。
+`--worker-auto-recover` 默认关闭；开启后会扫描 `APPROVAL_REJECTED`、`PRICE_CHANGED`、`INVENTORY_EXPIRED`、`ORDER_FAILED` 等异常状态，并通过恢复策略 gate 执行状态刷新、重规划或补偿后重规划。涉及 critical/补偿路径时仍会被 gate 阻断，除非显式传入 `--worker-recovery-approval-override`。
 
 查看最近 worker 运行历史：
 
@@ -537,12 +550,43 @@ python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --operatio
 python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --operations-closed-loop-report
 python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --operations-closed-loop-report --operations-closed-loop-format json
 python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --operations-closed-loop-report --operations-closed-loop-format prometheus
+python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --operations-recovery-metrics --operations-recovery-metrics-format prometheus
+python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --export-recovery-approval-receipts --recovery-approval-endpoint "https://audit.example.com/recovery-approvals"
+python -m travel_agent.cli --fetch-recovery-governance-policy --recovery-governance-policy-endpoint "https://config.example.com/recovery-governance"
+python -m travel_agent.cli --fetch-recovery-governance-policy --audit-recovery-governance-policy --recovery-governance-policy-endpoint "https://config.example.com/recovery-governance"
+python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --recovery-approval-sla --recovery-approval-sla-policy-json '{"max_pending_hours":12,"allowed_approvers":["ops-lead"]}'
+python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --operations-closed-loop-report --save-operations-closed-loop --closed-loop-snapshot-department finance --closed-loop-snapshot-tenant corp-a
+python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --list-operations-closed-loop-snapshots
+python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --operations-closed-loop-dashboard --closed-loop-dashboard-limit 10 --closed-loop-dashboard-owner ops
+python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --operations-closed-loop-dashboard --closed-loop-dashboard-cursor "2026-05-20T03:10:00+00:00" --closed-loop-dashboard-department finance --closed-loop-dashboard-tenant corp-a
+python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --operations-closed-loop-dashboard --closed-loop-dashboard-checkpoint "2026-05-20T03:10:00+00:00"
+python -m travel_agent.cli --operations-closed-loop-contract schema
+python -m travel_agent.cli --operations-closed-loop-contract openapi --closed-loop-contract-server-url "https://ops.example.com"
+python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --operations-closed-loop-contract validate --closed-loop-dashboard-department finance --closed-loop-dashboard-tenant corp-a
+python -m travel_agent.cli --publish-operations-closed-loop-contract --closed-loop-schema-registry-endpoint "https://schema.example.com/registry"
+python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --operations-closed-loop-quality
+python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --operations-closed-loop-checkpoint-plan
+python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --operations-closed-loop-acceptance
 python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --operations-closed-loop-report --export-operations-closed-loop --closed-loop-endpoint "https://bi.example.com/travel/closed-loop"
+python -m travel_agent.cli --operations-authorize-action view_operations_console --operations-actor ops --operations-actor-role ops
+python -m travel_agent.cli --operations-schedule-plan
+python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --init-operations-schedule
+python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --list-operations-schedule
+python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --run-operations-schedule --operations-actor ops --operations-actor-role ops
+python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --run-persisted-operations-schedule --operations-scheduler-owner worker-a --operations-scheduler-lease-seconds 300
+python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --operations-scheduler-health
+python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --execute-oncall-webhook-replay-jobs --operations-actor ops --operations-actor-role ops
+python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --operations-console-overview
+python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --serve-operations-dashboard --operations-dashboard-host 127.0.0.1 --operations-dashboard-port 9110 --operations-dashboard-token "read-token"
 ```
 
 `TRAVEL_TREND_ALERT_RULES_JSON` 可覆盖默认趋势阈值规则，格式为 `{"rules":[{"metric":"critical_alerts","severity":"critical","route":"ops","owner":"ops","delta_threshold":1}]}`。
 `TRAVEL_ACTION_SLA_POLICY_JSON` 可覆盖行动项 SLA 阈值和 owner 路由，格式为 `{"warning_after_hours":12,"critical_after_hours":24,"owner_routes":{"platform-oncall":"incident-oncall"}}`。
-`TRAVEL_CLOSED_LOOP_API_URL` / `TRAVEL_CLOSED_LOOP_API_TOKEN` 可配置闭环报表 HTTP sink。持久化知识库存在命中时，`TravelAgent.plan()` 会自动将知识条目和推荐动作写入任务计划，CLI 输出中会展示“规划知识”。
+`TRAVEL_CLOSED_LOOP_API_URL` / `TRAVEL_CLOSED_LOOP_API_TOKEN` 可配置闭环报表 HTTP sink。持久化知识库存在命中时，`TravelAgent.plan()` 会自动将知识条目和推荐动作写入任务计划，CLI 输出中会展示“规划知识”；`replan_after_exception()` 会将恢复策略决策和策略 gate 写入 `RecoveryRecord.payload`，`execute_recovery_strategy()` 会额外写入 `strategy_execution` 执行结果，包含 `idempotency_key` 和可选 `approval_receipt`。
+`TRAVEL_RECOVERY_APPROVAL_API_URL` / `TRAVEL_RECOVERY_APPROVAL_API_TOKEN` 可配置恢复审批回执外发端点；`TRAVEL_RECOVERY_GOVERNANCE_POLICY_JSON` 可配置本地恢复策略治理规则，`TRAVEL_RECOVERY_GOVERNANCE_POLICY_API_URL` / `TRAVEL_RECOVERY_GOVERNANCE_POLICY_API_TOKEN` 可配置远端配置中心，例如 `{"allowed_actions":["retry_status_refresh","replan"],"max_executions_per_session":2}`。`--recovery-approval-sla` 可评估审批回执超时和审批人 allowlist/prefix，`--audit-recovery-governance-policy` 可输出策略变更审计。`--open-recovery-failure-ticket-session` 会把最近一次失败/阻断的恢复执行作为 OnCall payload 推送。
+`TRAVEL_CLOSED_LOOP_SCHEMA_REGISTRY_URL` / `TRAVEL_CLOSED_LOOP_SCHEMA_REGISTRY_API_TOKEN` 可配置闭环 schema registry。`--publish-operations-closed-loop-contract` 会发布 JSON Schema、OpenAPI 和兼容矩阵，`--operations-closed-loop-quality`、`--operations-closed-loop-checkpoint-plan` 和 `--operations-closed-loop-acceptance` 可用于 BI 契约 CI 或外部消费验收。
+`--operations-authorize-action` 会按 `--operations-actor`、`--operations-actor-role` 和 `--operations-actor-department` 执行运维动作权限决策，并在配置 `TRAVEL_AUDIT_LOG_API_URL` 后写入脱敏审计。`--operations-schedule-plan` 输出默认周期任务，`--run-operations-schedule` 执行一次内存态 due tasks；`--init-operations-schedule` 会将默认 schedule plan 落库，`--run-persisted-operations-schedule` 会按 `--operations-scheduler-owner` claim due tasks，执行成功或失败后释放租约并推进下次运行/重试时间，同时记录 scheduler run history；`--operations-scheduler-health` 会输出失败 run、过期租约、长期未运行任务和连续失败任务告警。`--execute-oncall-webhook-replay-jobs` 可单独执行 pending replay job 并写回事件、工单状态和 job 结果。
+`--serve-operations-dashboard` 会暴露 `/health`、`/metrics`、`/operations/closed-loop`、`/operations/closed-loop/snapshots`、`/operations/oncall-webhook-ops`、`/operations/oncall-webhook-replay-jobs`、`/operations/console`、`/operations/console/view` 和 `/operations/console/ui`，闭环看板 JSON 中包含 `travel.operations.closed_loop.v1` schema 版本、最新 snapshot、趋势指标、过滤条件、摘要、`limit`、`cursor`、`next_cursor`、`checkpoint` 和 `has_more`；`/operations/console` 聚合 closed-loop dashboard、webhook ops、replay job、质量门禁和验收摘要；`/operations/console/view` 和 `/operations/console/ui` 会读取 `X-Operations-Actor`、`X-Operations-Roles`、`X-Operations-Department` 生成 RBAC-aware JSON/HTML 控制台。可通过 `--operations-dashboard-token` 或 `TRAVEL_OPERATIONS_DASHBOARD_TOKEN` 开启只读 token，并用 `?owner=<owner>&since=<iso>&cursor=<iso>&department=<department>&tenant=<tenant>&checkpoint=<iso>&limit=10` 进行增量分页查询。
 
 输出告警路由、升级和静默规则模板：
 
@@ -573,7 +617,17 @@ python -m travel_agent.cli --open-oncall-ticket
 $env:TRAVEL_ONCALL_STATUS_API_URL = "https://oncall.example.com/api/ticket-status"
 $env:PYTHONPATH = "src"
 python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --sync-oncall-ticket "INC-1"
+python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --sync-action-items-from-oncall
 python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --list-oncall-ticket-statuses
+python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --record-oncall-webhook-json '{"data":{"ticket_id":"INC-1","status":"CLOSED","assignee":"ops","updated_at":"2026-05-21T10:00:00+08:00","detail":"resolved by webhook"}}' --sync-action-items-from-webhook
+python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --record-oncall-webhook-file ".\webhook-payload.json" --oncall-webhook-signature "sha256=<digest>" --oncall-webhook-secret "secret" --sync-action-items-from-webhook
+python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --list-oncall-webhook-events
+python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --list-oncall-webhook-dead-letters
+python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --oncall-webhook-ops-console --oncall-webhook-ops-format json
+python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --create-oncall-webhook-replay-job --oncall-webhook-replay-requested-by ops
+python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --replay-oncall-webhook-event "WHK-1" --sync-action-items-from-webhook
+python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --replay-oncall-webhook-dead-letters --oncall-webhook-replay-limit 20 --oncall-webhook-patch-file ".\webhook-patch.json" --sync-action-items-from-webhook --oncall-webhook-replay-audit-json --persist-oncall-webhook-replay-job
+python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --list-oncall-webhook-replay-jobs --oncall-webhook-replay-jobs-format json
 ```
 
 ## 存储健康检查
@@ -587,6 +641,6 @@ python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --storage-
 
 ## 下一阶段建议
 
-- 知识驱动异常恢复深化：将历史复盘和处置知识进一步接入价格变化、库存失效、审批驳回和订单失败的恢复策略选择。
-- SLA 回执与工单闭环：同步通知、OnCall 和企业工单状态，形成提醒、认领、处理、关闭的可追踪链路。
-- 闭环指标定时化和看板接入：沉淀 BI schema、定时导出任务和运营看板消费契约。
+- 审计回放、补偿任务生命周期与告警联动：把运维审计事件、replay job、恢复补偿任务和告警行动项打通，形成可追踪的创建、审批、执行、失败升级和关闭链路。
+- 控制台操作审计与策略变更审批：将 RBAC、治理策略和调度配置变更纳入双人复核、版本 diff、回滚和变更审计。
+- 控制台交互动作落地：将 replay job 创建/执行、scheduler 手动触发和 BI contract 发布从只读视图推进为受 RBAC 与审计保护的 POST 操作。

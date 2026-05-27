@@ -2,50 +2,93 @@ from __future__ import annotations
 
 import argparse
 import json
-from datetime import date
+from datetime import date, datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from threading import Thread
 from typing import Callable
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from .agent import build_default_agent
 from .acceptance import render_integration_acceptance_report, run_integration_acceptance_report
 from .config import IntegrationSettings
+from .data_governance import build_audit_sink
 from .evaluation import render_evaluation_report, run_evaluation_suite
 from .governance import render_release_readiness_report, run_release_readiness_report
 from .models import DeadLetterCalendarSync, DeadLetterNotification, TravelContext, TravelRequest, WorkerRunRecord
 from .observability import build_otlp_payloads, export_otlp_http
 from .operations import (
+    OnCallWebhookReplayBatchResult,
+    advance_operations_scheduled_task,
+    authorize_operations_action,
     build_alert_route_rules,
     build_operations_dashboard,
     build_operations_dashboard_snapshot,
     build_operations_dashboard_trend_report,
     build_operations_action_sla_policy,
     build_operations_closed_loop_report,
+    build_operations_closed_loop_snapshot,
+    build_operations_closed_loop_dashboard,
+    build_operations_closed_loop_acceptance_report,
+    build_operations_closed_loop_checkpoint_plan,
+    build_operations_closed_loop_contract_matrix,
+    build_operations_closed_loop_json_schema,
+    build_operations_closed_loop_openapi_spec,
     build_operations_knowledge_entries,
+    build_operations_scheduled_tasks,
+    build_operations_scheduler_health_report,
+    build_operations_console_overview,
+    build_operations_console_view,
     build_operations_multidimensional_view,
     build_operations_postmortem_report,
     build_operations_trend_alert_rules,
+    build_oncall_webhook_event,
+    build_recovery_strategy_metrics,
+    collect_recovery_approval_receipts,
     build_postmortem_action_items,
     build_trend_alert_action_items,
     close_operations_action_item,
     evaluate_operations_action_sla,
+    evaluate_operations_closed_loop_quality,
     evaluate_operations_drill_gate,
     evaluate_operations_trend_alerts,
+    evaluate_recovery_approval_sla,
+    execute_oncall_webhook_replay_job,
+    export_recovery_approval_receipt_http,
     export_operations_closed_loop_report_http,
     export_operations_alerts_http,
+    fetch_recovery_governance_policy_http,
     fetch_oncall_ticket_status_http,
     open_oncall_ticket_http,
     oncall_ticket_status_from_dict,
+    oncall_ticket_status_from_webhook,
     oncall_ticket_status_to_dict,
+    oncall_webhook_replay_job_from_dict,
+    oncall_webhook_replay_job_to_dict,
+    open_recovery_failure_ticket_http,
+    oncall_webhook_event_from_dict,
+    oncall_webhook_event_to_dict,
+    list_dead_letter_oncall_webhook_events,
+    patch_oncall_webhook_event_payload,
     operations_action_item_from_dict,
     operations_action_item_to_dict,
+    operations_closed_loop_snapshot_from_dict,
+    operations_closed_loop_snapshot_to_dict,
     operations_dashboard_snapshot_from_dict,
     operations_dashboard_snapshot_to_dict,
     operations_knowledge_entry_from_dict,
     operations_knowledge_entry_to_dict,
+    operations_scheduled_task_from_dict,
+    operations_scheduled_task_to_dict,
+    operations_scheduler_run_report_from_dict,
+    operations_scheduler_run_report_to_dict,
     operations_trend_alert_from_dict,
     operations_trend_alert_to_dict,
+    recovery_governance_policy_from_json,
+    build_recovery_approval_sla_policy,
+    build_recovery_governance_policy_audit,
+    recovery_strategy_execution_result_from_dict,
+    publish_operations_closed_loop_schema_http,
     render_operations_alert_export_result,
     render_operations_alerts,
     render_operations_alerts_json,
@@ -57,10 +100,39 @@ from .operations import (
     render_operations_action_items,
     render_operations_action_sla_notifications,
     render_operations_action_sla_report,
+    render_operations_action_status_sync_report,
     render_operations_closed_loop_export_result,
     render_operations_closed_loop_report,
+    render_operations_closed_loop_dashboard_json,
     render_operations_closed_loop_report_json,
     render_operations_closed_loop_report_prometheus,
+    render_operations_closed_loop_snapshot,
+    render_operations_closed_loop_snapshots,
+    render_operations_closed_loop_contract_matrix_json,
+    render_operations_closed_loop_json_schema,
+    render_operations_closed_loop_openapi_spec,
+    render_operations_closed_loop_contract_validation,
+    render_operations_closed_loop_acceptance_report,
+    render_operations_closed_loop_checkpoint_plan,
+    render_operations_closed_loop_quality_report,
+    render_operations_closed_loop_schema_publish_result,
+    render_operations_action_authorization,
+    render_operations_console_overview_json,
+    render_operations_console_view_html,
+    render_operations_console_view_json,
+    render_operations_scheduled_tasks,
+    render_operations_scheduler_health_report,
+    render_operations_scheduler_run_report,
+    render_oncall_webhook_replay_audit_json,
+    render_oncall_webhook_replay_batch_result,
+    render_oncall_webhook_replay_job_execution,
+    render_oncall_webhook_replay_result,
+    build_oncall_webhook_replay_job,
+    build_oncall_webhook_ops_console,
+    render_oncall_webhook_ops_console,
+    render_oncall_webhook_ops_console_json,
+    render_oncall_webhook_replay_jobs,
+    render_oncall_webhook_replay_jobs_json,
     render_operations_dashboard_snapshots,
     render_operations_dashboard_trend_report,
     render_operations_knowledge_entries,
@@ -70,12 +142,22 @@ from .operations import (
     render_operations_trend_alerts,
     render_operations_trend_alerts_json,
     search_operations_knowledge,
+    sync_operations_action_items_from_oncall,
     render_oncall_ticket_status,
+    render_oncall_webhook_event,
     render_oncall_ticket_result,
     render_operations_dashboard,
     render_operations_drill_gate_result,
     render_operations_drill_report,
     render_operations_runbook,
+    render_recovery_approval_export_result,
+    render_recovery_approval_sla_report,
+    render_recovery_governance_policy_audit,
+    render_recovery_governance_policy_fetch_result,
+    render_recovery_strategy_metrics_prometheus,
+    run_operations_scheduled_tasks,
+    replay_dead_letter_oncall_webhook_event,
+    replay_dead_letter_oncall_webhook_events,
 )
 from .integrations import JsonHttpClient
 from .permissions import PermissionPolicy, evaluate_permission, render_permission_decision
@@ -151,6 +233,86 @@ def parse_args() -> argparse.Namespace:
         "--replan-reason",
         default="operator_replan",
         help="Recovery reason passed to approval/order/inventory compensations.",
+    )
+    parser.add_argument(
+        "--execute-recovery-strategy-session",
+        default=None,
+        help="Load a persisted exception session and execute the selected recovery strategy.",
+    )
+    parser.add_argument(
+        "--enforce-recovery-gate",
+        action="store_true",
+        help="Stop automated replan when the recovery strategy gate requires approval.",
+    )
+    parser.add_argument(
+        "--recovery-approval-override",
+        action="store_true",
+        help="Treat required recovery approvals as provided when executing a recovery strategy.",
+    )
+    parser.add_argument(
+        "--recovery-approved-by",
+        default=None,
+        help="Operator or system principal recorded in the recovery approval receipt.",
+    )
+    parser.add_argument(
+        "--recovery-approval-reason",
+        default=None,
+        help="Approval receipt reason when --recovery-approval-override is used.",
+    )
+    parser.add_argument(
+        "--recovery-governance-policy-json",
+        default=None,
+        help="Recovery governance policy JSON with allowed_actions, blocked_actions, and max_executions_per_session.",
+    )
+    parser.add_argument(
+        "--fetch-recovery-governance-policy",
+        action="store_true",
+        help="Fetch recovery governance policy from a remote config-center endpoint.",
+    )
+    parser.add_argument(
+        "--recovery-governance-policy-endpoint",
+        default=None,
+        help="Remote config-center endpoint for recovery governance policy. Defaults to TRAVEL_RECOVERY_GOVERNANCE_POLICY_API_URL.",
+    )
+    parser.add_argument(
+        "--audit-recovery-governance-policy",
+        action="store_true",
+        help="Compare local and remote recovery governance policies and render a policy-change audit.",
+    )
+    parser.add_argument(
+        "--recovery-governance-policy-changed-by",
+        default="travel-ops",
+        help="Principal recorded in --audit-recovery-governance-policy.",
+    )
+    parser.add_argument(
+        "--recovery-approval-sla",
+        action="store_true",
+        help="Evaluate recovery approval receipt SLA and approver permissions.",
+    )
+    parser.add_argument(
+        "--recovery-approval-sla-policy-json",
+        default=None,
+        help="Recovery approval SLA policy JSON with max_pending_hours and approver allow rules.",
+    )
+    parser.add_argument(
+        "--recovery-approval-sla-now",
+        default=None,
+        help="Optional ISO timestamp used as current time for --recovery-approval-sla.",
+    )
+    parser.add_argument(
+        "--export-recovery-approval-receipts",
+        action="store_true",
+        help="Export persisted recovery approval receipts to the configured audit/OA endpoint.",
+    )
+    parser.add_argument(
+        "--recovery-approval-endpoint",
+        default=None,
+        help="Endpoint for --export-recovery-approval-receipts. Defaults to TRAVEL_RECOVERY_APPROVAL_API_URL.",
+    )
+    parser.add_argument(
+        "--open-recovery-failure-ticket-session",
+        default=None,
+        help="Open an OnCall ticket for the latest failed or blocked recovery execution in a session.",
     )
     parser.add_argument(
         "--reselect-hotel-session",
@@ -242,6 +404,32 @@ def parse_args() -> argparse.Namespace:
         help="Seconds to sleep between worker iterations.",
     )
     parser.add_argument(
+        "--worker-auto-recover",
+        action="store_true",
+        help="Let the worker execute gated recovery strategies for exception states.",
+    )
+    parser.add_argument(
+        "--worker-recovery-approval-override",
+        action="store_true",
+        help="Treat worker recovery gate approvals as provided.",
+    )
+    parser.add_argument(
+        "--worker-recovery-reason",
+        default="worker_auto_recovery",
+        help="Recovery reason used when --worker-auto-recover executes a strategy.",
+    )
+    parser.add_argument(
+        "--worker-recovery-rollout-percentage",
+        type=int,
+        default=None,
+        help="Optional percentage gate for worker auto recovery. Omit to skip rollout gating.",
+    )
+    parser.add_argument(
+        "--worker-recovery-rollout-salt",
+        default="worker-auto-recovery",
+        help="Stable salt used when --worker-recovery-rollout-percentage is set.",
+    )
+    parser.add_argument(
         "--list-worker-runs",
         action="store_true",
         help="List recent worker run summaries from the session store.",
@@ -299,6 +487,11 @@ def parse_args() -> argparse.Namespace:
         help="Serve Prometheus metrics over HTTP at /metrics.",
     )
     parser.add_argument(
+        "--serve-operations-dashboard",
+        action="store_true",
+        help="Serve operations dashboard JSON over HTTP at /operations/closed-loop.",
+    )
+    parser.add_argument(
         "--metrics-host",
         default="127.0.0.1",
         help="Host for --serve-metrics.",
@@ -308,6 +501,94 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=9108,
         help="Port for --serve-metrics.",
+    )
+    parser.add_argument(
+        "--operations-dashboard-host",
+        default="127.0.0.1",
+        help="Host for --serve-operations-dashboard.",
+    )
+    parser.add_argument(
+        "--operations-dashboard-port",
+        type=int,
+        default=9110,
+        help="Port for --serve-operations-dashboard.",
+    )
+    parser.add_argument(
+        "--operations-dashboard-token",
+        default=None,
+        help="Read-only token required by --serve-operations-dashboard. Defaults to TRAVEL_OPERATIONS_DASHBOARD_TOKEN.",
+    )
+    parser.add_argument(
+        "--operations-console-overview",
+        action="store_true",
+        help="Render the aggregated operations console JSON from closed-loop, webhook ops, replay jobs, and quality gates.",
+    )
+    parser.add_argument(
+        "--operations-schedule-plan",
+        action="store_true",
+        help="Render the default operations scheduler plan.",
+    )
+    parser.add_argument(
+        "--init-operations-schedule",
+        action="store_true",
+        help="Persist the default operations scheduler plan into the configured session store.",
+    )
+    parser.add_argument(
+        "--list-operations-schedule",
+        action="store_true",
+        help="List persisted operations scheduler tasks from the configured session store.",
+    )
+    parser.add_argument(
+        "--operations-scheduler-health",
+        action="store_true",
+        help="Render scheduler run history and schedule lease health alerts.",
+    )
+    parser.add_argument(
+        "--run-operations-schedule",
+        action="store_true",
+        help="Run due operations scheduler tasks once using persisted operations data.",
+    )
+    parser.add_argument(
+        "--run-persisted-operations-schedule",
+        action="store_true",
+        help="Claim due persisted operations scheduler tasks with a lease, run them once, and write back cursors.",
+    )
+    parser.add_argument(
+        "--operations-scheduler-owner",
+        default="operations-scheduler",
+        help="Lease owner used by --run-persisted-operations-schedule.",
+    )
+    parser.add_argument(
+        "--operations-scheduler-lease-seconds",
+        type=int,
+        default=300,
+        help="Lease TTL in seconds for persisted operations scheduler tasks.",
+    )
+    parser.add_argument(
+        "--execute-oncall-webhook-replay-jobs",
+        action="store_true",
+        help="Execute persisted pending OnCall webhook replay jobs and write back results.",
+    )
+    parser.add_argument(
+        "--operations-actor",
+        default="operator",
+        help="User/principal used for operations permission and audit checks.",
+    )
+    parser.add_argument(
+        "--operations-actor-role",
+        action="append",
+        default=[],
+        help="Role used for operations permission and audit checks. Can be repeated.",
+    )
+    parser.add_argument(
+        "--operations-actor-department",
+        default=None,
+        help="Department used for operations permission and audit checks.",
+    )
+    parser.add_argument(
+        "--operations-authorize-action",
+        default=None,
+        help="Evaluate operations permission and audit for an action without running it.",
     )
     parser.add_argument(
         "--export-otlp",
@@ -565,6 +846,130 @@ def parse_args() -> argparse.Namespace:
         help="Closure note for --close-operations-action-item.",
     )
     parser.add_argument(
+        "--sync-action-items-from-oncall",
+        action="store_true",
+        help="Close linked operations action items when synced OnCall tickets are resolved.",
+    )
+    parser.add_argument(
+        "--record-oncall-webhook-json",
+        default=None,
+        help="Record an OnCall webhook JSON payload as a persisted ticket status.",
+    )
+    parser.add_argument(
+        "--record-oncall-webhook-file",
+        default=None,
+        help="Read and record an OnCall webhook JSON payload from a file.",
+    )
+    parser.add_argument(
+        "--oncall-webhook-signature",
+        default=None,
+        help="Webhook signature header value. Supports sha256=<digest>.",
+    )
+    parser.add_argument(
+        "--oncall-webhook-secret",
+        default=None,
+        help="Webhook signing secret. Defaults to TRAVEL_ONCALL_WEBHOOK_SECRET.",
+    )
+    parser.add_argument(
+        "--oncall-webhook-replay-window-minutes",
+        type=int,
+        default=1440,
+        help="Maximum age for webhook updated_at before treating it as replay.",
+    )
+    parser.add_argument(
+        "--allow-oncall-webhook-replay",
+        action="store_true",
+        help="Accept webhook payloads outside the replay window.",
+    )
+    parser.add_argument(
+        "--sync-action-items-from-webhook",
+        action="store_true",
+        help="Close linked action items immediately after recording an accepted webhook.",
+    )
+    parser.add_argument(
+        "--list-oncall-webhook-events",
+        action="store_true",
+        help="List persisted OnCall webhook events.",
+    )
+    parser.add_argument(
+        "--list-oncall-webhook-dead-letters",
+        action="store_true",
+        help="List persisted dead-letter OnCall webhook events.",
+    )
+    parser.add_argument(
+        "--oncall-webhook-ops-console",
+        action="store_true",
+        help="Render dead-letter webhook operations console with retry candidates and patch templates.",
+    )
+    parser.add_argument(
+        "--oncall-webhook-ops-format",
+        choices=("summary", "json"),
+        default="summary",
+        help="Output format for --oncall-webhook-ops-console.",
+    )
+    parser.add_argument(
+        "--replay-oncall-webhook-event",
+        default=None,
+        help="Replay a persisted dead-letter OnCall webhook event by event id.",
+    )
+    parser.add_argument(
+        "--replay-oncall-webhook-dead-letters",
+        action="store_true",
+        help="Batch replay persisted dead-letter OnCall webhook events.",
+    )
+    parser.add_argument(
+        "--oncall-webhook-replay-limit",
+        type=int,
+        default=None,
+        help="Maximum dead-letter webhook events to replay in a batch.",
+    )
+    parser.add_argument(
+        "--oncall-webhook-patch-json",
+        default=None,
+        help="JSON object used to patch a replayed OnCall webhook payload before replay.",
+    )
+    parser.add_argument(
+        "--oncall-webhook-patch-file",
+        default=None,
+        help="File containing a JSON object used to patch replayed OnCall webhook payloads.",
+    )
+    parser.add_argument(
+        "--oncall-webhook-replay-audit-json",
+        action="store_true",
+        help="Render replay batch audit JSON after batch replay.",
+    )
+    parser.add_argument(
+        "--persist-oncall-webhook-replay-job",
+        action="store_true",
+        help="Persist replay job metadata when replaying OnCall webhook dead letters.",
+    )
+    parser.add_argument(
+        "--create-oncall-webhook-replay-job",
+        action="store_true",
+        help="Create a pending replay job from current dead-letter OnCall webhook candidates.",
+    )
+    parser.add_argument(
+        "--oncall-webhook-replay-requested-by",
+        default="operator",
+        help="Principal recorded on persisted OnCall webhook replay jobs.",
+    )
+    parser.add_argument(
+        "--oncall-webhook-patch-template-id",
+        default=None,
+        help="Patch template id recorded on persisted OnCall webhook replay jobs.",
+    )
+    parser.add_argument(
+        "--list-oncall-webhook-replay-jobs",
+        action="store_true",
+        help="List persisted OnCall webhook replay jobs.",
+    )
+    parser.add_argument(
+        "--oncall-webhook-replay-jobs-format",
+        choices=("summary", "json"),
+        default="summary",
+        help="Output format for --list-oncall-webhook-replay-jobs.",
+    )
+    parser.add_argument(
         "--save-operations-knowledge",
         action="store_true",
         help="Save operations knowledge entries from trend alerts, postmortem, and closed action items.",
@@ -605,6 +1010,89 @@ def parse_args() -> argparse.Namespace:
         help="Summarize trend alerts, action item closure, SLA findings, and knowledge entries.",
     )
     parser.add_argument(
+        "--operations-recovery-metrics",
+        action="store_true",
+        help="Render recovery strategy execution metrics from persisted sessions.",
+    )
+    parser.add_argument(
+        "--operations-recovery-metrics-format",
+        choices=("summary", "json", "prometheus"),
+        default="summary",
+        help="Output format for --operations-recovery-metrics.",
+    )
+    parser.add_argument(
+        "--operations-closed-loop-dashboard",
+        action="store_true",
+        help="Render persisted closed-loop snapshots as dashboard JSON with filters and cursor pagination.",
+    )
+    parser.add_argument(
+        "--operations-closed-loop-contract",
+        choices=("schema", "openapi", "matrix", "validate"),
+        default=None,
+        help="Render or validate the closed-loop BI contract.",
+    )
+    parser.add_argument(
+        "--closed-loop-contract-server-url",
+        default="http://127.0.0.1:9110",
+        help="Server URL used in the generated closed-loop OpenAPI contract.",
+    )
+    parser.add_argument(
+        "--closed-loop-dashboard-owner",
+        default=None,
+        help="Optional owner filter for --operations-closed-loop-dashboard.",
+    )
+    parser.add_argument(
+        "--closed-loop-dashboard-since",
+        default=None,
+        help="Optional ISO timestamp lower bound for --operations-closed-loop-dashboard.",
+    )
+    parser.add_argument(
+        "--closed-loop-dashboard-cursor",
+        default=None,
+        help="Optional cursor timestamp for the next closed-loop dashboard page.",
+    )
+    parser.add_argument(
+        "--closed-loop-dashboard-department",
+        default=None,
+        help="Optional department metadata filter for --operations-closed-loop-dashboard.",
+    )
+    parser.add_argument(
+        "--closed-loop-dashboard-tenant",
+        default=None,
+        help="Optional tenant metadata filter for --operations-closed-loop-dashboard.",
+    )
+    parser.add_argument(
+        "--closed-loop-dashboard-checkpoint",
+        default=None,
+        help="Optional checkpoint timestamp for incremental closed-loop dashboard export.",
+    )
+    parser.add_argument(
+        "--closed-loop-dashboard-limit",
+        type=int,
+        default=None,
+        help="Optional page size for --operations-closed-loop-dashboard.",
+    )
+    parser.add_argument(
+        "--closed-loop-snapshot-department",
+        default=None,
+        help="Department metadata saved with --save-operations-closed-loop.",
+    )
+    parser.add_argument(
+        "--closed-loop-snapshot-tenant",
+        default=None,
+        help="Tenant metadata saved with --save-operations-closed-loop.",
+    )
+    parser.add_argument(
+        "--save-operations-closed-loop",
+        action="store_true",
+        help="Save the current closed-loop report as a persistent snapshot.",
+    )
+    parser.add_argument(
+        "--list-operations-closed-loop-snapshots",
+        action="store_true",
+        help="List persisted closed-loop report snapshots.",
+    )
+    parser.add_argument(
         "--operations-closed-loop-format",
         choices=("summary", "json", "prometheus"),
         default="summary",
@@ -619,6 +1107,31 @@ def parse_args() -> argparse.Namespace:
         "--closed-loop-endpoint",
         default=None,
         help="Closed-loop report sink endpoint. Defaults to TRAVEL_CLOSED_LOOP_API_URL.",
+    )
+    parser.add_argument(
+        "--publish-operations-closed-loop-contract",
+        action="store_true",
+        help="Publish closed-loop JSON Schema/OpenAPI/compatibility matrix to a schema registry.",
+    )
+    parser.add_argument(
+        "--closed-loop-schema-registry-endpoint",
+        default=None,
+        help="Schema registry endpoint. Defaults to TRAVEL_CLOSED_LOOP_SCHEMA_REGISTRY_URL.",
+    )
+    parser.add_argument(
+        "--operations-closed-loop-quality",
+        action="store_true",
+        help="Evaluate BI data quality for closed-loop dashboard snapshots.",
+    )
+    parser.add_argument(
+        "--operations-closed-loop-checkpoint-plan",
+        action="store_true",
+        help="Render the next incremental checkpoint plan for closed-loop BI consumption.",
+    )
+    parser.add_argument(
+        "--operations-closed-loop-acceptance",
+        action="store_true",
+        help="Run closed-loop BI consumer acceptance checks: contract, data quality, and checkpoint readiness.",
     )
     parser.add_argument(
         "--alert-rules",
@@ -758,6 +1271,139 @@ def main() -> None:
     if args.operations_runbook:
         print(render_operations_runbook(build_operations_runbook()))
         return
+    if args.operations_authorize_action:
+        authorization = authorize_operations_action(
+            args.operations_authorize_action,
+            user_id=args.operations_actor,
+            permission_policy=PermissionPolicy.from_env(),
+            department=args.operations_actor_department,
+            roles=args.operations_actor_role,
+            audit_sink=build_audit_sink(settings),
+            payload={"source": "cli"},
+        )
+        print(render_operations_action_authorization(authorization))
+        if not authorization.allowed:
+            raise SystemExit(1)
+        return
+    if args.operations_schedule_plan:
+        print(render_operations_scheduled_tasks(build_operations_scheduled_tasks()))
+        return
+    if args.init_operations_schedule:
+        _require_persistent_session_store(settings, "--init-operations-schedule")
+        tasks = build_operations_scheduled_tasks()
+        for task in tasks:
+            agent.session_store.record_operations_scheduled_task(operations_scheduled_task_to_dict(task))
+        print(render_operations_scheduled_tasks(tasks))
+        return
+    if args.list_operations_schedule:
+        _require_persistent_session_store(settings, "--list-operations-schedule")
+        tasks = [
+            operations_scheduled_task_from_dict(item)
+            for item in agent.session_store.list_operations_scheduled_tasks(args.observability_limit)
+        ]
+        print(render_operations_scheduled_tasks(tasks))
+        return
+    if args.operations_scheduler_health:
+        _require_persistent_session_store(settings, "--operations-scheduler-health")
+        runs = [
+            operations_scheduler_run_report_from_dict(item)
+            for item in agent.session_store.list_operations_scheduler_runs(args.observability_limit)
+        ]
+        tasks = [
+            operations_scheduled_task_from_dict(item)
+            for item in agent.session_store.list_operations_scheduled_tasks(args.observability_limit)
+        ]
+        print(render_operations_scheduler_health_report(build_operations_scheduler_health_report(runs, tasks)))
+        return
+    if args.operations_console_overview:
+        _require_persistent_session_store(settings, "--operations-console-overview")
+        print(build_operations_console_overview_json(agent.session_store, limit=args.observability_limit))
+        return
+    if args.execute_oncall_webhook_replay_jobs:
+        _require_persistent_session_store(settings, "--execute-oncall-webhook-replay-jobs")
+        authorization = authorize_operations_action(
+            "execute_replay_job",
+            user_id=args.operations_actor,
+            permission_policy=PermissionPolicy.from_env(),
+            department=args.operations_actor_department,
+            roles=args.operations_actor_role,
+            audit_sink=build_audit_sink(settings),
+            payload={"source": "cli", "limit": args.observability_limit},
+        )
+        print(render_operations_action_authorization(authorization))
+        if not authorization.allowed:
+            raise SystemExit(1)
+        events = [
+            oncall_webhook_event_from_dict(item)
+            for item in agent.session_store.list_oncall_webhook_events(args.observability_limit)
+        ]
+        jobs = [
+            oncall_webhook_replay_job_from_dict(item)
+            for item in agent.session_store.list_oncall_webhook_replay_jobs(args.observability_limit)
+        ]
+        executions = []
+        for job in jobs:
+            if job.status != "PENDING":
+                continue
+            execution = execute_oncall_webhook_replay_job(job, events)
+            executions.append(execution)
+            agent.session_store.record_oncall_webhook_replay_job(oncall_webhook_replay_job_to_dict(execution.job))
+            for event in execution.replayed_events:
+                agent.session_store.record_oncall_webhook_event(oncall_webhook_event_to_dict(event))
+            for status in execution.statuses:
+                agent.session_store.record_oncall_ticket_status(oncall_ticket_status_to_dict(status))
+            print(render_oncall_webhook_replay_job_execution(execution))
+        if not executions:
+            print("OnCall webhook replay job execution:\n- none")
+        if any(execution.result.failed for execution in executions):
+            raise SystemExit(1)
+        return
+    if args.run_operations_schedule or args.run_persisted_operations_schedule:
+        _require_persistent_session_store(
+            settings,
+            "--run-persisted-operations-schedule" if args.run_persisted_operations_schedule else "--run-operations-schedule",
+        )
+        authorization = authorize_operations_action(
+            "run_operations_schedule",
+            user_id=args.operations_actor,
+            permission_policy=PermissionPolicy.from_env(),
+            department=args.operations_actor_department,
+            roles=args.operations_actor_role,
+            audit_sink=build_audit_sink(settings),
+            payload={"source": "cli"},
+        )
+        print(render_operations_action_authorization(authorization))
+        if not authorization.allowed:
+            raise SystemExit(1)
+        handlers = _build_operations_schedule_handlers(agent.session_store, args)
+        if args.run_persisted_operations_schedule:
+            now = args.recovery_approval_sla_now or None
+            started_at = now or None
+            tasks = [
+                operations_scheduled_task_from_dict(item)
+                for item in agent.session_store.claim_due_operations_scheduled_tasks(
+                    owner=args.operations_scheduler_owner,
+                    now=now or _utc_now(),
+                    lease_seconds=args.operations_scheduler_lease_seconds,
+                    limit=args.observability_limit,
+                )
+            ]
+            report = run_operations_scheduled_tasks(tasks, handlers, now=started_at)
+            results_by_task_id = {result.task_id: result for result in report.results}
+            for task in tasks:
+                result = results_by_task_id.get(task.task_id)
+                if result is None:
+                    continue
+                agent.session_store.complete_operations_scheduled_task(
+                    operations_scheduled_task_to_dict(advance_operations_scheduled_task(task, result))
+                )
+        else:
+            report = run_operations_scheduled_tasks(build_operations_scheduled_tasks(), handlers)
+        agent.session_store.record_operations_scheduler_run(operations_scheduler_run_report_to_dict(report))
+        print(render_operations_scheduler_run_report(report))
+        if report.failed_count:
+            raise SystemExit(1)
+        return
     if args.list_operations_dashboard_snapshots:
         _require_persistent_session_store(settings, "--list-operations-dashboard-snapshots")
         snapshots = [
@@ -765,6 +1411,14 @@ def main() -> None:
             for item in agent.session_store.list_operations_dashboard_snapshots(args.observability_limit)
         ]
         print(render_operations_dashboard_snapshots(snapshots))
+        return
+    if args.list_operations_closed_loop_snapshots:
+        _require_persistent_session_store(settings, "--list-operations-closed-loop-snapshots")
+        snapshots = [
+            operations_closed_loop_snapshot_from_dict(item)
+            for item in agent.session_store.list_operations_closed_loop_snapshots(args.observability_limit)
+        ]
+        print(render_operations_closed_loop_snapshots(snapshots))
         return
     if args.operations_dashboard_trend:
         _require_persistent_session_store(settings, "--operations-dashboard-trend")
@@ -878,7 +1532,202 @@ def main() -> None:
             notification_report = agent.notify_operations_action_sla(report, channel=args.action_sla_channel)
             print(render_operations_action_sla_notifications(notification_report))
         return
-    if args.operations_closed_loop_report or args.export_operations_closed_loop:
+    if args.recovery_approval_sla:
+        _require_persistent_session_store(settings, "--recovery-approval-sla")
+        policy = build_recovery_approval_sla_policy(args.recovery_approval_sla_policy_json)
+        report = evaluate_recovery_approval_sla(
+            agent.session_store.list_recent(args.observability_limit),
+            policy=policy,
+            now=args.recovery_approval_sla_now,
+        )
+        print(render_recovery_approval_sla_report(report))
+        if report.findings:
+            raise SystemExit(1)
+        return
+    if args.fetch_recovery_governance_policy or args.audit_recovery_governance_policy:
+        endpoint = args.recovery_governance_policy_endpoint or settings.recovery_governance_policy_api_url
+        local_policy = recovery_governance_policy_from_json(
+            args.recovery_governance_policy_json or settings.recovery_governance_policy_json
+        )
+        if not endpoint:
+            if args.audit_recovery_governance_policy:
+                audit = build_recovery_governance_policy_audit(
+                    local_policy,
+                    local_policy,
+                    changed_by=args.recovery_governance_policy_changed_by,
+                )
+                print(render_recovery_governance_policy_audit(audit))
+                return
+            raise SystemExit(
+                "--fetch-recovery-governance-policy requires --recovery-governance-policy-endpoint "
+                "or TRAVEL_RECOVERY_GOVERNANCE_POLICY_API_URL."
+            )
+        result = fetch_recovery_governance_policy_http(
+            endpoint,
+            token=settings.recovery_governance_policy_api_token,
+            fallback_policy=local_policy,
+        )
+        print(render_recovery_governance_policy_fetch_result(result))
+        if args.audit_recovery_governance_policy:
+            audit = build_recovery_governance_policy_audit(
+                local_policy,
+                result.policy,
+                changed_by=args.recovery_governance_policy_changed_by,
+            )
+            print(render_recovery_governance_policy_audit(audit))
+        if not result.ok:
+            raise SystemExit(1)
+        return
+    if args.operations_closed_loop_dashboard:
+        _require_persistent_session_store(settings, "--operations-closed-loop-dashboard")
+        print(
+            build_operations_closed_loop_dashboard_json(
+                agent.session_store,
+                limit=args.closed_loop_dashboard_limit or args.observability_limit,
+                owner=args.closed_loop_dashboard_owner,
+                since=args.closed_loop_dashboard_since,
+                cursor=args.closed_loop_dashboard_cursor,
+                department=args.closed_loop_dashboard_department,
+                tenant=args.closed_loop_dashboard_tenant,
+                checkpoint=args.closed_loop_dashboard_checkpoint,
+            )
+        )
+        return
+    if args.operations_closed_loop_contract:
+        if args.operations_closed_loop_contract == "schema":
+            print(render_operations_closed_loop_json_schema())
+            return
+        if args.operations_closed_loop_contract == "openapi":
+            print(render_operations_closed_loop_openapi_spec(args.closed_loop_contract_server_url))
+            return
+        if args.operations_closed_loop_contract == "matrix":
+            print(render_operations_closed_loop_contract_matrix_json())
+            return
+        _require_persistent_session_store(settings, "--operations-closed-loop-contract validate")
+        snapshots = [
+            operations_closed_loop_snapshot_from_dict(item)
+            for item in agent.session_store.list_operations_closed_loop_snapshots(
+                max(100, args.closed_loop_dashboard_limit or args.observability_limit)
+            )
+        ]
+        dashboard = build_operations_closed_loop_dashboard(
+            snapshots,
+            limit=args.closed_loop_dashboard_limit or args.observability_limit,
+            owner=args.closed_loop_dashboard_owner,
+            since=args.closed_loop_dashboard_since,
+            cursor=args.closed_loop_dashboard_cursor,
+            department=args.closed_loop_dashboard_department,
+            tenant=args.closed_loop_dashboard_tenant,
+            checkpoint=args.closed_loop_dashboard_checkpoint,
+        )
+        from .operations import validate_operations_closed_loop_dashboard_contract
+
+        print(render_operations_closed_loop_contract_validation(validate_operations_closed_loop_dashboard_contract(dashboard)))
+        return
+    if (
+        args.operations_closed_loop_quality
+        or args.operations_closed_loop_checkpoint_plan
+        or args.operations_closed_loop_acceptance
+        or args.publish_operations_closed_loop_contract
+    ):
+        if args.publish_operations_closed_loop_contract:
+            endpoint = args.closed_loop_schema_registry_endpoint or settings.closed_loop_schema_registry_url
+            if not endpoint:
+                raise SystemExit(
+                    "--publish-operations-closed-loop-contract requires "
+                    "--closed-loop-schema-registry-endpoint or TRAVEL_CLOSED_LOOP_SCHEMA_REGISTRY_URL."
+                )
+            authorization = authorize_operations_action(
+                "publish_closed_loop_schema",
+                user_id=args.operations_actor,
+                permission_policy=PermissionPolicy.from_env(),
+                department=args.operations_actor_department,
+                roles=args.operations_actor_role,
+                audit_sink=build_audit_sink(settings),
+                payload={"endpoint": endpoint},
+            )
+            print(render_operations_action_authorization(authorization))
+            if not authorization.allowed:
+                raise SystemExit(1)
+            result = publish_operations_closed_loop_schema_http(
+                endpoint,
+                token=settings.closed_loop_schema_registry_api_token,
+                server_url=args.closed_loop_contract_server_url,
+            )
+            print(render_operations_closed_loop_schema_publish_result(result))
+            if not result.ok:
+                raise SystemExit(1)
+            if not (args.operations_closed_loop_quality or args.operations_closed_loop_checkpoint_plan or args.operations_closed_loop_acceptance):
+                return
+        _require_persistent_session_store(settings, "--operations-closed-loop-quality")
+        snapshots = [
+            operations_closed_loop_snapshot_from_dict(item)
+            for item in agent.session_store.list_operations_closed_loop_snapshots(
+                max(100, args.closed_loop_dashboard_limit or args.observability_limit)
+            )
+        ]
+        dashboard = build_operations_closed_loop_dashboard(
+            snapshots,
+            limit=args.closed_loop_dashboard_limit or args.observability_limit,
+            owner=args.closed_loop_dashboard_owner,
+            since=args.closed_loop_dashboard_since,
+            cursor=args.closed_loop_dashboard_cursor,
+            department=args.closed_loop_dashboard_department,
+            tenant=args.closed_loop_dashboard_tenant,
+            checkpoint=args.closed_loop_dashboard_checkpoint,
+        )
+        if args.operations_closed_loop_quality:
+            quality = evaluate_operations_closed_loop_quality(dashboard)
+            print(render_operations_closed_loop_quality_report(quality))
+            if not quality.ok:
+                raise SystemExit(1)
+        if args.operations_closed_loop_checkpoint_plan:
+            print(render_operations_closed_loop_checkpoint_plan(build_operations_closed_loop_checkpoint_plan(dashboard)))
+        if args.operations_closed_loop_acceptance:
+            acceptance = build_operations_closed_loop_acceptance_report(dashboard)
+            print(render_operations_closed_loop_acceptance_report(acceptance))
+            if not acceptance.ok:
+                raise SystemExit(1)
+        return
+    if args.operations_recovery_metrics:
+        sessions = agent.session_store.list_recent(args.observability_limit)
+        metrics = build_recovery_strategy_metrics(sessions)
+        if args.operations_recovery_metrics_format == "json":
+            print(json.dumps({"recovery_strategy_metrics": metrics}, ensure_ascii=False))
+        elif args.operations_recovery_metrics_format == "prometheus":
+            print(render_recovery_strategy_metrics_prometheus(sessions))
+        else:
+            lines = ["Recovery strategy metrics:"]
+            if not metrics:
+                lines.append("- none")
+            else:
+                for key, value in sorted(metrics.items()):
+                    lines.append(f"- {key}: {value}")
+            print("\n".join(lines))
+        return
+    if args.export_recovery_approval_receipts:
+        _require_persistent_session_store(settings, "--export-recovery-approval-receipts")
+        endpoint = args.recovery_approval_endpoint or settings.recovery_approval_api_url
+        if not endpoint:
+            raise SystemExit(
+                "--export-recovery-approval-receipts requires --recovery-approval-endpoint "
+                "or TRAVEL_RECOVERY_APPROVAL_API_URL."
+            )
+        receipts = collect_recovery_approval_receipts(agent.session_store.list_recent(args.observability_limit))
+        if not receipts:
+            print("Recovery approval receipts:\n- none")
+            return
+        for receipt in receipts:
+            result = export_recovery_approval_receipt_http(
+                receipt,
+                endpoint=endpoint,
+                token=settings.recovery_approval_api_token,
+            )
+            print(render_recovery_approval_export_result(result))
+            if not result.ok:
+                raise SystemExit(1)
+        return
+    if args.operations_closed_loop_report or args.export_operations_closed_loop or args.save_operations_closed_loop:
         _require_persistent_session_store(settings, "--operations-closed-loop-report")
         trend_alerts = [
             operations_trend_alert_from_dict(item)
@@ -909,6 +1758,18 @@ def main() -> None:
             print(render_operations_closed_loop_report_prometheus(report))
         else:
             print(render_operations_closed_loop_report(report))
+        if args.save_operations_closed_loop:
+            metadata = {
+                key: value
+                for key, value in {
+                    "department": args.closed_loop_snapshot_department,
+                    "tenant": args.closed_loop_snapshot_tenant,
+                }.items()
+                if value
+            }
+            snapshot = build_operations_closed_loop_snapshot(report, metadata=metadata)
+            agent.session_store.record_operations_closed_loop_snapshot(operations_closed_loop_snapshot_to_dict(snapshot))
+            print(render_operations_closed_loop_snapshot(snapshot))
         if args.export_operations_closed_loop:
             endpoint = args.closed_loop_endpoint or settings.closed_loop_api_url
             if not endpoint:
@@ -921,6 +1782,302 @@ def main() -> None:
                 token=settings.closed_loop_api_token,
             )
             print(render_operations_closed_loop_export_result(result))
+        return
+    if args.record_oncall_webhook_json or args.record_oncall_webhook_file:
+        _require_persistent_session_store(settings, "--record-oncall-webhook-json")
+        raw_body = _load_webhook_body(args.record_oncall_webhook_json, args.record_oncall_webhook_file)
+        try:
+            webhook_payload = json.loads(raw_body)
+        except json.JSONDecodeError as exc:
+            raise SystemExit(f"OnCall webhook payload is not valid JSON: {exc}") from exc
+        if not isinstance(webhook_payload, dict):
+            raise SystemExit("OnCall webhook payload requires a JSON object.")
+        existing_events = [
+            oncall_webhook_event_from_dict(item)
+            for item in agent.session_store.list_oncall_webhook_events(args.observability_limit)
+        ]
+        event = build_oncall_webhook_event(
+            webhook_payload,
+            raw_body=raw_body,
+            secret=args.oncall_webhook_secret or settings.oncall_webhook_secret,
+            signature=args.oncall_webhook_signature,
+            seen_event_ids={item.event_id for item in existing_events},
+            replay_window_minutes=args.oncall_webhook_replay_window_minutes,
+            allow_replay=args.allow_oncall_webhook_replay,
+        )
+        agent.session_store.record_oncall_webhook_event(oncall_webhook_event_to_dict(event))
+        print(render_oncall_webhook_event(event))
+        if event.accepted:
+            status = oncall_ticket_status_from_webhook(webhook_payload)
+            agent.session_store.record_oncall_ticket_status(oncall_ticket_status_to_dict(status))
+            print(render_oncall_ticket_status(status))
+            if args.sync_action_items_from_webhook:
+                items = [
+                    operations_action_item_from_dict(item)
+                    for item in agent.session_store.list_operations_action_items(args.observability_limit)
+                ]
+                report = sync_operations_action_items_from_oncall(items, [status])
+                for item in report.closed_items:
+                    agent.session_store.record_operations_action_item(operations_action_item_to_dict(item))
+                print(render_operations_action_status_sync_report(report))
+        elif event.dead_letter:
+            raise SystemExit(1)
+        return
+    if args.sync_action_items_from_webhook and not (
+        args.replay_oncall_webhook_event or args.replay_oncall_webhook_dead_letters
+    ):
+        raise SystemExit(
+            "--sync-action-items-from-webhook requires --record-oncall-webhook-json, "
+            "--record-oncall-webhook-file, --replay-oncall-webhook-event, or --replay-oncall-webhook-dead-letters."
+        )
+    if args.list_oncall_webhook_events:
+        _require_persistent_session_store(settings, "--list-oncall-webhook-events")
+        events = [
+            oncall_webhook_event_from_dict(item)
+            for item in agent.session_store.list_oncall_webhook_events(args.observability_limit)
+        ]
+        lines = ["OnCall webhook events:"]
+        if not events:
+            lines.append("- none")
+        else:
+            for event in events:
+                lines.append(
+                    f"- {event.event_id}: status={event.status} accepted={event.accepted} "
+                    f"duplicate={event.duplicate} replay={event.replay} ticket={event.ticket_id or '-'}"
+                )
+        print("\n".join(lines))
+        return
+    if args.list_oncall_webhook_dead_letters:
+        _require_persistent_session_store(settings, "--list-oncall-webhook-dead-letters")
+        events = list_dead_letter_oncall_webhook_events(
+            [
+                oncall_webhook_event_from_dict(item)
+                for item in agent.session_store.list_oncall_webhook_events(args.observability_limit)
+            ]
+        )
+        lines = ["OnCall webhook dead letters:"]
+        if not events:
+            lines.append("- none")
+        else:
+            for event in events:
+                lines.append(
+                    f"- {event.event_id}: status={event.status} accepted={event.accepted} "
+                    f"replay={event.replay} ticket={event.ticket_id or '-'}"
+                )
+        print("\n".join(lines))
+        return
+    if args.oncall_webhook_ops_console:
+        _require_persistent_session_store(settings, "--oncall-webhook-ops-console")
+        authorization = authorize_operations_action(
+            "view_operations_console",
+            user_id=args.operations_actor,
+            permission_policy=PermissionPolicy.from_env(),
+            department=args.operations_actor_department,
+            roles=args.operations_actor_role,
+            audit_sink=build_audit_sink(settings),
+            payload={"source": "cli", "view": "oncall_webhook_ops_console"},
+        )
+        print(render_operations_action_authorization(authorization))
+        if not authorization.allowed:
+            raise SystemExit(1)
+        events = [
+            oncall_webhook_event_from_dict(item)
+            for item in agent.session_store.list_oncall_webhook_events(args.observability_limit)
+        ]
+        console = build_oncall_webhook_ops_console(events)
+        if args.oncall_webhook_ops_format == "json":
+            print(render_oncall_webhook_ops_console_json(console))
+        else:
+            print(render_oncall_webhook_ops_console(console))
+        return
+    if args.list_oncall_webhook_replay_jobs:
+        _require_persistent_session_store(settings, "--list-oncall-webhook-replay-jobs")
+        jobs = [
+            oncall_webhook_replay_job_from_dict(item)
+            for item in agent.session_store.list_oncall_webhook_replay_jobs(args.observability_limit)
+        ]
+        if args.oncall_webhook_replay_jobs_format == "json":
+            print(render_oncall_webhook_replay_jobs_json(jobs))
+        else:
+            print(render_oncall_webhook_replay_jobs(jobs))
+        return
+    if args.create_oncall_webhook_replay_job:
+        _require_persistent_session_store(settings, "--create-oncall-webhook-replay-job")
+        authorization = authorize_operations_action(
+            "create_replay_job",
+            user_id=args.operations_actor,
+            permission_policy=PermissionPolicy.from_env(),
+            department=args.operations_actor_department,
+            roles=args.operations_actor_role,
+            audit_sink=build_audit_sink(settings),
+            payload={"source": "cli", "limit": args.oncall_webhook_replay_limit},
+        )
+        print(render_operations_action_authorization(authorization))
+        if not authorization.allowed:
+            raise SystemExit(1)
+        events = [
+            oncall_webhook_event_from_dict(item)
+            for item in agent.session_store.list_oncall_webhook_events(args.observability_limit)
+        ]
+        dead_letters = list_dead_letter_oncall_webhook_events(events)
+        if args.oncall_webhook_replay_limit is not None:
+            dead_letters = dead_letters[: max(0, args.oncall_webhook_replay_limit)]
+        job = build_oncall_webhook_replay_job(
+            [event.event_id for event in dead_letters],
+            requested_by=args.oncall_webhook_replay_requested_by,
+            patch_template_id=args.oncall_webhook_patch_template_id,
+            audit={
+                "status": "PENDING",
+                "candidate_count": len(dead_letters),
+                "source": "cli",
+            },
+        )
+        agent.session_store.record_oncall_webhook_replay_job(oncall_webhook_replay_job_to_dict(job))
+        print(render_oncall_webhook_replay_jobs([job]))
+        return
+    if args.replay_oncall_webhook_event:
+        _require_persistent_session_store(settings, "--replay-oncall-webhook-event")
+        authorization = authorize_operations_action(
+            "execute_replay_job",
+            user_id=args.operations_actor,
+            permission_policy=PermissionPolicy.from_env(),
+            department=args.operations_actor_department,
+            roles=args.operations_actor_role,
+            audit_sink=build_audit_sink(settings),
+            payload={"source": "cli", "mode": "single", "event_id": args.replay_oncall_webhook_event},
+        )
+        print(render_operations_action_authorization(authorization))
+        if not authorization.allowed:
+            raise SystemExit(1)
+        events = {
+            event.event_id: event
+            for event in (
+                oncall_webhook_event_from_dict(item)
+                for item in agent.session_store.list_oncall_webhook_events(args.observability_limit)
+            )
+        }
+        event = events.get(args.replay_oncall_webhook_event)
+        if event is None:
+            raise SystemExit(f"OnCall webhook event not found: {args.replay_oncall_webhook_event}")
+        patch = _load_json_object(
+            args.oncall_webhook_patch_json,
+            args.oncall_webhook_patch_file,
+            "--oncall-webhook-patch-json",
+            "--oncall-webhook-patch-file",
+        )
+        if patch:
+            event = patch_oncall_webhook_event_payload(event, patch)
+        replayed_event, status, replay_result = replay_dead_letter_oncall_webhook_event(event)
+        agent.session_store.record_oncall_webhook_event(oncall_webhook_event_to_dict(replayed_event))
+        print(render_oncall_webhook_replay_result(replay_result))
+        if status is not None:
+            agent.session_store.record_oncall_ticket_status(oncall_ticket_status_to_dict(status))
+            print(render_oncall_ticket_status(status))
+            if args.sync_action_items_from_webhook:
+                items = [
+                    operations_action_item_from_dict(item)
+                    for item in agent.session_store.list_operations_action_items(args.observability_limit)
+                ]
+                report = sync_operations_action_items_from_oncall(items, [status])
+                for item in report.closed_items:
+                    agent.session_store.record_operations_action_item(operations_action_item_to_dict(item))
+                print(render_operations_action_status_sync_report(report))
+        if args.persist_oncall_webhook_replay_job:
+            batch_result = OnCallWebhookReplayBatchResult(
+                batch_id=replay_result.source_event_id,
+                generated_at=replay_result.replayed_at,
+                attempted=1,
+                accepted=1 if replay_result.accepted else 0,
+                failed=1 if replay_result.status == "FAILED" else 0,
+                skipped=1 if replay_result.status == "SKIPPED" else 0,
+                results=[replay_result],
+            )
+            job = build_oncall_webhook_replay_job(
+                [replay_result.source_event_id],
+                requested_by=args.oncall_webhook_replay_requested_by,
+                patch_template_id=args.oncall_webhook_patch_template_id,
+                batch_result=batch_result,
+                audit={"source": "cli", "mode": "single"},
+            )
+            agent.session_store.record_oncall_webhook_replay_job(oncall_webhook_replay_job_to_dict(job))
+            print(render_oncall_webhook_replay_jobs([job]))
+        if not replay_result.accepted:
+            raise SystemExit(1)
+        return
+    if args.replay_oncall_webhook_dead_letters:
+        _require_persistent_session_store(settings, "--replay-oncall-webhook-dead-letters")
+        authorization = authorize_operations_action(
+            "execute_replay_job",
+            user_id=args.operations_actor,
+            permission_policy=PermissionPolicy.from_env(),
+            department=args.operations_actor_department,
+            roles=args.operations_actor_role,
+            audit_sink=build_audit_sink(settings),
+            payload={"source": "cli", "mode": "batch", "limit": args.oncall_webhook_replay_limit},
+        )
+        print(render_operations_action_authorization(authorization))
+        if not authorization.allowed:
+            raise SystemExit(1)
+        events = [
+            oncall_webhook_event_from_dict(item)
+            for item in agent.session_store.list_oncall_webhook_events(args.observability_limit)
+        ]
+        dead_letters = list_dead_letter_oncall_webhook_events(events)
+        patch = _load_json_object(
+            args.oncall_webhook_patch_json,
+            args.oncall_webhook_patch_file,
+            "--oncall-webhook-patch-json",
+            "--oncall-webhook-patch-file",
+        )
+        patches = {event.event_id: patch for event in dead_letters} if patch else None
+        replayed_events, statuses, batch_result = replay_dead_letter_oncall_webhook_events(
+            events,
+            limit=args.oncall_webhook_replay_limit,
+            patches=patches,
+        )
+        for event in replayed_events:
+            agent.session_store.record_oncall_webhook_event(oncall_webhook_event_to_dict(event))
+        for status in statuses:
+            agent.session_store.record_oncall_ticket_status(oncall_ticket_status_to_dict(status))
+        print(render_oncall_webhook_replay_batch_result(batch_result))
+        if args.persist_oncall_webhook_replay_job:
+            job = build_oncall_webhook_replay_job(
+                [result.source_event_id for result in batch_result.results],
+                requested_by=args.oncall_webhook_replay_requested_by,
+                patch_template_id=args.oncall_webhook_patch_template_id,
+                batch_result=batch_result,
+                audit={"source": "cli", "mode": "batch"},
+            )
+            agent.session_store.record_oncall_webhook_replay_job(oncall_webhook_replay_job_to_dict(job))
+            print(render_oncall_webhook_replay_jobs([job]))
+        if args.sync_action_items_from_webhook and statuses:
+            items = [
+                operations_action_item_from_dict(item)
+                for item in agent.session_store.list_operations_action_items(args.observability_limit)
+            ]
+            report = sync_operations_action_items_from_oncall(items, statuses)
+            for item in report.closed_items:
+                agent.session_store.record_operations_action_item(operations_action_item_to_dict(item))
+            print(render_operations_action_status_sync_report(report))
+        if args.oncall_webhook_replay_audit_json:
+            print(render_oncall_webhook_replay_audit_json(batch_result))
+        if batch_result.failed:
+            raise SystemExit(1)
+        return
+    if args.sync_action_items_from_oncall:
+        _require_persistent_session_store(settings, "--sync-action-items-from-oncall")
+        items = [
+            operations_action_item_from_dict(item)
+            for item in agent.session_store.list_operations_action_items(args.observability_limit)
+        ]
+        statuses = [
+            oncall_ticket_status_from_dict(item)
+            for item in agent.session_store.list_oncall_ticket_statuses(args.observability_limit)
+        ]
+        report = sync_operations_action_items_from_oncall(items, statuses)
+        for item in report.closed_items:
+            agent.session_store.record_operations_action_item(operations_action_item_to_dict(item))
+        print(render_operations_action_status_sync_report(report))
         return
     if args.list_oncall_ticket_statuses:
         _require_persistent_session_store(settings, "--list-oncall-ticket-statuses")
@@ -1121,6 +2278,16 @@ def main() -> None:
             limit=args.observability_limit,
         )
         return
+    if args.serve_operations_dashboard:
+        _require_persistent_session_store(settings, "--serve-operations-dashboard")
+        serve_operations_dashboard(
+            session_store=agent.session_store,
+            host=args.operations_dashboard_host,
+            port=args.operations_dashboard_port,
+            limit=args.observability_limit,
+            token=args.operations_dashboard_token or settings.operations_dashboard_token,
+        )
+        return
     if args.export_otlp:
         _require_persistent_session_store(settings, "--export-otlp")
         endpoint = args.otlp_endpoint or settings.otlp_http_endpoint
@@ -1164,9 +2331,50 @@ def main() -> None:
         context = agent.replay_dead_letter_calendar_sync(context, args.replay_calendar_dead_letter_event)
         print(render_context(context))
         return
+    if args.execute_recovery_strategy_session:
+        context = agent.get_session(args.execute_recovery_strategy_session)
+        governance_policy_json = args.recovery_governance_policy_json or settings.recovery_governance_policy_json
+        governance_policy = recovery_governance_policy_from_json(governance_policy_json)
+        context = agent.execute_recovery_strategy(
+            context,
+            reason=args.replan_reason,
+            enforce_strategy_gate=args.enforce_recovery_gate,
+            approval_override=args.recovery_approval_override,
+            approved_by=args.recovery_approved_by,
+            approval_reason=args.recovery_approval_reason,
+            governance_policy=governance_policy,
+        )
+        context = agent.notify_current_state(context)
+        print(render_context(context))
+        return
+    if args.open_recovery_failure_ticket_session:
+        _require_persistent_session_store(settings, "--open-recovery-failure-ticket-session")
+        endpoint = args.oncall_endpoint or settings.oncall_api_url
+        if not endpoint:
+            raise SystemExit("--open-recovery-failure-ticket-session requires --oncall-endpoint or TRAVEL_ONCALL_API_URL.")
+        context = agent.get_session(args.open_recovery_failure_ticket_session)
+        execution_payload = _latest_recovery_execution_payload(context)
+        if execution_payload is None:
+            raise SystemExit(f"No recovery execution found for session: {context.session_id}")
+        execution = recovery_strategy_execution_result_from_dict(execution_payload)
+        result = open_recovery_failure_ticket_http(
+            context,
+            execution,
+            endpoint=endpoint,
+            token=settings.oncall_api_token,
+        )
+        print(render_oncall_ticket_result(result))
+        if not result.ok:
+            raise SystemExit(1)
+        return
     if args.replan_session:
         context = agent.get_session(args.replan_session)
-        context = agent.replan_after_exception(context, reason=args.replan_reason)
+        context = agent.replan_after_exception(
+            context,
+            reason=args.replan_reason,
+            enforce_strategy_gate=args.enforce_recovery_gate,
+            recovery_approval_override=args.recovery_approval_override,
+        )
         context = agent.notify_current_state(context)
         print(render_context(context))
         return
@@ -1178,11 +2386,25 @@ def main() -> None:
         return
     if args.run_worker_once:
         _require_persistent_session_store(settings, "--run-worker-once")
+        recovery_rollout_policy = None
+        if args.worker_recovery_rollout_percentage is not None:
+            recovery_rollout_policy = RolloutPolicy(
+                enabled=True,
+                percentage=args.worker_recovery_rollout_percentage,
+                salt=args.worker_recovery_rollout_salt,
+            )
+        worker = WorkflowWorker(
+            agent,
+            auto_recover=args.worker_auto_recover,
+            recovery_approval_override=args.worker_recovery_approval_override,
+            recovery_reason=args.worker_recovery_reason,
+            recovery_rollout_policy=recovery_rollout_policy,
+        )
         if args.worker_iterations <= 1:
-            result = WorkflowWorker(agent).run_once(limit=args.worker_limit)
+            result = worker.run_once(limit=args.worker_limit)
             print(render_worker_result(result))
         else:
-            result = WorkflowWorker(agent).run_loop(
+            result = worker.run_loop(
                 iterations=args.worker_iterations,
                 interval_seconds=args.worker_interval,
                 limit=args.worker_limit,
@@ -1351,6 +2573,10 @@ def render_metrics(
     errors = sum(len(record.errors) for record in worker_runs)
     agent_executions = sum(len(context.agent_executions) for context in sessions)
     calendar_syncs = sum(len(context.calendar_syncs) for context in sessions)
+    recovery_metrics = build_recovery_strategy_metrics(sessions)
+    recovery_executions = sum(
+        count for key, count in recovery_metrics.items() if key.startswith("status:")
+    )
     lines = [
         "Metrics:",
         f"- worker_runs: {len(worker_runs)}",
@@ -1362,6 +2588,7 @@ def render_metrics(
         f"- sessions_observed: {len(sessions)}",
         f"- agent_executions: {agent_executions}",
         f"- calendar_syncs: {calendar_syncs}",
+        f"- recovery_strategy_executions: {recovery_executions}",
     ]
     return "\n".join(lines)
 
@@ -1462,6 +2689,7 @@ def render_prometheus_metrics(
     else:
         lines.append("travel_calendar_syncs_total 0")
 
+    lines.append(render_recovery_strategy_metrics_prometheus(sessions))
     return "\n".join(lines)
 
 
@@ -1502,15 +2730,261 @@ def build_prometheus_metrics(session_store: SessionStore, limit: int = 50) -> st
     )
 
 
-def make_metrics_handler(metrics_provider: Callable[[], str]) -> type[BaseHTTPRequestHandler]:
+def build_operations_closed_loop_dashboard_json(
+    session_store: SessionStore,
+    limit: int = 20,
+    owner: str | None = None,
+    since: str | None = None,
+    cursor: str | None = None,
+    department: str | None = None,
+    tenant: str | None = None,
+    checkpoint: str | None = None,
+) -> str:
+    fetch_limit = max(100, limit + 1)
+    snapshots = [
+        operations_closed_loop_snapshot_from_dict(item)
+        for item in session_store.list_operations_closed_loop_snapshots(fetch_limit)
+    ]
+    dashboard = build_operations_closed_loop_dashboard(
+        snapshots,
+        limit=limit,
+        owner=owner,
+        since=since,
+        cursor=cursor,
+        department=department,
+        tenant=tenant,
+        checkpoint=checkpoint,
+    )
+    return render_operations_closed_loop_dashboard_json(dashboard)
+
+
+def build_oncall_webhook_ops_console_json(session_store: SessionStore, limit: int = 20) -> str:
+    events = [
+        oncall_webhook_event_from_dict(item)
+        for item in session_store.list_oncall_webhook_events(limit)
+    ]
+    return render_oncall_webhook_ops_console_json(build_oncall_webhook_ops_console(events))
+
+
+def build_oncall_webhook_replay_jobs_json(session_store: SessionStore, limit: int = 20) -> str:
+    jobs = [
+        oncall_webhook_replay_job_from_dict(item)
+        for item in session_store.list_oncall_webhook_replay_jobs(limit)
+    ]
+    return render_oncall_webhook_replay_jobs_json(jobs)
+
+
+def build_operations_console_overview_json(session_store: SessionStore, limit: int = 20) -> str:
+    snapshots = [
+        operations_closed_loop_snapshot_from_dict(item)
+        for item in session_store.list_operations_closed_loop_snapshots(max(100, limit + 1))
+    ]
+    dashboard = build_operations_closed_loop_dashboard(snapshots, limit=limit)
+    events = [
+        oncall_webhook_event_from_dict(item)
+        for item in session_store.list_oncall_webhook_events(limit)
+    ]
+    jobs = [
+        oncall_webhook_replay_job_from_dict(item)
+        for item in session_store.list_oncall_webhook_replay_jobs(limit)
+    ]
+    overview = build_operations_console_overview(
+        dashboard,
+        build_oncall_webhook_ops_console(events),
+        jobs,
+    )
+    return render_operations_console_overview_json(overview)
+
+
+def build_operations_console_view_json(
+    session_store: SessionStore,
+    limit: int = 20,
+    actor: str = "operator",
+    roles: list[str] | None = None,
+    department: str | None = None,
+) -> str:
+    return render_operations_console_view_json(
+        _build_operations_console_view(session_store, limit, actor, roles, department)
+    )
+
+
+def build_operations_console_view_html(
+    session_store: SessionStore,
+    limit: int = 20,
+    actor: str = "operator",
+    roles: list[str] | None = None,
+    department: str | None = None,
+) -> str:
+    return render_operations_console_view_html(
+        _build_operations_console_view(session_store, limit, actor, roles, department)
+    )
+
+
+def _build_operations_console_view(
+    session_store: SessionStore,
+    limit: int,
+    actor: str,
+    roles: list[str] | None,
+    department: str | None,
+) -> object:
+    snapshots = [
+        operations_closed_loop_snapshot_from_dict(item)
+        for item in session_store.list_operations_closed_loop_snapshots(max(100, limit + 1))
+    ]
+    dashboard = build_operations_closed_loop_dashboard(snapshots, limit=limit)
+    events = [
+        oncall_webhook_event_from_dict(item)
+        for item in session_store.list_oncall_webhook_events(limit)
+    ]
+    jobs = [
+        oncall_webhook_replay_job_from_dict(item)
+        for item in session_store.list_oncall_webhook_replay_jobs(limit)
+    ]
+    overview = build_operations_console_overview(
+        dashboard,
+        build_oncall_webhook_ops_console(events),
+        jobs,
+    )
+    return build_operations_console_view(
+        overview,
+        actor=actor,
+        roles=roles or [],
+        department=department,
+        permission_policy=PermissionPolicy.from_env(),
+    )
+
+
+def make_metrics_handler(
+    metrics_provider: Callable[[], str],
+    closed_loop_dashboard_provider: Callable[
+        [str | None, str | None, str | None, str | None, str | None, str | None, int | None],
+        str,
+    ]
+    | None = None,
+    oncall_webhook_ops_provider: Callable[[int | None], str] | None = None,
+    oncall_webhook_replay_jobs_provider: Callable[[int | None], str] | None = None,
+    operations_console_provider: Callable[[int | None], str] | None = None,
+    operations_console_view_provider: Callable[[int | None, str, list[str], str | None], str] | None = None,
+    operations_console_html_provider: Callable[[int | None, str, list[str], str | None], str] | None = None,
+    dashboard_token: str | None = None,
+) -> type[BaseHTTPRequestHandler]:
     class MetricsHandler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
-            path = urlsplit(self.path).path
+            parsed = urlsplit(self.path)
+            path = parsed.path
             if path == "/health":
                 self._send_text("ok\n", "text/plain; charset=utf-8")
                 return
             if path == "/metrics":
                 self._send_text(metrics_provider() + "\n", "text/plain; version=0.0.4; charset=utf-8")
+                return
+            if path in {"/operations/closed-loop", "/operations/closed-loop/snapshots"}:
+                if closed_loop_dashboard_provider is None:
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                if not self._authorized():
+                    self.send_response(401)
+                    self.end_headers()
+                    return
+                query = parse_qs(parsed.query)
+                self._send_text(
+                    closed_loop_dashboard_provider(
+                        _first_query_value(query, "owner"),
+                        _first_query_value(query, "since"),
+                        _first_query_value(query, "cursor"),
+                        _first_query_value(query, "department"),
+                        _first_query_value(query, "tenant"),
+                        _first_query_value(query, "checkpoint"),
+                        _first_query_int(query, "limit"),
+                    ) + "\n",
+                    "application/json; charset=utf-8",
+                )
+                return
+            if path == "/operations/oncall-webhook-ops":
+                if oncall_webhook_ops_provider is None:
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                if not self._authorized():
+                    self.send_response(401)
+                    self.end_headers()
+                    return
+                query = parse_qs(parsed.query)
+                self._send_text(
+                    oncall_webhook_ops_provider(_first_query_int(query, "limit")) + "\n",
+                    "application/json; charset=utf-8",
+                )
+                return
+            if path == "/operations/oncall-webhook-replay-jobs":
+                if oncall_webhook_replay_jobs_provider is None:
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                if not self._authorized():
+                    self.send_response(401)
+                    self.end_headers()
+                    return
+                query = parse_qs(parsed.query)
+                self._send_text(
+                    oncall_webhook_replay_jobs_provider(_first_query_int(query, "limit")) + "\n",
+                    "application/json; charset=utf-8",
+                )
+                return
+            if path == "/operations/console":
+                if operations_console_provider is None:
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                if not self._authorized():
+                    self.send_response(401)
+                    self.end_headers()
+                    return
+                query = parse_qs(parsed.query)
+                self._send_text(
+                    operations_console_provider(_first_query_int(query, "limit")) + "\n",
+                    "application/json; charset=utf-8",
+                )
+                return
+            if path == "/operations/console/view":
+                if operations_console_view_provider is None:
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                if not self._authorized():
+                    self.send_response(401)
+                    self.end_headers()
+                    return
+                query = parse_qs(parsed.query)
+                self._send_text(
+                    operations_console_view_provider(
+                        _first_query_int(query, "limit"),
+                        self._actor(),
+                        self._roles(),
+                        self._department(),
+                    ) + "\n",
+                    "application/json; charset=utf-8",
+                )
+                return
+            if path == "/operations/console/ui":
+                if operations_console_html_provider is None:
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                if not self._authorized():
+                    self.send_response(401)
+                    self.end_headers()
+                    return
+                query = parse_qs(parsed.query)
+                self._send_text(
+                    operations_console_html_provider(
+                        _first_query_int(query, "limit"),
+                        self._actor(),
+                        self._roles(),
+                        self._department(),
+                    ) + "\n",
+                    "text/html; charset=utf-8",
+                )
                 return
             self.send_response(404)
             self.end_headers()
@@ -1526,6 +3000,26 @@ def make_metrics_handler(metrics_provider: Callable[[], str]) -> type[BaseHTTPRe
             self.end_headers()
             self.wfile.write(encoded)
 
+        def _authorized(self) -> bool:
+            if not dashboard_token:
+                return True
+            auth = self.headers.get("Authorization") or ""
+            token = self.headers.get("X-Operations-Dashboard-Token") or ""
+            if auth.startswith("Bearer "):
+                token = auth[7:]
+            return token == dashboard_token
+
+        def _actor(self) -> str:
+            return self.headers.get("X-Operations-Actor") or "operator"
+
+        def _roles(self) -> list[str]:
+            raw = self.headers.get("X-Operations-Roles") or ""
+            return [item.strip() for item in raw.split(",") if item.strip()]
+
+        def _department(self) -> str | None:
+            value = self.headers.get("X-Operations-Department")
+            return value.strip() if value and value.strip() else None
+
     return MetricsHandler
 
 
@@ -1538,6 +3032,49 @@ def create_metrics_server(
     return ThreadingHTTPServer(
         (host, port),
         make_metrics_handler(lambda: build_prometheus_metrics(session_store, limit)),
+    )
+
+
+def create_operations_dashboard_server(
+    session_store: SessionStore,
+    host: str = "127.0.0.1",
+    port: int = 9110,
+    limit: int = 20,
+    token: str | None = None,
+) -> ThreadingHTTPServer:
+    return ThreadingHTTPServer(
+        (host, port),
+        make_metrics_handler(
+            lambda: build_prometheus_metrics(session_store, limit),
+            lambda owner, since, cursor, department, tenant, checkpoint, request_limit: build_operations_closed_loop_dashboard_json(
+                session_store,
+                request_limit or limit,
+                owner=owner,
+                since=since,
+                cursor=cursor,
+                department=department,
+                tenant=tenant,
+                checkpoint=checkpoint,
+            ),
+            lambda request_limit: build_oncall_webhook_ops_console_json(session_store, request_limit or limit),
+            lambda request_limit: build_oncall_webhook_replay_jobs_json(session_store, request_limit or limit),
+            lambda request_limit: build_operations_console_overview_json(session_store, request_limit or limit),
+            lambda request_limit, actor, roles, department: build_operations_console_view_json(
+                session_store,
+                request_limit or limit,
+                actor=actor,
+                roles=roles,
+                department=department,
+            ),
+            lambda request_limit, actor, roles, department: build_operations_console_view_html(
+                session_store,
+                request_limit or limit,
+                actor=actor,
+                roles=roles,
+                department=department,
+            ),
+            dashboard_token=token,
+        ),
     )
 
 
@@ -1558,10 +3095,46 @@ def serve_metrics(
         server.server_close()
 
 
+def serve_operations_dashboard(
+    session_store: SessionStore,
+    host: str = "127.0.0.1",
+    port: int = 9110,
+    limit: int = 20,
+    token: str | None = None,
+) -> None:
+    server = create_operations_dashboard_server(session_store, host=host, port=port, limit=limit, token=token)
+    actual_host, actual_port = server.server_address
+    print(f"Serving operations dashboard on http://{actual_host}:{actual_port}/operations/closed-loop")
+    print(f"Serving OnCall webhook ops on http://{actual_host}:{actual_port}/operations/oncall-webhook-ops")
+    print(f"Serving operations console on http://{actual_host}:{actual_port}/operations/console")
+    print(f"Serving operations console UI on http://{actual_host}:{actual_port}/operations/console/ui")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+
+
 def run_metrics_server_in_thread(server: ThreadingHTTPServer) -> Thread:
     thread = Thread(target=server.serve_forever, daemon=True)
     thread.start()
     return thread
+
+
+def _first_query_value(query: dict[str, list[str]], key: str) -> str | None:
+    values = query.get(key) or []
+    return values[0] if values else None
+
+
+def _first_query_int(query: dict[str, list[str]], key: str) -> int | None:
+    value = _first_query_value(query, key)
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
 
 
 def _metric_label(value: object) -> str:
@@ -1599,7 +3172,13 @@ def _replace_session_db(settings: IntegrationSettings, session_db_path: str) -> 
         alert_api_url=settings.alert_api_url,
         oncall_api_url=settings.oncall_api_url,
         oncall_status_api_url=settings.oncall_status_api_url,
+        oncall_webhook_secret=settings.oncall_webhook_secret,
         closed_loop_api_url=settings.closed_loop_api_url,
+        closed_loop_schema_registry_url=settings.closed_loop_schema_registry_url,
+        recovery_approval_api_url=settings.recovery_approval_api_url,
+        recovery_governance_policy_json=settings.recovery_governance_policy_json,
+        recovery_governance_policy_api_url=settings.recovery_governance_policy_api_url,
+        operations_dashboard_token=settings.operations_dashboard_token,
         alert_rules_json=settings.alert_rules_json,
         trend_alert_rules_json=settings.trend_alert_rules_json,
         action_sla_policy_json=settings.action_sla_policy_json,
@@ -1616,6 +3195,9 @@ def _replace_session_db(settings: IntegrationSettings, session_db_path: str) -> 
         alert_api_token=settings.alert_api_token,
         oncall_api_token=settings.oncall_api_token,
         closed_loop_api_token=settings.closed_loop_api_token,
+        closed_loop_schema_registry_api_token=settings.closed_loop_schema_registry_api_token,
+        recovery_approval_api_token=settings.recovery_approval_api_token,
+        recovery_governance_policy_api_token=settings.recovery_governance_policy_api_token,
         otlp_api_token=settings.otlp_api_token,
         use_mock_fallback=settings.use_mock_fallback,
         notification_use_mock_fallback=settings.notification_use_mock_fallback,
@@ -1651,6 +3233,155 @@ def _has_persistent_session_store(settings: IntegrationSettings) -> bool:
     if backend == "memory":
         return False
     return bool(settings.session_db_path or settings.session_store_api_url)
+
+
+def _load_webhook_body(webhook_json: str | None, webhook_file: str | None) -> str:
+    if webhook_json and webhook_file:
+        raise SystemExit("Use either --record-oncall-webhook-json or --record-oncall-webhook-file, not both.")
+    if webhook_file:
+        return Path(webhook_file).read_text(encoding="utf-8-sig")
+    if webhook_json is None:
+        raise SystemExit("OnCall webhook payload is required.")
+    return webhook_json
+
+
+def _load_json_object(
+    json_text: str | None,
+    json_file: str | None,
+    json_flag: str,
+    file_flag: str,
+) -> dict[str, Any]:
+    if json_text and json_file:
+        raise SystemExit(f"Use either {json_flag} or {file_flag}, not both.")
+    raw = None
+    if json_file:
+        raw = Path(json_file).read_text(encoding="utf-8-sig")
+    elif json_text is not None:
+        raw = json_text
+    if raw is None:
+        return {}
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"JSON payload is not valid: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise SystemExit("JSON payload requires an object.")
+    return payload
+
+
+def _save_scheduled_closed_loop_snapshot(
+    session_store: SessionStore,
+    limit: int,
+    sla_policy_json: str | None,
+    sla_now: str | None,
+) -> dict[str, object]:
+    trend_alerts = [
+        operations_trend_alert_from_dict(item)
+        for item in session_store.list_operations_trend_alerts(limit)
+    ]
+    action_items = [
+        operations_action_item_from_dict(item)
+        for item in session_store.list_operations_action_items(limit)
+    ]
+    knowledge_entries = [
+        operations_knowledge_entry_from_dict(item)
+        for item in session_store.list_operations_knowledge_entries(limit)
+    ]
+    sla_report = evaluate_operations_action_sla(
+        action_items,
+        now=sla_now,
+    )
+    report = build_operations_closed_loop_report(
+        trend_alerts=trend_alerts,
+        action_items=action_items,
+        knowledge_entries=knowledge_entries,
+        sla_report=sla_report,
+    )
+    snapshot = build_operations_closed_loop_snapshot(report)
+    session_store.record_operations_closed_loop_snapshot(operations_closed_loop_snapshot_to_dict(snapshot))
+    return {"snapshot_id": snapshot.snapshot_id, "closure_rate": snapshot.report.closure_rate}
+
+
+def _build_operations_schedule_handlers(session_store: SessionStore, args: argparse.Namespace) -> dict[str, Callable[[object], dict[str, object]]]:
+    def _load_closed_loop_dashboard() -> object:
+        snapshots = [
+            operations_closed_loop_snapshot_from_dict(item)
+            for item in session_store.list_operations_closed_loop_snapshots(
+                max(100, args.closed_loop_dashboard_limit or args.observability_limit)
+            )
+        ]
+        return build_operations_closed_loop_dashboard(
+            snapshots,
+            limit=args.closed_loop_dashboard_limit or args.observability_limit,
+            owner=args.closed_loop_dashboard_owner,
+            since=args.closed_loop_dashboard_since,
+            cursor=args.closed_loop_dashboard_cursor,
+            department=args.closed_loop_dashboard_department,
+            tenant=args.closed_loop_dashboard_tenant,
+            checkpoint=args.closed_loop_dashboard_checkpoint,
+        )
+
+    def _execute_replay_jobs(_: object) -> dict[str, object]:
+        events = [
+            oncall_webhook_event_from_dict(item)
+            for item in session_store.list_oncall_webhook_events(args.observability_limit)
+        ]
+        jobs = [
+            oncall_webhook_replay_job_from_dict(item)
+            for item in session_store.list_oncall_webhook_replay_jobs(args.observability_limit)
+        ]
+        executions = []
+        for job in jobs:
+            if job.status != "PENDING":
+                continue
+            execution = execute_oncall_webhook_replay_job(job, events)
+            executions.append(execution)
+            session_store.record_oncall_webhook_replay_job(oncall_webhook_replay_job_to_dict(execution.job))
+            for event in execution.replayed_events:
+                session_store.record_oncall_webhook_event(oncall_webhook_event_to_dict(event))
+            for status in execution.statuses:
+                session_store.record_oncall_ticket_status(oncall_ticket_status_to_dict(status))
+        return {
+            "executed_jobs": len(executions),
+            "failed_jobs": sum(1 for execution in executions if execution.result.failed),
+        }
+
+    return {
+        "closed_loop_snapshot": lambda task: _save_scheduled_closed_loop_snapshot(
+            session_store,
+            args.observability_limit,
+            args.recovery_approval_sla_policy_json,
+            args.recovery_approval_sla_now,
+        ),
+        "closed_loop_checkpoint": lambda task: {
+            "checkpoint": build_operations_closed_loop_checkpoint_plan(_load_closed_loop_dashboard()).next_checkpoint
+        },
+        "closed_loop_quality": lambda task: {
+            "ok": evaluate_operations_closed_loop_quality(_load_closed_loop_dashboard()).ok
+        },
+        "recovery_approval_sla": lambda task: {
+            "findings": len(
+                evaluate_recovery_approval_sla(
+                    session_store.list_recent(args.observability_limit),
+                    policy=build_recovery_approval_sla_policy(args.recovery_approval_sla_policy_json),
+                    now=args.recovery_approval_sla_now,
+                ).findings
+            )
+        },
+        "webhook_replay_jobs": _execute_replay_jobs,
+    }
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _latest_recovery_execution_payload(context: TravelContext) -> dict[str, Any] | None:
+    for record in reversed(context.recovery_records):
+        execution = record.payload.get("strategy_execution") if isinstance(record.payload, dict) else None
+        if isinstance(execution, dict):
+            return execution
+    return None
 
 
 def _validate_required_trip_args(args: argparse.Namespace) -> None:

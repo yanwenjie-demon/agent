@@ -39,7 +39,13 @@ class IntegrationSettings:
     alert_api_url: str | None = None
     oncall_api_url: str | None = None
     oncall_status_api_url: str | None = None
+    oncall_webhook_secret: str | None = None
     closed_loop_api_url: str | None = None
+    closed_loop_schema_registry_url: str | None = None
+    recovery_approval_api_url: str | None = None
+    recovery_governance_policy_json: str | None = None
+    recovery_governance_policy_api_url: str | None = None
+    operations_dashboard_token: str | None = None
     alert_rules_json: str | None = None
     trend_alert_rules_json: str | None = None
     action_sla_policy_json: str | None = None
@@ -56,6 +62,9 @@ class IntegrationSettings:
     alert_api_token: str | None = None
     oncall_api_token: str | None = None
     closed_loop_api_token: str | None = None
+    closed_loop_schema_registry_api_token: str | None = None
+    recovery_approval_api_token: str | None = None
+    recovery_governance_policy_api_token: str | None = None
     otlp_api_token: str | None = None
     use_mock_fallback: bool = True
     notification_use_mock_fallback: bool = True
@@ -98,7 +107,13 @@ class IntegrationSettings:
             alert_api_url=_optional_env("TRAVEL_ALERT_API_URL"),
             oncall_api_url=_optional_env("TRAVEL_ONCALL_API_URL"),
             oncall_status_api_url=_optional_env("TRAVEL_ONCALL_STATUS_API_URL"),
+            oncall_webhook_secret=_optional_env("TRAVEL_ONCALL_WEBHOOK_SECRET"),
             closed_loop_api_url=_optional_env("TRAVEL_CLOSED_LOOP_API_URL"),
+            closed_loop_schema_registry_url=_optional_env("TRAVEL_CLOSED_LOOP_SCHEMA_REGISTRY_URL"),
+            recovery_approval_api_url=_optional_env("TRAVEL_RECOVERY_APPROVAL_API_URL"),
+            recovery_governance_policy_json=_optional_env("TRAVEL_RECOVERY_GOVERNANCE_POLICY_JSON"),
+            recovery_governance_policy_api_url=_optional_env("TRAVEL_RECOVERY_GOVERNANCE_POLICY_API_URL"),
+            operations_dashboard_token=_optional_env("TRAVEL_OPERATIONS_DASHBOARD_TOKEN"),
             alert_rules_json=_optional_env("TRAVEL_ALERT_RULES_JSON"),
             trend_alert_rules_json=_optional_env("TRAVEL_TREND_ALERT_RULES_JSON"),
             action_sla_policy_json=_optional_env("TRAVEL_ACTION_SLA_POLICY_JSON"),
@@ -115,6 +130,9 @@ class IntegrationSettings:
             alert_api_token=_optional_env("TRAVEL_ALERT_API_TOKEN"),
             oncall_api_token=_optional_env("TRAVEL_ONCALL_API_TOKEN"),
             closed_loop_api_token=_optional_env("TRAVEL_CLOSED_LOOP_API_TOKEN"),
+            closed_loop_schema_registry_api_token=_optional_env("TRAVEL_CLOSED_LOOP_SCHEMA_REGISTRY_API_TOKEN"),
+            recovery_approval_api_token=_optional_env("TRAVEL_RECOVERY_APPROVAL_API_TOKEN"),
+            recovery_governance_policy_api_token=_optional_env("TRAVEL_RECOVERY_GOVERNANCE_POLICY_API_TOKEN"),
             otlp_api_token=_optional_env("TRAVEL_OTLP_API_TOKEN"),
             use_mock_fallback=_bool_env("TRAVEL_USE_MOCK_FALLBACK", True),
             notification_use_mock_fallback=_bool_env("TRAVEL_NOTIFICATION_USE_MOCK_FALLBACK", True),

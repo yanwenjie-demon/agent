@@ -523,6 +523,8 @@ class TravelAgent:
         release_inventory: bool = True,
         cancel_order: bool = True,
         cancel_approval: bool = True,
+        enforce_strategy_gate: bool = False,
+        recovery_approval_override: bool = False,
     ) -> TravelContext:
         if context.state not in {
             TravelState.APPROVAL_CREATED.value,
@@ -576,6 +578,110 @@ class TravelAgent:
                         f"cancel_approval {approval_cancellation.target_id} -> {approval_cancellation.status}."
                     )
 
+        recovery_knowledge_refs: list[str] = []
+        recovery_guidance: list[str] = []
+        try:
+            recovery_report = self._search_recovery_knowledge(context, from_state, reason)
+        except Exception as exc:
+            recovery_report = None
+            context.append_event(f"Operations knowledge recovery search skipped: {exc}")
+        if recovery_report is not None and recovery_report.hits:
+            recovery_knowledge_refs = [hit.entry.entry_id for hit in recovery_report.hits]
+            recovery_guidance = recovery_report.suggested_actions
+            context.agent_executions.append(
+                AgentExecutionRecord(
+                    agent_name="RecoveryKnowledgeAgent",
+                    action="search_operations_knowledge",
+                    status="SUCCESS",
+                    input_refs={
+                        "session_id": context.session_id,
+                        "workflow_generation": context.workflow_generation,
+                        "from_state": from_state,
+                        "reason": reason,
+                        "query": recovery_report.query,
+                    },
+                    output_refs={
+                        "knowledge_refs": recovery_knowledge_refs,
+                        "suggested_actions": recovery_guidance,
+                    },
+                    message="Historical operations knowledge attached to recovery plan.",
+                    created_at=datetime.now(timezone.utc).isoformat(),
+                )
+            )
+            context.append_event(
+                f"Operations knowledge applied to recovery: {len(recovery_knowledge_refs)} hits, "
+                f"{len(recovery_guidance)} suggested actions."
+            )
+
+        from .operations import (
+            decide_recovery_strategy,
+            evaluate_recovery_strategy_gate,
+            recovery_strategy_decision_to_dict,
+            recovery_strategy_gate_result_to_dict,
+        )
+
+        recovery_decision = decide_recovery_strategy(
+            context,
+            from_state=from_state,
+            reason=reason,
+            knowledge_refs=recovery_knowledge_refs,
+            guidance=recovery_guidance,
+        )
+        recovery_decision_payload = recovery_strategy_decision_to_dict(recovery_decision)
+        recovery_gate = evaluate_recovery_strategy_gate(recovery_decision, approved=recovery_approval_override)
+        recovery_gate_payload = recovery_strategy_gate_result_to_dict(recovery_gate)
+        for step in recovery_decision.recommended_next_steps:
+            if step not in recovery_guidance:
+                recovery_guidance.append(step)
+        context.agent_executions.append(
+            AgentExecutionRecord(
+                agent_name="RecoveryStrategyAgent",
+                action="decide_recovery_strategy",
+                status="SUCCESS",
+                input_refs={
+                    "session_id": context.session_id,
+                    "workflow_generation": context.workflow_generation,
+                    "from_state": from_state,
+                    "reason": reason,
+                },
+                output_refs=recovery_decision_payload,
+                message=(
+                    f"Recovery strategy {recovery_decision.action} selected with "
+                    f"{recovery_decision.severity} severity; gate={recovery_gate.status}."
+                ),
+                created_at=datetime.now(timezone.utc).isoformat(),
+            )
+        )
+        context.append_event(
+            "Recovery strategy decided: "
+            f"{recovery_decision.action} severity={recovery_decision.severity} gate={recovery_gate.status}."
+        )
+
+        if enforce_strategy_gate and not recovery_gate.allow_automation:
+            context.recovery_records.append(
+                RecoveryRecord(
+                    recovery_id="RCV-" + uuid4().hex[:10].upper(),
+                    action="gate_blocked",
+                    reason=reason,
+                    from_state=from_state,
+                    to_state=context.state,
+                    payload={
+                        "workflow_generation": context.workflow_generation,
+                        "compensations": compensation_payload,
+                        "knowledge_refs": recovery_knowledge_refs,
+                        "guidance": recovery_guidance,
+                        "strategy_decision": recovery_decision_payload,
+                        "strategy_gate": recovery_gate_payload,
+                    },
+                    created_at=datetime.now(timezone.utc).isoformat(),
+                )
+            )
+            context.append_event(
+                f"Recovery automation blocked by strategy gate: {', '.join(recovery_gate.required_approvals)}."
+            )
+            self.session_store.save(context)
+            return context
+
         context.workflow_generation += 1
         context.selected_hotel = None
         context.selected_transport = None
@@ -588,6 +694,11 @@ class TravelAgent:
         context.order_cancellation = None
         context.transport_order_cancellation = None
         context.inventory_release = None
+        context.task_plan = self.planner.build_plan(
+            context.request,
+            knowledge_refs=recovery_knowledge_refs,
+            guidance=recovery_guidance,
+        )
 
         if context.policy_result is None or context.transport_policy_result is None:
             context = self.agent_team.policy.check(context)
@@ -610,6 +721,10 @@ class TravelAgent:
                     "compensations": compensation_payload,
                     "hotel_count": len(context.hotel_options),
                     "transport_count": len(context.transport_options),
+                    "knowledge_refs": recovery_knowledge_refs,
+                    "guidance": recovery_guidance,
+                    "strategy_decision": recovery_decision_payload,
+                    "strategy_gate": recovery_gate_payload,
                 },
                 created_at=datetime.now(timezone.utc).isoformat(),
             )
@@ -617,6 +732,336 @@ class TravelAgent:
         context.append_event(
             f"Recovery replan completed from {from_state}; generation {context.workflow_generation} is ready."
         )
+        self.session_store.save(context)
+        return context
+
+    def execute_recovery_strategy(
+        self,
+        context: TravelContext,
+        reason: str = "strategy_recovery",
+        enforce_strategy_gate: bool = True,
+        approval_override: bool = False,
+        approved_by: str | None = None,
+        approval_reason: str | None = None,
+        governance_policy: Any | None = None,
+    ) -> TravelContext:
+        from .operations import (
+            RecoveryStrategyExecutionResult,
+            build_recovery_approval_receipt,
+            decide_recovery_strategy,
+            evaluate_recovery_governance_policy,
+            evaluate_recovery_strategy_gate,
+            recovery_approval_receipt_to_dict,
+            recovery_governance_decision_to_dict,
+            recovery_strategy_decision_to_dict,
+            recovery_strategy_execution_result_to_dict,
+            recovery_strategy_gate_result_to_dict,
+        )
+
+        from_state = context.state
+        recovery_knowledge_refs: list[str] = []
+        recovery_guidance: list[str] = []
+        try:
+            recovery_report = self._search_recovery_knowledge(context, from_state, reason)
+        except Exception as exc:
+            recovery_report = None
+            context.append_event(f"Operations knowledge recovery search skipped: {exc}")
+        if recovery_report is not None and recovery_report.hits:
+            recovery_knowledge_refs = [hit.entry.entry_id for hit in recovery_report.hits]
+            recovery_guidance = recovery_report.suggested_actions
+
+        decision = decide_recovery_strategy(
+            context,
+            from_state=from_state,
+            reason=reason,
+            knowledge_refs=recovery_knowledge_refs,
+            guidance=recovery_guidance,
+        )
+        gate = evaluate_recovery_strategy_gate(decision, approved=approval_override)
+        governance = evaluate_recovery_governance_policy(decision, context, governance_policy)
+        decision_payload = recovery_strategy_decision_to_dict(decision)
+        gate_payload = recovery_strategy_gate_result_to_dict(gate)
+        governance_payload = recovery_governance_decision_to_dict(governance)
+        executed_steps: list[str] = [
+            "decide_recovery_strategy",
+            "evaluate_recovery_strategy_gate",
+            "evaluate_recovery_governance_policy",
+        ]
+        skipped_steps: list[str] = []
+        idempotency_key = _recovery_execution_idempotency_key(context, decision.decision_id, reason)
+        existing_execution = _find_recovery_execution_by_idempotency_key(context, idempotency_key)
+        if existing_execution is not None and (
+            existing_execution.get("status") == "EXECUTED" or not approval_override
+        ):
+            created_at = datetime.now(timezone.utc).isoformat()
+            execution = RecoveryStrategyExecutionResult(
+                execution_id="RSE-" + uuid4().hex[:10].upper(),
+                decision_id=decision.decision_id,
+                action=decision.action,
+                status="SKIPPED",
+                from_state=from_state,
+                to_state=context.state,
+                gate_status=gate.status,
+                approval_override=approval_override,
+                executed_steps=executed_steps,
+                skipped_steps=[decision.action],
+                detail="Duplicate recovery execution skipped by idempotency key.",
+                created_at=created_at,
+                idempotency_key=idempotency_key,
+                approval_receipt=dict(existing_execution.get("approval_receipt") or {}) or None,
+            )
+            execution_payload = recovery_strategy_execution_result_to_dict(execution)
+            execution_payload["idempotent"] = True
+            context.recovery_records.append(
+                RecoveryRecord(
+                    recovery_id="RCV-" + uuid4().hex[:10].upper(),
+                    action="strategy_execution_idempotent_skip",
+                    reason=reason,
+                    from_state=from_state,
+                    to_state=context.state,
+                    payload={
+                        "workflow_generation": context.workflow_generation,
+                        "strategy_decision": decision_payload,
+                        "strategy_gate": gate_payload,
+                        "strategy_governance": governance_payload,
+                        "strategy_execution": execution_payload,
+                    },
+                    created_at=created_at,
+                )
+            )
+            context.agent_executions.append(
+                AgentExecutionRecord(
+                    agent_name="RecoveryStrategyExecutor",
+                    action="execute_recovery_strategy",
+                    status="SKIPPED",
+                    input_refs={"session_id": context.session_id, "from_state": from_state, "reason": reason},
+                    output_refs=execution_payload,
+                    message="Recovery strategy execution skipped by idempotency key.",
+                    created_at=created_at,
+                )
+            )
+            context.append_event("Recovery strategy execution skipped by idempotency key.")
+            self.session_store.save(context)
+            return context
+        approval_receipt = None
+        if approval_override:
+            receipt = build_recovery_approval_receipt(
+                decision.decision_id,
+                gate.required_approvals,
+                approved_by=approved_by,
+                reason=approval_reason,
+            )
+            approval_receipt = recovery_approval_receipt_to_dict(receipt)
+
+        if not governance.allow_automation:
+            created_at = datetime.now(timezone.utc).isoformat()
+            execution = RecoveryStrategyExecutionResult(
+                execution_id="RSE-" + uuid4().hex[:10].upper(),
+                decision_id=decision.decision_id,
+                action=decision.action,
+                status="BLOCKED",
+                from_state=from_state,
+                to_state=context.state,
+                gate_status="GOVERNANCE_BLOCKED",
+                approval_override=approval_override,
+                executed_steps=executed_steps,
+                skipped_steps=[decision.action],
+                detail="; ".join(governance.reasons),
+                created_at=created_at,
+                idempotency_key=idempotency_key,
+                approval_receipt=approval_receipt,
+            )
+            execution_payload = recovery_strategy_execution_result_to_dict(execution)
+            context.recovery_records.append(
+                RecoveryRecord(
+                    recovery_id="RCV-" + uuid4().hex[:10].upper(),
+                    action="strategy_execution_governance_blocked",
+                    reason=reason,
+                    from_state=from_state,
+                    to_state=context.state,
+                    payload={
+                        "workflow_generation": context.workflow_generation,
+                        "strategy_decision": decision_payload,
+                        "strategy_gate": gate_payload,
+                        "strategy_governance": governance_payload,
+                        "strategy_execution": execution_payload,
+                    },
+                    created_at=created_at,
+                )
+            )
+            context.agent_executions.append(
+                AgentExecutionRecord(
+                    agent_name="RecoveryStrategyExecutor",
+                    action="execute_recovery_strategy",
+                    status="BLOCKED",
+                    input_refs={"session_id": context.session_id, "from_state": from_state, "reason": reason},
+                    output_refs=execution_payload,
+                    message=f"Recovery strategy execution blocked by governance {governance.status}.",
+                    created_at=created_at,
+                )
+            )
+            context.append_event("Recovery strategy execution blocked by governance policy.")
+            self.session_store.save(context)
+            return context
+
+        if enforce_strategy_gate and not gate.allow_automation:
+            execution = RecoveryStrategyExecutionResult(
+                execution_id="RSE-" + uuid4().hex[:10].upper(),
+                decision_id=decision.decision_id,
+                action=decision.action,
+                status="BLOCKED",
+                from_state=from_state,
+                to_state=context.state,
+                gate_status=gate.status,
+                approval_override=approval_override,
+                executed_steps=executed_steps,
+                skipped_steps=[decision.action],
+                detail="; ".join(gate.reasons),
+                created_at=datetime.now(timezone.utc).isoformat(),
+                idempotency_key=idempotency_key,
+                approval_receipt=approval_receipt,
+            )
+            execution_payload = recovery_strategy_execution_result_to_dict(execution)
+            context.recovery_records.append(
+                RecoveryRecord(
+                    recovery_id="RCV-" + uuid4().hex[:10].upper(),
+                    action="strategy_execution_blocked",
+                    reason=reason,
+                    from_state=from_state,
+                    to_state=context.state,
+                    payload={
+                        "workflow_generation": context.workflow_generation,
+                        "strategy_decision": decision_payload,
+                        "strategy_gate": gate_payload,
+                        "strategy_governance": governance_payload,
+                        "strategy_execution": execution_payload,
+                    },
+                    created_at=execution.created_at,
+                )
+            )
+            context.agent_executions.append(
+                AgentExecutionRecord(
+                    agent_name="RecoveryStrategyExecutor",
+                    action="execute_recovery_strategy",
+                    status="BLOCKED",
+                    input_refs={"session_id": context.session_id, "from_state": from_state, "reason": reason},
+                    output_refs=execution_payload,
+                    message=f"Recovery strategy execution blocked by gate {gate.status}.",
+                    created_at=execution.created_at,
+                )
+            )
+            context.append_event(f"Recovery strategy execution blocked: {', '.join(gate.required_approvals)}.")
+            self.session_store.save(context)
+            return context
+
+        detail = ""
+        if decision.action == "retry_status_refresh":
+            context = self._execute_recovery_status_refresh(context)
+            executed_steps.append("retry_status_refresh")
+            detail = "Refreshed supplier, approval, or order status before further recovery."
+        elif decision.action in {"replan", "knowledge_guided_replan"}:
+            context = self.replan_after_exception(
+                context,
+                reason=reason,
+                enforce_strategy_gate=False,
+                recovery_approval_override=approval_override,
+            )
+            executed_steps.append(decision.action)
+            detail = "Replanned without compensation because the selected strategy did not require it."
+        elif decision.action == "compensate_then_replan":
+            context = self.replan_after_exception(
+                context,
+                reason=reason,
+                enforce_strategy_gate=False,
+                recovery_approval_override=approval_override,
+            )
+            executed_steps.append("compensate_then_replan")
+            detail = "Completed eligible compensations and rebuilt the travel plan."
+        else:
+            skipped_steps.append(decision.action)
+            detail = f"Unsupported recovery strategy action: {decision.action}."
+
+        status = "EXECUTED" if not skipped_steps else "SKIPPED"
+        execution = RecoveryStrategyExecutionResult(
+            execution_id="RSE-" + uuid4().hex[:10].upper(),
+            decision_id=decision.decision_id,
+            action=decision.action,
+            status=status,
+            from_state=from_state,
+            to_state=context.state,
+            gate_status=gate.status,
+            approval_override=approval_override,
+            executed_steps=executed_steps,
+            skipped_steps=skipped_steps,
+            detail=detail,
+            created_at=datetime.now(timezone.utc).isoformat(),
+            idempotency_key=idempotency_key,
+            approval_receipt=approval_receipt,
+        )
+        execution_payload = recovery_strategy_execution_result_to_dict(execution)
+        context.recovery_records.append(
+            RecoveryRecord(
+                recovery_id="RCV-" + uuid4().hex[:10].upper(),
+                action="strategy_execution",
+                reason=reason,
+                from_state=from_state,
+                to_state=context.state,
+                payload={
+                    "workflow_generation": context.workflow_generation,
+                    "strategy_decision": decision_payload,
+                    "strategy_gate": gate_payload,
+                    "strategy_governance": governance_payload,
+                    "strategy_execution": execution_payload,
+                },
+                created_at=execution.created_at,
+            )
+        )
+        context.agent_executions.append(
+            AgentExecutionRecord(
+                agent_name="RecoveryStrategyExecutor",
+                action="execute_recovery_strategy",
+                status=status,
+                input_refs={"session_id": context.session_id, "from_state": from_state, "reason": reason},
+                output_refs=execution_payload,
+                message=f"Recovery strategy {decision.action} execution {status.lower()}.",
+                created_at=execution.created_at,
+            )
+        )
+        context.append_event(f"Recovery strategy execution {status.lower()}: {decision.action}.")
+        self.session_store.save(context)
+        return context
+
+    def _execute_recovery_status_refresh(self, context: TravelContext) -> TravelContext:
+        if context.state in {TravelState.APPROVAL_CREATED.value, TravelState.APPROVAL_REJECTED.value} and context.approval is not None:
+            if context.state == TravelState.APPROVAL_REJECTED.value:
+                context = self.agent_team.approval.refresh(context)
+                self.session_store.save(context)
+                return context
+            return self.refresh_approval_status(context)
+        if context.state in {TravelState.ORDER_CREATED.value, TravelState.COMPLETED.value} and context.order is not None:
+            return self.refresh_order_status(context)
+        if context.state in {TravelState.PRICE_CHANGED.value, TravelState.INVENTORY_EXPIRED.value} and context.inventory_lock is not None:
+            context = self.agent_team.hotel.verify_price(context)
+            price_check = context.price_check
+            price_status = self._normalize_status(price_check.status)
+            if context.state == TravelState.PRICE_CHANGED.value and not self._price_requires_confirmation(price_check):
+                self.state_machine.transition(context, TravelState.INVENTORY_LOCKED)
+            elif context.state == TravelState.INVENTORY_EXPIRED.value and price_status not in {
+                "SOLD_OUT",
+                "UNAVAILABLE",
+                "INVENTORY_EXPIRED",
+                "NO_INVENTORY",
+            }:
+                self.state_machine.transition(context, TravelState.PLAN_GENERATED)
+            self.session_store.save(context)
+            return context
+        if context.state == TravelState.ORDER_FAILED.value and context.order is not None:
+            return self.refresh_order_status(context)
+        if context.state == TravelState.ORDER_FAILED.value and context.transport_order is not None:
+            context = self.agent_team.transport.refresh_order(context)
+            self.session_store.save(context)
+            return context
+        context.append_event(f"Recovery status refresh skipped for state {context.state}.")
         self.session_store.save(context)
         return context
 
@@ -856,6 +1301,22 @@ class TravelAgent:
             return None
         return search_operations_knowledge(entries, self._planning_knowledge_query(request), limit=5)
 
+    def _search_recovery_knowledge(
+        self,
+        context: TravelContext,
+        from_state: str,
+        reason: str,
+    ) -> OperationsKnowledgeSearchReport | None:
+        from .operations import operations_knowledge_entry_from_dict, search_operations_knowledge
+
+        entries = [
+            operations_knowledge_entry_from_dict(item)
+            for item in self.session_store.list_operations_knowledge_entries(limit=20)
+        ]
+        if not entries:
+            return None
+        return search_operations_knowledge(entries, self._recovery_knowledge_query(context, from_state, reason), limit=5)
+
     @staticmethod
     def _planning_knowledge_query(request: TravelRequest) -> str:
         tokens = [
@@ -873,6 +1334,29 @@ class TravelAgent:
             "order",
             "notification",
             "calendar",
+        ]
+        return " ".join(token for token in tokens if token)
+
+    @staticmethod
+    def _recovery_knowledge_query(context: TravelContext, from_state: str, reason: str) -> str:
+        request = context.request
+        tokens = [
+            from_state,
+            reason,
+            request.origin_city,
+            request.destination_city,
+            request.purpose,
+            request.venue,
+            context.approval.status if context.approval else "",
+            context.price_check.status if context.price_check else "",
+            context.order.status if context.order else "",
+            context.transport_order.status if context.transport_order else "",
+            "approval",
+            "price",
+            "inventory",
+            "order",
+            "recovery",
+            "compensation",
         ]
         return " ".join(token for token in tokens if token)
 
@@ -1378,6 +1862,26 @@ class TravelAgent:
             return int(generation)
         except (TypeError, ValueError):
             return 1
+
+
+def _recovery_execution_idempotency_key(context: TravelContext, decision_id: str, reason: str) -> str:
+    return (
+        f"recovery-execution:{context.session_id}:"
+        f"{context.workflow_generation}:{decision_id}:{reason}"
+    )
+
+
+def _find_recovery_execution_by_idempotency_key(
+    context: TravelContext,
+    idempotency_key: str,
+) -> dict[str, Any] | None:
+    if not idempotency_key:
+        return None
+    for record in reversed(context.recovery_records):
+        execution = record.payload.get("strategy_execution") if isinstance(record.payload, dict) else None
+        if isinstance(execution, dict) and execution.get("idempotency_key") == idempotency_key:
+            return execution
+    return None
 
 
 def build_default_agent(

@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import json
 import hashlib
+import hmac
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
+from html import escape
 from typing import Any
 from uuid import uuid4
 
 from .config import IntegrationSettings
-from .data_governance import AuditSinkResult
+from .data_governance import AuditSink, AuditSinkResult, build_audit_event
 from .governance import ReleaseReadinessReport, run_release_readiness_report
 from .models import (
     DeadLetterCalendarSync,
@@ -329,6 +331,7 @@ class OperationsClosedLoopReport:
     knowledge_entries: int
     knowledge_topics: dict[str, int]
     source_counts: dict[str, int]
+    owner_counts: dict[str, int]
     recommendations: list[str]
 
 
@@ -337,6 +340,7 @@ class OperationsClosedLoopSnapshot:
     snapshot_id: str
     created_at: str
     report: OperationsClosedLoopReport
+    metadata: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -345,6 +349,355 @@ class OperationsActionStatusSyncReport:
     matched_items: int
     closed_items: list[OperationsActionItem]
     skipped_items: list[str]
+
+
+@dataclass(frozen=True)
+class RecoveryStrategyDecision:
+    decision_id: str
+    action: str
+    severity: str
+    reason: str
+    from_state: str
+    compensation_required: bool
+    manual_escalation_required: bool
+    knowledge_refs: list[str]
+    guidance: list[str]
+    recommended_next_steps: list[str]
+
+
+@dataclass(frozen=True)
+class RecoveryStrategyGateResult:
+    decision_id: str
+    status: str
+    allow_automation: bool
+    exit_code: int
+    required_approvals: list[str]
+    blocked_actions: list[str]
+    reasons: list[str]
+
+
+@dataclass(frozen=True)
+class RecoveryStrategyExecutionResult:
+    execution_id: str
+    decision_id: str
+    action: str
+    status: str
+    from_state: str
+    to_state: str
+    gate_status: str
+    approval_override: bool
+    executed_steps: list[str]
+    skipped_steps: list[str]
+    detail: str
+    created_at: str
+    idempotency_key: str = ""
+    approval_receipt: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class RecoveryApprovalReceipt:
+    receipt_id: str
+    decision_id: str
+    approved_by: str
+    approved_at: str
+    reason: str
+    required_approvals: list[str]
+
+
+@dataclass(frozen=True)
+class RecoveryApprovalSlaPolicy:
+    max_pending_hours: float = 24.0
+    allowed_approvers: list[str] = field(default_factory=list)
+    approver_prefixes: list[str] = field(default_factory=list)
+    required_approval_types: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class RecoveryApprovalSlaFinding:
+    decision_id: str
+    severity: str
+    age_hours: float
+    reason: str
+    required_approvals: list[str]
+    approved_by: str | None = None
+
+
+@dataclass(frozen=True)
+class RecoveryApprovalSlaReport:
+    now: str
+    checked_receipts: int
+    findings: list[RecoveryApprovalSlaFinding]
+    summary: str
+
+
+@dataclass(frozen=True)
+class RecoveryGovernancePolicy:
+    allowed_actions: list[str] = field(default_factory=list)
+    blocked_actions: list[str] = field(default_factory=list)
+    max_executions_per_session: int | None = None
+
+
+@dataclass(frozen=True)
+class RecoveryGovernanceDecision:
+    decision_id: str
+    action: str
+    status: str
+    allow_automation: bool
+    reasons: list[str]
+
+
+@dataclass(frozen=True)
+class RecoveryApprovalExportResult:
+    ok: bool
+    endpoint: str
+    delivered: int
+    failed: int
+    detail: str
+
+
+@dataclass(frozen=True)
+class RecoveryGovernancePolicyFetchResult:
+    ok: bool
+    endpoint: str
+    policy: RecoveryGovernancePolicy
+    source: str
+    detail: str
+    fetched_at: str
+
+
+@dataclass(frozen=True)
+class RecoveryGovernancePolicyAudit:
+    audit_id: str
+    changed_by: str
+    changed_at: str
+    before: dict[str, Any]
+    after: dict[str, Any]
+    changes: list[str]
+
+
+@dataclass(frozen=True)
+class OnCallWebhookEvent:
+    event_id: str
+    ticket_id: str | None
+    status: str
+    received_at: str
+    updated_at: str | None
+    accepted: bool
+    duplicate: bool
+    signature_valid: bool
+    replay: bool
+    dead_letter: bool
+    reason: str
+    payload: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class OnCallWebhookReplayResult:
+    source_event_id: str
+    status: str
+    accepted: bool
+    replayed_at: str
+    ticket_id: str | None
+    reason: str
+
+
+@dataclass(frozen=True)
+class OnCallWebhookReplayBatchResult:
+    batch_id: str
+    generated_at: str
+    attempted: int
+    accepted: int
+    failed: int
+    skipped: int
+    results: list[OnCallWebhookReplayResult]
+
+
+@dataclass(frozen=True)
+class OnCallWebhookReplayJob:
+    job_id: str
+    created_at: str
+    status: str
+    requested_by: str
+    event_ids: list[str]
+    patch_template_id: str | None
+    batch_result: OnCallWebhookReplayBatchResult | None
+    audit: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class OnCallWebhookPatchTemplate:
+    template_id: str
+    title: str
+    match_reason: str
+    patch: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class OnCallWebhookOpsConsole:
+    generated_at: str
+    total_events: int
+    dead_letters: int
+    replayed: int
+    failed_replays: int
+    retryable_event_ids: list[str]
+    failure_reasons: dict[str, int]
+    patch_templates: list[OnCallWebhookPatchTemplate]
+
+
+@dataclass(frozen=True)
+class OperationsClosedLoopDashboard:
+    schema_version: str
+    generated_at: str
+    snapshot_count: int
+    latest_snapshot: OperationsClosedLoopSnapshot | None
+    snapshots: list[OperationsClosedLoopSnapshot]
+    trends: list[OperationsTrendMetric]
+    filters: dict[str, str]
+    summary: str
+    cursor: str | None = None
+    next_cursor: str | None = None
+    limit: int = 20
+    has_more: bool = False
+    checkpoint: str | None = None
+
+
+@dataclass(frozen=True)
+class OperationsClosedLoopSchemaPublishResult:
+    ok: bool
+    endpoint: str
+    schema_version: str
+    delivered: int
+    failed: int
+    detail: str
+
+
+@dataclass(frozen=True)
+class OperationsClosedLoopQualityFinding:
+    severity: str
+    code: str
+    message: str
+    snapshot_id: str | None = None
+
+
+@dataclass(frozen=True)
+class OperationsClosedLoopQualityReport:
+    ok: bool
+    generated_at: str
+    snapshot_count: int
+    findings: list[OperationsClosedLoopQualityFinding]
+    summary: str
+
+
+@dataclass(frozen=True)
+class OperationsClosedLoopCheckpointPlan:
+    generated_at: str
+    checkpoint: str | None
+    next_checkpoint: str | None
+    snapshot_count: int
+    ready: bool
+    summary: str
+
+
+@dataclass(frozen=True)
+class OperationsClosedLoopAcceptanceReport:
+    ok: bool
+    generated_at: str
+    contract_ok: bool
+    quality_ok: bool
+    publish_ready: bool
+    checkpoint_ready: bool
+    findings: list[str]
+
+
+@dataclass(frozen=True)
+class OperationsScheduledTask:
+    task_id: str
+    task_type: str
+    cadence: str
+    next_run_at: str
+    enabled: bool
+    params: dict[str, Any] = field(default_factory=dict)
+    last_run_at: str | None = None
+    last_status: str | None = None
+    run_count: int = 0
+    failure_count: int = 0
+    lease_owner: str | None = None
+    lease_expires_at: str | None = None
+
+
+@dataclass(frozen=True)
+class OperationsScheduledTaskResult:
+    task_id: str
+    task_type: str
+    status: str
+    started_at: str
+    finished_at: str
+    detail: str
+    output: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class OperationsSchedulerRunReport:
+    run_id: str
+    started_at: str
+    finished_at: str
+    due_count: int
+    executed_count: int
+    failed_count: int
+    results: list[OperationsScheduledTaskResult]
+    summary: str
+
+
+@dataclass(frozen=True)
+class OperationsSchedulerHealthReport:
+    generated_at: str
+    run_count: int
+    task_count: int
+    failed_runs: int
+    stale_leases: int
+    alerts: list[dict[str, Any]]
+    summary: str
+
+
+@dataclass(frozen=True)
+class OperationsActionAuthorization:
+    allowed: bool
+    action: str
+    user_id: str
+    decision: PermissionDecision
+    audit_result: AuditSinkResult | None = None
+
+
+@dataclass(frozen=True)
+class OnCallWebhookReplayJobExecution:
+    job: OnCallWebhookReplayJob
+    replayed_events: list[OnCallWebhookEvent]
+    statuses: list[OnCallTicketStatus]
+    result: OnCallWebhookReplayBatchResult
+
+
+@dataclass(frozen=True)
+class OperationsConsoleOverview:
+    generated_at: str
+    closed_loop_dashboard: OperationsClosedLoopDashboard
+    webhook_ops: OnCallWebhookOpsConsole
+    replay_jobs: list[OnCallWebhookReplayJob]
+    closed_loop_quality: OperationsClosedLoopQualityReport
+    closed_loop_acceptance: OperationsClosedLoopAcceptanceReport
+    summary: str
+
+
+@dataclass(frozen=True)
+class OperationsConsoleView:
+    generated_at: str
+    actor: str
+    department: str | None
+    roles: list[str]
+    permissions: dict[str, OperationsActionAuthorization]
+    overview: OperationsConsoleOverview
+    visible_sections: list[str]
+    actions: list[dict[str, Any]]
+    read_only: bool
 
 
 def build_operations_runbook() -> OperationsRunbook:
@@ -960,6 +1313,772 @@ def render_operations_action_status_sync_report(report: OperationsActionStatusSy
     return "\n".join(lines)
 
 
+def decide_recovery_strategy(
+    context: TravelContext,
+    from_state: str,
+    reason: str,
+    knowledge_refs: list[str] | None = None,
+    guidance: list[str] | None = None,
+) -> RecoveryStrategyDecision:
+    knowledge_refs = knowledge_refs or []
+    guidance = guidance or []
+    normalized_state = from_state.strip().upper()
+    reasons: list[str] = [f"state={normalized_state}", f"reason={reason}"]
+    recommended_steps: list[str] = []
+
+    compensation_targets = _recovery_compensation_targets(context, normalized_state)
+    failed_compensations = _failed_recovery_compensations(context)
+    if knowledge_refs:
+        reasons.append(f"knowledge_hits={len(knowledge_refs)}")
+    if compensation_targets:
+        reasons.append("compensation_targets=" + ",".join(compensation_targets))
+    if failed_compensations:
+        reasons.append("failed_compensations=" + ",".join(failed_compensations))
+
+    policy_noncompliant = (
+        (context.policy_result is not None and not context.policy_result.compliant)
+        or (context.transport_policy_result is not None and not context.transport_policy_result.compliant)
+    )
+    price_requires_confirmation = bool(
+        context.price_check is not None
+        and (
+            context.price_check.requires_confirmation
+            or _normalize_status_value(context.price_check.status) == "PRICE_CHANGED"
+            or not context.price_check.policy_compliant
+        )
+    )
+    order_failed = any(
+        _normalize_status_value(getattr(order, "status", "")) in {"FAILED", "ERROR", "REJECTED"}
+        for order in (context.order, context.transport_order)
+        if order is not None
+    )
+
+    if failed_compensations:
+        action = "manual_escalation"
+        severity = "critical"
+        manual = True
+        recommended_steps.append("Open or update an incident ticket before continuing automated recovery.")
+    elif order_failed or normalized_state == "ORDER_FAILED":
+        action = "compensate_then_replan"
+        severity = "critical"
+        manual = False
+        recommended_steps.append("Complete order, inventory, and approval compensation before resubmitting.")
+    elif policy_noncompliant:
+        action = "manual_escalation"
+        severity = "critical"
+        manual = True
+        reasons.append("policy_noncompliant=true")
+        recommended_steps.append("Route to travel policy owner before rebuilding the plan.")
+    elif normalized_state in {"PRICE_CHANGED", "INVENTORY_EXPIRED"} and not compensation_targets:
+        action = "retry_status_refresh"
+        severity = "warning"
+        manual = False
+        recommended_steps.append("Refresh supplier price or inventory status before creating a new approval.")
+    elif normalized_state == "APPROVAL_REJECTED":
+        action = "knowledge_guided_replan" if knowledge_refs else "replan"
+        severity = "warning"
+        manual = False
+        recommended_steps.append("Adjust hotel or transport options and resubmit approval.")
+    elif price_requires_confirmation:
+        action = "replan"
+        severity = "warning"
+        manual = False
+        reasons.append("price_requires_confirmation=true")
+        recommended_steps.append("Rebuild candidate set using current price and policy constraints.")
+    else:
+        action = "knowledge_guided_replan" if knowledge_refs else "replan"
+        severity = "info"
+        manual = False
+        recommended_steps.append("Rebuild policy, itinerary, hotel, and transport candidates.")
+
+    recommended_steps.extend(guidance)
+    return RecoveryStrategyDecision(
+        decision_id=_stable_id("RSD", context.session_id, str(context.workflow_generation), normalized_state, reason),
+        action=action,
+        severity=severity,
+        reason="; ".join(_dedupe(reasons)),
+        from_state=normalized_state,
+        compensation_required=bool(compensation_targets),
+        manual_escalation_required=manual,
+        knowledge_refs=list(knowledge_refs),
+        guidance=list(guidance),
+        recommended_next_steps=_dedupe(recommended_steps),
+    )
+
+
+def recovery_strategy_decision_to_dict(decision: RecoveryStrategyDecision) -> dict[str, Any]:
+    return {
+        "decision_id": decision.decision_id,
+        "action": decision.action,
+        "severity": decision.severity,
+        "reason": decision.reason,
+        "from_state": decision.from_state,
+        "compensation_required": decision.compensation_required,
+        "manual_escalation_required": decision.manual_escalation_required,
+        "knowledge_refs": decision.knowledge_refs,
+        "guidance": decision.guidance,
+        "recommended_next_steps": decision.recommended_next_steps,
+    }
+
+
+def recovery_strategy_decision_from_dict(payload: dict[str, Any]) -> RecoveryStrategyDecision:
+    return RecoveryStrategyDecision(
+        decision_id=str(payload["decision_id"]),
+        action=str(payload["action"]),
+        severity=str(payload.get("severity") or "info"),
+        reason=str(payload.get("reason") or ""),
+        from_state=str(payload.get("from_state") or ""),
+        compensation_required=bool(payload.get("compensation_required", False)),
+        manual_escalation_required=bool(payload.get("manual_escalation_required", False)),
+        knowledge_refs=[str(item) for item in payload.get("knowledge_refs") or []],
+        guidance=[str(item) for item in payload.get("guidance") or []],
+        recommended_next_steps=[str(item) for item in payload.get("recommended_next_steps") or []],
+    )
+
+
+def render_recovery_strategy_decision(decision: RecoveryStrategyDecision) -> str:
+    lines = [
+        "Recovery strategy decision:",
+        f"- decision_id: {decision.decision_id}",
+        f"- action: {decision.action}",
+        f"- severity: {decision.severity}",
+        f"- from_state: {decision.from_state}",
+        f"- compensation_required: {decision.compensation_required}",
+        f"- manual_escalation_required: {decision.manual_escalation_required}",
+        f"- reason: {decision.reason}",
+        "- recommended_next_steps:",
+    ]
+    if not decision.recommended_next_steps:
+        lines.append("  - none")
+    else:
+        for step in decision.recommended_next_steps:
+            lines.append(f"  - {step}")
+    return "\n".join(lines)
+
+
+def evaluate_recovery_strategy_gate(
+    decision: RecoveryStrategyDecision,
+    approved: bool = False,
+    allow_critical_auto: bool = False,
+) -> RecoveryStrategyGateResult:
+    required: list[str] = []
+    blocked: list[str] = []
+    reasons: list[str] = []
+    if decision.manual_escalation_required:
+        required.append("incident_owner_approval")
+        blocked.append(decision.action)
+        reasons.append("manual escalation is required by the recovery strategy")
+    if decision.severity == "critical" and not allow_critical_auto:
+        required.append("critical_recovery_approval")
+        blocked.append(decision.action)
+        reasons.append("critical recovery requires approval before automated continuation")
+    if decision.compensation_required and decision.action == "compensate_then_replan" and not allow_critical_auto:
+        required.append("compensation_owner_approval")
+        reasons.append("compensation path requires owner acknowledgement")
+    required = _dedupe(required)
+    blocked = _dedupe(blocked)
+    if required and not approved:
+        status = "APPROVAL_REQUIRED"
+        allow = False
+        exit_code = 2
+    else:
+        status = "PASS"
+        allow = True
+        exit_code = 0
+        if not reasons:
+            reasons.append("strategy is eligible for automated continuation")
+        elif approved:
+            reasons.append("required approval has been provided")
+    return RecoveryStrategyGateResult(
+        decision_id=decision.decision_id,
+        status=status,
+        allow_automation=allow,
+        exit_code=exit_code,
+        required_approvals=required,
+        blocked_actions=blocked if not allow else [],
+        reasons=_dedupe(reasons),
+    )
+
+
+def recovery_strategy_gate_result_to_dict(result: RecoveryStrategyGateResult) -> dict[str, Any]:
+    return {
+        "decision_id": result.decision_id,
+        "status": result.status,
+        "allow_automation": result.allow_automation,
+        "exit_code": result.exit_code,
+        "required_approvals": result.required_approvals,
+        "blocked_actions": result.blocked_actions,
+        "reasons": result.reasons,
+    }
+
+
+def recovery_strategy_gate_result_from_dict(payload: dict[str, Any]) -> RecoveryStrategyGateResult:
+    return RecoveryStrategyGateResult(
+        decision_id=str(payload["decision_id"]),
+        status=str(payload.get("status") or "PASS"),
+        allow_automation=bool(payload.get("allow_automation", True)),
+        exit_code=int(payload.get("exit_code") or 0),
+        required_approvals=[str(item) for item in payload.get("required_approvals") or []],
+        blocked_actions=[str(item) for item in payload.get("blocked_actions") or []],
+        reasons=[str(item) for item in payload.get("reasons") or []],
+    )
+
+
+def render_recovery_strategy_gate_result(result: RecoveryStrategyGateResult) -> str:
+    lines = [
+        "Recovery strategy gate:",
+        f"- decision_id: {result.decision_id}",
+        f"- status: {result.status}",
+        f"- allow_automation: {result.allow_automation}",
+        f"- exit_code: {result.exit_code}",
+    ]
+    _append_list_section(lines, "required_approvals", result.required_approvals)
+    _append_list_section(lines, "blocked_actions", result.blocked_actions)
+    _append_list_section(lines, "reasons", result.reasons)
+    return "\n".join(lines)
+
+
+def build_recovery_approval_receipt(
+    decision_id: str,
+    required_approvals: list[str],
+    approved_by: str | None = None,
+    reason: str | None = None,
+    approved_at: str | None = None,
+) -> RecoveryApprovalReceipt:
+    approved_at = approved_at or datetime.now(timezone.utc).isoformat()
+    approved_by = approved_by or "operator"
+    reason = reason or "recovery approval override"
+    return RecoveryApprovalReceipt(
+        receipt_id=_stable_id("RAP", decision_id, approved_by, approved_at, reason),
+        decision_id=decision_id,
+        approved_by=approved_by,
+        approved_at=approved_at,
+        reason=reason,
+        required_approvals=list(required_approvals),
+    )
+
+
+def recovery_governance_policy_from_dict(payload: dict[str, Any] | None) -> RecoveryGovernancePolicy:
+    payload = payload or {}
+    max_executions = payload.get("max_executions_per_session")
+    return RecoveryGovernancePolicy(
+        allowed_actions=[str(item) for item in payload.get("allowed_actions") or []],
+        blocked_actions=[str(item) for item in payload.get("blocked_actions") or []],
+        max_executions_per_session=int(max_executions) if max_executions is not None else None,
+    )
+
+
+def recovery_governance_policy_from_json(value: str | None) -> RecoveryGovernancePolicy:
+    if not value:
+        return RecoveryGovernancePolicy()
+    parsed = json.loads(value)
+    if not isinstance(parsed, dict):
+        raise ValueError("Recovery governance policy JSON requires an object.")
+    return recovery_governance_policy_from_dict(parsed)
+
+
+def recovery_governance_policy_to_dict(policy: RecoveryGovernancePolicy) -> dict[str, Any]:
+    return {
+        "allowed_actions": policy.allowed_actions,
+        "blocked_actions": policy.blocked_actions,
+        "max_executions_per_session": policy.max_executions_per_session,
+    }
+
+
+def fetch_recovery_governance_policy_http(
+    endpoint: str,
+    token: str | None = None,
+    http_client: Any | None = None,
+    fallback_policy: RecoveryGovernancePolicy | None = None,
+) -> RecoveryGovernancePolicyFetchResult:
+    from .integrations import JsonHttpClient
+
+    fetched_at = datetime.now(timezone.utc).isoformat()
+    fallback_policy = fallback_policy or RecoveryGovernancePolicy()
+    try:
+        client = http_client or JsonHttpClient()
+        response = client.post_json(endpoint, {"source": "travel-agent", "kind": "recovery_governance_policy"}, token)
+        payload = response.get("policy") or response.get("data") or response
+        if not isinstance(payload, dict):
+            raise ValueError("Recovery governance policy endpoint returned a non-object payload.")
+        policy = recovery_governance_policy_from_dict(payload)
+    except Exception as exc:
+        return RecoveryGovernancePolicyFetchResult(
+            ok=False,
+            endpoint=endpoint,
+            policy=fallback_policy,
+            source="fallback",
+            detail=str(exc),
+            fetched_at=fetched_at,
+        )
+    return RecoveryGovernancePolicyFetchResult(
+        ok=True,
+        endpoint=endpoint,
+        policy=policy,
+        source=str(response.get("source") or "remote-config"),
+        detail=str(response.get("detail") or "recovery governance policy fetched"),
+        fetched_at=fetched_at,
+    )
+
+
+def recovery_governance_policy_fetch_result_to_dict(result: RecoveryGovernancePolicyFetchResult) -> dict[str, Any]:
+    return {
+        "ok": result.ok,
+        "endpoint": result.endpoint,
+        "policy": recovery_governance_policy_to_dict(result.policy),
+        "source": result.source,
+        "detail": result.detail,
+        "fetched_at": result.fetched_at,
+    }
+
+
+def render_recovery_governance_policy_fetch_result(result: RecoveryGovernancePolicyFetchResult) -> str:
+    return "\n".join(
+        [
+            "Recovery governance policy fetch:",
+            f"- ok: {result.ok}",
+            f"- endpoint: {result.endpoint}",
+            f"- source: {result.source}",
+            f"- fetched_at: {result.fetched_at}",
+            f"- detail: {result.detail}",
+            f"- allowed_actions: {', '.join(result.policy.allowed_actions) or '-'}",
+            f"- blocked_actions: {', '.join(result.policy.blocked_actions) or '-'}",
+            f"- max_executions_per_session: {result.policy.max_executions_per_session}",
+        ]
+    )
+
+
+def build_recovery_governance_policy_audit(
+    previous: RecoveryGovernancePolicy,
+    current: RecoveryGovernancePolicy,
+    changed_by: str,
+    changed_at: str | None = None,
+) -> RecoveryGovernancePolicyAudit:
+    changed_at = changed_at or datetime.now(timezone.utc).isoformat()
+    before = recovery_governance_policy_to_dict(previous)
+    after = recovery_governance_policy_to_dict(current)
+    changes = [
+        f"{key}: {before.get(key)!r} -> {after.get(key)!r}"
+        for key in sorted(set(before) | set(after))
+        if before.get(key) != after.get(key)
+    ]
+    if not changes:
+        changes.append("no policy changes")
+    return RecoveryGovernancePolicyAudit(
+        audit_id=_stable_id("RGA", changed_by, changed_at, json.dumps(after, sort_keys=True)),
+        changed_by=changed_by,
+        changed_at=changed_at,
+        before=before,
+        after=after,
+        changes=changes,
+    )
+
+
+def recovery_governance_policy_audit_to_dict(audit: RecoveryGovernancePolicyAudit) -> dict[str, Any]:
+    return {
+        "audit_id": audit.audit_id,
+        "changed_by": audit.changed_by,
+        "changed_at": audit.changed_at,
+        "before": audit.before,
+        "after": audit.after,
+        "changes": audit.changes,
+    }
+
+
+def render_recovery_governance_policy_audit(audit: RecoveryGovernancePolicyAudit) -> str:
+    lines = [
+        "Recovery governance policy audit:",
+        f"- audit_id: {audit.audit_id}",
+        f"- changed_by: {audit.changed_by}",
+        f"- changed_at: {audit.changed_at}",
+    ]
+    _append_list_section(lines, "changes", audit.changes)
+    return "\n".join(lines)
+
+
+def evaluate_recovery_governance_policy(
+    decision: RecoveryStrategyDecision,
+    context: TravelContext,
+    policy: RecoveryGovernancePolicy | None = None,
+) -> RecoveryGovernanceDecision:
+    policy = policy or RecoveryGovernancePolicy()
+    reasons: list[str] = []
+    allowed_actions = set(policy.allowed_actions)
+    blocked_actions = set(policy.blocked_actions)
+    executed_count = _recovery_strategy_execution_count(context)
+    if allowed_actions and decision.action not in allowed_actions:
+        reasons.append(f"action {decision.action} is not in the recovery allowlist")
+    if decision.action in blocked_actions:
+        reasons.append(f"action {decision.action} is blocked by recovery governance policy")
+    if policy.max_executions_per_session is not None and executed_count >= policy.max_executions_per_session:
+        reasons.append(
+            f"recovery execution limit reached: {executed_count}/{policy.max_executions_per_session}"
+        )
+    allow = not reasons
+    if allow:
+        reasons.append("recovery governance policy passed")
+    return RecoveryGovernanceDecision(
+        decision_id=decision.decision_id,
+        action=decision.action,
+        status="PASS" if allow else "BLOCKED",
+        allow_automation=allow,
+        reasons=_dedupe(reasons),
+    )
+
+
+def recovery_governance_decision_to_dict(decision: RecoveryGovernanceDecision) -> dict[str, Any]:
+    return {
+        "decision_id": decision.decision_id,
+        "action": decision.action,
+        "status": decision.status,
+        "allow_automation": decision.allow_automation,
+        "reasons": decision.reasons,
+    }
+
+
+def recovery_governance_decision_from_dict(payload: dict[str, Any]) -> RecoveryGovernanceDecision:
+    return RecoveryGovernanceDecision(
+        decision_id=str(payload["decision_id"]),
+        action=str(payload.get("action") or ""),
+        status=str(payload.get("status") or "UNKNOWN"),
+        allow_automation=bool(payload.get("allow_automation", False)),
+        reasons=[str(item) for item in payload.get("reasons") or []],
+    )
+
+
+def render_recovery_governance_decision(decision: RecoveryGovernanceDecision) -> str:
+    lines = [
+        "Recovery governance decision:",
+        f"- decision_id: {decision.decision_id}",
+        f"- action: {decision.action}",
+        f"- status: {decision.status}",
+        f"- allow_automation: {decision.allow_automation}",
+    ]
+    _append_list_section(lines, "reasons", decision.reasons)
+    return "\n".join(lines)
+
+
+def export_recovery_approval_receipt_http(
+    receipt: RecoveryApprovalReceipt | dict[str, Any],
+    endpoint: str,
+    token: str | None = None,
+    http_client: Any | None = None,
+) -> RecoveryApprovalExportResult:
+    from .integrations import JsonHttpClient
+
+    receipt_payload = (
+        recovery_approval_receipt_to_dict(receipt)
+        if isinstance(receipt, RecoveryApprovalReceipt)
+        else dict(receipt)
+    )
+    payload = {"source": "travel-agent", "approval_receipt": receipt_payload}
+    try:
+        client = http_client or JsonHttpClient()
+        response = client.post_json(endpoint, payload, token)
+    except Exception as exc:
+        return RecoveryApprovalExportResult(
+            ok=False,
+            endpoint=endpoint,
+            delivered=0,
+            failed=1,
+            detail=str(exc),
+        )
+    delivered = int(response.get("accepted") or response.get("delivered") or 1)
+    failed = 0 if delivered > 0 else 1
+    return RecoveryApprovalExportResult(
+        ok=bool(response.get("ok", failed == 0)),
+        endpoint=endpoint,
+        delivered=delivered,
+        failed=failed,
+        detail=str(response.get("detail") or "recovery approval receipt exported"),
+    )
+
+
+def render_recovery_approval_export_result(result: RecoveryApprovalExportResult) -> str:
+    return "\n".join(
+        [
+            "Recovery approval export:",
+            f"- ok: {result.ok}",
+            f"- endpoint: {result.endpoint}",
+            f"- delivered: {result.delivered}",
+            f"- failed: {result.failed}",
+            f"- detail: {result.detail}",
+        ]
+    )
+
+
+def recovery_approval_receipt_to_dict(receipt: RecoveryApprovalReceipt) -> dict[str, Any]:
+    return {
+        "receipt_id": receipt.receipt_id,
+        "decision_id": receipt.decision_id,
+        "approved_by": receipt.approved_by,
+        "approved_at": receipt.approved_at,
+        "reason": receipt.reason,
+        "required_approvals": receipt.required_approvals,
+    }
+
+
+def recovery_approval_receipt_from_dict(payload: dict[str, Any]) -> RecoveryApprovalReceipt:
+    return RecoveryApprovalReceipt(
+        receipt_id=str(payload["receipt_id"]),
+        decision_id=str(payload["decision_id"]),
+        approved_by=str(payload.get("approved_by") or "operator"),
+        approved_at=str(payload.get("approved_at") or ""),
+        reason=str(payload.get("reason") or ""),
+        required_approvals=[str(item) for item in payload.get("required_approvals") or []],
+    )
+
+
+def collect_recovery_approval_receipts(sessions: list[TravelContext]) -> list[RecoveryApprovalReceipt]:
+    receipts: list[RecoveryApprovalReceipt] = []
+    seen: set[str] = set()
+    for context in sessions:
+        for record in context.recovery_records:
+            execution = record.payload.get("strategy_execution") if isinstance(record.payload, dict) else None
+            if not isinstance(execution, dict):
+                continue
+            receipt_payload = execution.get("approval_receipt")
+            if not isinstance(receipt_payload, dict):
+                continue
+            receipt = recovery_approval_receipt_from_dict(receipt_payload)
+            if receipt.receipt_id in seen:
+                continue
+            seen.add(receipt.receipt_id)
+            receipts.append(receipt)
+    return receipts
+
+
+def build_recovery_approval_sla_policy(policy_json: str | None = None) -> RecoveryApprovalSlaPolicy:
+    if not policy_json:
+        return RecoveryApprovalSlaPolicy()
+    parsed = json.loads(policy_json)
+    if not isinstance(parsed, dict):
+        raise ValueError("Recovery approval SLA policy JSON requires an object.")
+    return RecoveryApprovalSlaPolicy(
+        max_pending_hours=float(parsed.get("max_pending_hours") or 24.0),
+        allowed_approvers=[str(item) for item in parsed.get("allowed_approvers") or []],
+        approver_prefixes=[str(item) for item in parsed.get("approver_prefixes") or []],
+        required_approval_types=[str(item) for item in parsed.get("required_approval_types") or []],
+    )
+
+
+def validate_recovery_approver(
+    receipt: RecoveryApprovalReceipt,
+    policy: RecoveryApprovalSlaPolicy | None = None,
+) -> tuple[bool, list[str]]:
+    policy = policy or RecoveryApprovalSlaPolicy()
+    reasons: list[str] = []
+    if policy.allowed_approvers and receipt.approved_by not in policy.allowed_approvers:
+        reasons.append(f"approver {receipt.approved_by} is not in allowed approvers")
+    if policy.approver_prefixes and not any(
+        receipt.approved_by.startswith(prefix) for prefix in policy.approver_prefixes
+    ):
+        reasons.append(f"approver {receipt.approved_by} does not match required prefixes")
+    missing_types = [
+        required
+        for required in policy.required_approval_types
+        if required not in set(receipt.required_approvals)
+    ]
+    for required in missing_types:
+        reasons.append(f"required approval type missing: {required}")
+    return not reasons, reasons or ["approver permission passed"]
+
+
+def evaluate_recovery_approval_sla(
+    sessions: list[TravelContext],
+    policy: RecoveryApprovalSlaPolicy | None = None,
+    now: str | None = None,
+) -> RecoveryApprovalSlaReport:
+    policy = policy or RecoveryApprovalSlaPolicy()
+    now = now or datetime.now(timezone.utc).isoformat()
+    now_dt = _parse_iso_datetime(now)
+    receipts = collect_recovery_approval_receipts(sessions)
+    findings: list[RecoveryApprovalSlaFinding] = []
+    for receipt in receipts:
+        approved_at = _parse_iso_datetime(receipt.approved_at)
+        age_hours = max(0.0, (now_dt - approved_at).total_seconds() / 3600.0)
+        approver_ok, approver_reasons = validate_recovery_approver(receipt, policy)
+        if age_hours > policy.max_pending_hours:
+            findings.append(
+                RecoveryApprovalSlaFinding(
+                    decision_id=receipt.decision_id,
+                    severity="critical",
+                    age_hours=round(age_hours, 2),
+                    reason=f"approval receipt age exceeds {policy.max_pending_hours:g}h",
+                    required_approvals=list(receipt.required_approvals),
+                    approved_by=receipt.approved_by,
+                )
+            )
+        if not approver_ok:
+            findings.append(
+                RecoveryApprovalSlaFinding(
+                    decision_id=receipt.decision_id,
+                    severity="critical",
+                    age_hours=round(age_hours, 2),
+                    reason="; ".join(approver_reasons),
+                    required_approvals=list(receipt.required_approvals),
+                    approved_by=receipt.approved_by,
+                )
+            )
+    summary = (
+        "Recovery approval SLA passed."
+        if not findings
+        else f"Recovery approval SLA found {len(findings)} issue(s)."
+    )
+    return RecoveryApprovalSlaReport(
+        now=now,
+        checked_receipts=len(receipts),
+        findings=findings,
+        summary=summary,
+    )
+
+
+def recovery_approval_sla_finding_to_dict(finding: RecoveryApprovalSlaFinding) -> dict[str, Any]:
+    return {
+        "decision_id": finding.decision_id,
+        "severity": finding.severity,
+        "age_hours": finding.age_hours,
+        "reason": finding.reason,
+        "required_approvals": finding.required_approvals,
+        "approved_by": finding.approved_by,
+    }
+
+
+def recovery_approval_sla_report_to_dict(report: RecoveryApprovalSlaReport) -> dict[str, Any]:
+    return {
+        "now": report.now,
+        "checked_receipts": report.checked_receipts,
+        "findings": [recovery_approval_sla_finding_to_dict(item) for item in report.findings],
+        "summary": report.summary,
+    }
+
+
+def render_recovery_approval_sla_report(report: RecoveryApprovalSlaReport) -> str:
+    lines = [
+        "Recovery approval SLA:",
+        f"- now: {report.now}",
+        f"- checked_receipts: {report.checked_receipts}",
+        f"- findings: {len(report.findings)}",
+        f"- summary: {report.summary}",
+    ]
+    if report.findings:
+        lines.append("- details:")
+        for finding in report.findings:
+            lines.append(
+                f"  - {finding.decision_id}: severity={finding.severity} "
+                f"age_hours={finding.age_hours:.2f} approver={finding.approved_by or '-'} "
+                f"reason={finding.reason}"
+            )
+    return "\n".join(lines)
+
+
+def open_recovery_failure_ticket_http(
+    context: TravelContext,
+    execution: RecoveryStrategyExecutionResult | dict[str, Any],
+    endpoint: str,
+    token: str | None = None,
+    http_client: Any | None = None,
+) -> OnCallTicketResult:
+    from .integrations import JsonHttpClient
+
+    execution_payload = (
+        recovery_strategy_execution_result_to_dict(execution)
+        if isinstance(execution, RecoveryStrategyExecutionResult)
+        else dict(execution)
+    )
+    payload = {
+        "source": "travel-agent",
+        "summary": "Travel Agent recovery failure",
+        "session_id": context.session_id,
+        "state": context.state,
+        "workflow_generation": context.workflow_generation,
+        "user_id": context.request.user_id,
+        "department": context.request.department,
+        "recovery_execution": execution_payload,
+    }
+    try:
+        client = http_client or JsonHttpClient()
+        response = client.post_json(endpoint, payload, token)
+    except Exception as exc:
+        return OnCallTicketResult(
+            ok=False,
+            endpoint=endpoint,
+            ticket_id=None,
+            delivered=0,
+            failed=1,
+            detail=str(exc),
+        )
+    ticket_id = response.get("ticket_id") or response.get("id") or response.get("incident_id")
+    ok = bool(response.get("ok", True))
+    return OnCallTicketResult(
+        ok=ok,
+        endpoint=endpoint,
+        ticket_id=str(ticket_id) if ticket_id is not None else None,
+        delivered=1 if ok else 0,
+        failed=0 if ok else 1,
+        detail=str(response.get("detail") or "recovery failure ticket opened"),
+    )
+
+
+def recovery_strategy_execution_result_to_dict(result: RecoveryStrategyExecutionResult) -> dict[str, Any]:
+    return {
+        "execution_id": result.execution_id,
+        "decision_id": result.decision_id,
+        "action": result.action,
+        "status": result.status,
+        "from_state": result.from_state,
+        "to_state": result.to_state,
+        "gate_status": result.gate_status,
+        "approval_override": result.approval_override,
+        "executed_steps": result.executed_steps,
+        "skipped_steps": result.skipped_steps,
+        "detail": result.detail,
+        "created_at": result.created_at,
+        "idempotency_key": result.idempotency_key,
+        "approval_receipt": result.approval_receipt,
+    }
+
+
+def recovery_strategy_execution_result_from_dict(payload: dict[str, Any]) -> RecoveryStrategyExecutionResult:
+    return RecoveryStrategyExecutionResult(
+        execution_id=str(payload["execution_id"]),
+        decision_id=str(payload["decision_id"]),
+        action=str(payload.get("action") or ""),
+        status=str(payload.get("status") or "UNKNOWN"),
+        from_state=str(payload.get("from_state") or ""),
+        to_state=str(payload.get("to_state") or ""),
+        gate_status=str(payload.get("gate_status") or ""),
+        approval_override=bool(payload.get("approval_override", False)),
+        executed_steps=[str(item) for item in payload.get("executed_steps") or []],
+        skipped_steps=[str(item) for item in payload.get("skipped_steps") or []],
+        detail=str(payload.get("detail") or ""),
+        created_at=str(payload.get("created_at") or ""),
+        idempotency_key=str(payload.get("idempotency_key") or ""),
+        approval_receipt=dict(payload["approval_receipt"]) if isinstance(payload.get("approval_receipt"), dict) else None,
+    )
+
+
+def render_recovery_strategy_execution_result(result: RecoveryStrategyExecutionResult) -> str:
+    lines = [
+        "Recovery strategy execution:",
+        f"- execution_id: {result.execution_id}",
+        f"- decision_id: {result.decision_id}",
+        f"- action: {result.action}",
+        f"- status: {result.status}",
+        f"- from_state: {result.from_state}",
+        f"- to_state: {result.to_state}",
+        f"- gate_status: {result.gate_status}",
+        f"- approval_override: {result.approval_override}",
+        f"- idempotency_key: {result.idempotency_key or '-'}",
+        f"- detail: {result.detail}",
+    ]
+    if result.approval_receipt:
+        lines.append(f"- approval_receipt: {result.approval_receipt.get('receipt_id', '-')}")
+    _append_list_section(lines, "executed_steps", result.executed_steps)
+    _append_list_section(lines, "skipped_steps", result.skipped_steps)
+    return "\n".join(lines)
+
+
 def operations_action_item_to_dict(item: OperationsActionItem) -> dict[str, Any]:
     return {
         "action_id": item.action_id,
@@ -1270,6 +2389,7 @@ def build_operations_closed_loop_report(
     closure_rate = round((len(closed) / len(action_items)) * 100, 1) if action_items else 0.0
     knowledge_topics = dict(Counter(entry.topic for entry in knowledge_entries))
     source_counts = dict(Counter(item.source_type for item in action_items))
+    owner_counts = dict(Counter(item.owner for item in action_items))
     action_items_overdue = len(sla_report.findings) if sla_report else 0
     recommendations = _closed_loop_recommendations(
         trend_alerts=trend_alerts,
@@ -1290,6 +2410,7 @@ def build_operations_closed_loop_report(
         knowledge_entries=len(knowledge_entries),
         knowledge_topics=knowledge_topics,
         source_counts=source_counts,
+        owner_counts=owner_counts,
         recommendations=recommendations,
     )
 
@@ -1308,6 +2429,7 @@ def render_operations_closed_loop_report(report: OperationsClosedLoopReport) -> 
     ]
     _append_count_section(lines, "knowledge_topics", report.knowledge_topics)
     _append_count_section(lines, "action_sources", report.source_counts)
+    _append_count_section(lines, "owners", report.owner_counts)
     _append_list_section(lines, "recommendations", report.recommendations)
     return "\n".join(lines)
 
@@ -1324,8 +2446,32 @@ def operations_closed_loop_report_to_dict(report: OperationsClosedLoopReport) ->
         "knowledge_entries": report.knowledge_entries,
         "knowledge_topics": report.knowledge_topics,
         "source_counts": report.source_counts,
+        "owner_counts": report.owner_counts,
         "recommendations": report.recommendations,
     }
+
+
+def build_operations_closed_loop_snapshot(
+    report: OperationsClosedLoopReport,
+    snapshot_id: str | None = None,
+    created_at: str | None = None,
+    metadata: dict[str, str] | None = None,
+) -> OperationsClosedLoopSnapshot:
+    created_at = created_at or datetime.now(timezone.utc).isoformat()
+    snapshot_id = snapshot_id or _stable_id(
+        "CLP",
+        report.generated_at,
+        str(report.trend_alerts),
+        str(report.action_items_total),
+        str(report.action_items_closed),
+        str(report.closure_rate),
+    )
+    return OperationsClosedLoopSnapshot(
+        snapshot_id=snapshot_id,
+        created_at=created_at,
+        report=report,
+        metadata={str(key): str(value) for key, value in dict(metadata or {}).items()},
+    )
 
 
 def render_operations_closed_loop_report_json(report: OperationsClosedLoopReport) -> str:
@@ -1372,6 +2518,70 @@ def render_operations_closed_loop_report_prometheus(report: OperationsClosedLoop
             )
     else:
         lines.append('travel_operations_closed_loop_action_sources{source_type="none"} 0')
+    lines.extend(
+        [
+            "# HELP travel_operations_closed_loop_action_owners Action items by owner.",
+            "# TYPE travel_operations_closed_loop_action_owners gauge",
+        ]
+    )
+    if report.owner_counts:
+        for owner, count in _sorted_count_items(report.owner_counts):
+            lines.append(f'travel_operations_closed_loop_action_owners{{owner="{_metric_label(owner)}"}} {count}')
+    else:
+        lines.append('travel_operations_closed_loop_action_owners{owner="none"} 0')
+    return "\n".join(lines)
+
+
+def build_recovery_strategy_metrics(sessions: list[TravelContext]) -> dict[str, int]:
+    counts: Counter[str] = Counter()
+    for context in sessions:
+        for record in context.recovery_records:
+            execution = record.payload.get("strategy_execution") if isinstance(record.payload, dict) else None
+            if not isinstance(execution, dict):
+                continue
+            status = str(execution.get("status") or "UNKNOWN")
+            action = str(execution.get("action") or record.action or "unknown")
+            counts[f"status:{status}"] += 1
+            counts[f"action:{action}"] += 1
+            if execution.get("approval_override"):
+                counts["approval_override"] += 1
+            if execution.get("approval_receipt"):
+                counts["approval_receipt"] += 1
+            if execution.get("idempotent"):
+                counts["idempotent_skip"] += 1
+    return dict(counts)
+
+
+def render_recovery_strategy_metrics_prometheus(sessions: list[TravelContext]) -> str:
+    metrics = build_recovery_strategy_metrics(sessions)
+    lines = [
+        "# HELP travel_recovery_strategy_executions_total Recovery strategy execution records.",
+        "# TYPE travel_recovery_strategy_executions_total counter",
+    ]
+    emitted = False
+    for key, count in sorted(metrics.items()):
+        prefix, value = key.split(":", 1) if ":" in key else ("kind", key)
+        if prefix in {"status", "action"}:
+            emitted = True
+            lines.append(
+                "travel_recovery_strategy_executions_total"
+                f'{{{prefix}="{_metric_label(value)}"}} {count}'
+            )
+    if not emitted:
+        lines.append("travel_recovery_strategy_executions_total 0")
+    lines.extend(
+        [
+            "# HELP travel_recovery_strategy_approval_overrides_total Recovery executions using approval override.",
+            "# TYPE travel_recovery_strategy_approval_overrides_total counter",
+            f"travel_recovery_strategy_approval_overrides_total {metrics.get('approval_override', 0)}",
+            "# HELP travel_recovery_strategy_approval_receipts_total Recovery executions with approval receipts.",
+            "# TYPE travel_recovery_strategy_approval_receipts_total counter",
+            f"travel_recovery_strategy_approval_receipts_total {metrics.get('approval_receipt', 0)}",
+            "# HELP travel_recovery_strategy_idempotent_skips_total Duplicate recovery execution requests skipped.",
+            "# TYPE travel_recovery_strategy_idempotent_skips_total counter",
+            f"travel_recovery_strategy_idempotent_skips_total {metrics.get('idempotent_skip', 0)}",
+        ]
+    )
     return "\n".join(lines)
 
 
@@ -1420,6 +2630,1462 @@ def render_operations_closed_loop_export_result(result: OperationsClosedLoopExpo
             f"- detail: {result.detail}",
         ]
     )
+
+
+def operations_closed_loop_snapshot_to_dict(snapshot: OperationsClosedLoopSnapshot) -> dict[str, Any]:
+    return {
+        "snapshot_id": snapshot.snapshot_id,
+        "created_at": snapshot.created_at,
+        "report": operations_closed_loop_report_to_dict(snapshot.report),
+        "metadata": dict(snapshot.metadata),
+    }
+
+
+def operations_closed_loop_snapshot_from_dict(payload: dict[str, Any]) -> OperationsClosedLoopSnapshot:
+    return OperationsClosedLoopSnapshot(
+        snapshot_id=str(payload["snapshot_id"]),
+        created_at=str(payload.get("created_at") or ""),
+        report=OperationsClosedLoopReport(
+            generated_at=str(payload["report"]["generated_at"]),
+            trend_alerts=int(payload["report"].get("trend_alerts") or 0),
+            action_items_total=int(payload["report"].get("action_items_total") or 0),
+            action_items_open=int(payload["report"].get("action_items_open") or 0),
+            action_items_closed=int(payload["report"].get("action_items_closed") or 0),
+            action_items_overdue=int(payload["report"].get("action_items_overdue") or 0),
+            closure_rate=float(payload["report"].get("closure_rate") or 0.0),
+            knowledge_entries=int(payload["report"].get("knowledge_entries") or 0),
+            knowledge_topics={
+                str(key): int(value) for key, value in dict(payload["report"].get("knowledge_topics") or {}).items()
+            },
+            source_counts={
+                str(key): int(value) for key, value in dict(payload["report"].get("source_counts") or {}).items()
+            },
+            owner_counts={
+                str(key): int(value) for key, value in dict(payload["report"].get("owner_counts") or {}).items()
+            },
+            recommendations=[str(item) for item in payload["report"].get("recommendations") or []],
+        ),
+        metadata={str(key): str(value) for key, value in dict(payload.get("metadata") or {}).items()},
+    )
+
+
+def render_operations_closed_loop_snapshot(snapshot: OperationsClosedLoopSnapshot) -> str:
+    lines = [
+        "Operations closed-loop snapshot:",
+        f"- snapshot_id: {snapshot.snapshot_id}",
+        f"- created_at: {snapshot.created_at}",
+        f"- closure_rate: {snapshot.report.closure_rate:.1f}%",
+        f"- action_items_total: {snapshot.report.action_items_total}",
+        f"- knowledge_entries: {snapshot.report.knowledge_entries}",
+    ]
+    if snapshot.metadata:
+        lines.append("- metadata:")
+        for key, value in sorted(snapshot.metadata.items()):
+            lines.append(f"  - {key}: {value}")
+    return "\n".join(lines)
+
+
+def render_operations_closed_loop_snapshots(snapshots: list[OperationsClosedLoopSnapshot]) -> str:
+    lines = ["Operations closed-loop snapshots:"]
+    if not snapshots:
+        lines.append("- none")
+        return "\n".join(lines)
+    for snapshot in snapshots:
+        lines.append(
+            f"- {snapshot.snapshot_id}: generated_at={snapshot.report.generated_at} "
+            f"closure_rate={snapshot.report.closure_rate:.1f}%"
+        )
+        lines.append(f"  created_at: {snapshot.created_at}")
+        if snapshot.metadata:
+            metadata = ", ".join(f"{key}={value}" for key, value in sorted(snapshot.metadata.items()))
+            lines.append(f"  metadata: {metadata}")
+        if snapshot.report.recommendations:
+            lines.append(f"  recommendations: {'; '.join(snapshot.report.recommendations)}")
+    return "\n".join(lines)
+
+
+def build_operations_closed_loop_dashboard(
+    snapshots: list[OperationsClosedLoopSnapshot] | None = None,
+    generated_at: str | None = None,
+    limit: int = 20,
+    owner: str | None = None,
+    since: str | None = None,
+    cursor: str | None = None,
+    department: str | None = None,
+    tenant: str | None = None,
+    checkpoint: str | None = None,
+) -> OperationsClosedLoopDashboard:
+    generated_at = generated_at or datetime.now(timezone.utc).isoformat()
+    limit = max(1, int(limit))
+    filtered = list(snapshots or [])
+    if owner:
+        filtered = [snapshot for snapshot in filtered if snapshot.report.owner_counts.get(owner, 0) > 0]
+    if department:
+        filtered = [snapshot for snapshot in filtered if snapshot.metadata.get("department") == department]
+    if tenant:
+        filtered = [snapshot for snapshot in filtered if snapshot.metadata.get("tenant") == tenant]
+    if since:
+        since_ts = _timestamp_sort_key(since)
+        filtered = [snapshot for snapshot in filtered if _timestamp_sort_key(snapshot.created_at) >= since_ts]
+    effective_cursor = cursor or checkpoint
+    if effective_cursor:
+        cursor_ts = _timestamp_sort_key(effective_cursor)
+        filtered = [snapshot for snapshot in filtered if _timestamp_sort_key(snapshot.created_at) < cursor_ts]
+    ordered_candidates = sorted(filtered, key=lambda snapshot: snapshot.created_at, reverse=True)
+    ordered = ordered_candidates[:limit]
+    has_more = len(ordered_candidates) > limit
+    next_cursor = ordered[-1].created_at if has_more and ordered else None
+    checkpoint_value = next_cursor or (ordered[-1].created_at if ordered else effective_cursor)
+    latest = ordered[0] if ordered else None
+    previous = ordered[1] if len(ordered) > 1 else None
+    trends = _closed_loop_dashboard_trends(latest, previous)
+    if latest is None:
+        summary = "No closed-loop snapshots are available."
+    elif previous is None:
+        summary = f"Latest closed-loop snapshot {latest.snapshot_id} is ready; trend baseline is not available yet."
+    else:
+        closure_delta = latest.report.closure_rate - previous.report.closure_rate
+        summary = (
+            f"Latest closed-loop snapshot {latest.snapshot_id} compared with {previous.snapshot_id}; "
+            f"closure_rate_delta={closure_delta:.1f}."
+        )
+    return OperationsClosedLoopDashboard(
+        schema_version="travel.operations.closed_loop.v1",
+        generated_at=generated_at,
+        snapshot_count=len(ordered),
+        latest_snapshot=latest,
+        snapshots=ordered,
+        trends=trends,
+        filters={
+            key: value
+            for key, value in {
+                "owner": owner,
+                "since": since,
+                "cursor": cursor,
+                "department": department,
+                "tenant": tenant,
+                "checkpoint": checkpoint,
+            }.items()
+            if value
+        },
+        summary=summary,
+        cursor=cursor,
+        next_cursor=next_cursor,
+        limit=limit,
+        has_more=has_more,
+        checkpoint=checkpoint_value,
+    )
+
+
+def operations_closed_loop_dashboard_to_dict(dashboard: OperationsClosedLoopDashboard) -> dict[str, Any]:
+    return {
+        "schema_version": dashboard.schema_version,
+        "generated_at": dashboard.generated_at,
+        "snapshot_count": dashboard.snapshot_count,
+        "latest_snapshot": (
+            operations_closed_loop_snapshot_to_dict(dashboard.latest_snapshot)
+            if dashboard.latest_snapshot is not None
+            else None
+        ),
+        "snapshots": [operations_closed_loop_snapshot_to_dict(snapshot) for snapshot in dashboard.snapshots],
+        "trends": [
+            {
+                "name": metric.name,
+                "current": metric.current,
+                "previous": metric.previous,
+                "delta": metric.delta,
+                "delta_percent": metric.delta_percent,
+            }
+            for metric in dashboard.trends
+        ],
+        "filters": dashboard.filters,
+        "summary": dashboard.summary,
+        "cursor": dashboard.cursor,
+        "next_cursor": dashboard.next_cursor,
+        "limit": dashboard.limit,
+        "has_more": dashboard.has_more,
+        "checkpoint": dashboard.checkpoint,
+    }
+
+
+def render_operations_closed_loop_dashboard_json(dashboard: OperationsClosedLoopDashboard) -> str:
+    return json.dumps(
+        {"closed_loop_dashboard": operations_closed_loop_dashboard_to_dict(dashboard)},
+        ensure_ascii=False,
+    )
+
+
+def build_operations_closed_loop_json_schema() -> dict[str, Any]:
+    return {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$id": "https://travel-agent.local/schemas/travel.operations.closed_loop.v1.json",
+        "title": "Travel Operations Closed Loop Dashboard",
+        "type": "object",
+        "required": ["closed_loop_dashboard"],
+        "properties": {
+            "closed_loop_dashboard": {
+                "type": "object",
+                "required": [
+                    "schema_version",
+                    "generated_at",
+                    "snapshot_count",
+                    "snapshots",
+                    "trends",
+                    "filters",
+                    "summary",
+                    "limit",
+                    "has_more",
+                ],
+                "properties": {
+                    "schema_version": {"const": "travel.operations.closed_loop.v1"},
+                    "generated_at": {"type": "string"},
+                    "snapshot_count": {"type": "integer", "minimum": 0},
+                    "latest_snapshot": {"anyOf": [{"$ref": "#/$defs/snapshot"}, {"type": "null"}]},
+                    "snapshots": {"type": "array", "items": {"$ref": "#/$defs/snapshot"}},
+                    "trends": {"type": "array", "items": {"$ref": "#/$defs/trend"}},
+                    "filters": {"type": "object", "additionalProperties": {"type": "string"}},
+                    "summary": {"type": "string"},
+                    "cursor": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                    "next_cursor": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                    "checkpoint": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                    "limit": {"type": "integer", "minimum": 1},
+                    "has_more": {"type": "boolean"},
+                },
+                "additionalProperties": False,
+            }
+        },
+        "$defs": {
+            "snapshot": {
+                "type": "object",
+                "required": ["snapshot_id", "created_at", "report", "metadata"],
+                "properties": {
+                    "snapshot_id": {"type": "string"},
+                    "created_at": {"type": "string"},
+                    "metadata": {"type": "object", "additionalProperties": {"type": "string"}},
+                    "report": {"$ref": "#/$defs/report"},
+                },
+                "additionalProperties": False,
+            },
+            "report": {
+                "type": "object",
+                "required": [
+                    "generated_at",
+                    "trend_alerts",
+                    "action_items_total",
+                    "action_items_open",
+                    "action_items_closed",
+                    "action_items_overdue",
+                    "closure_rate",
+                    "knowledge_entries",
+                    "knowledge_topics",
+                    "source_counts",
+                    "owner_counts",
+                    "recommendations",
+                ],
+                "properties": {
+                    "generated_at": {"type": "string"},
+                    "trend_alerts": {"type": "integer"},
+                    "action_items_total": {"type": "integer"},
+                    "action_items_open": {"type": "integer"},
+                    "action_items_closed": {"type": "integer"},
+                    "action_items_overdue": {"type": "integer"},
+                    "closure_rate": {"type": "number"},
+                    "knowledge_entries": {"type": "integer"},
+                    "knowledge_topics": {"type": "object", "additionalProperties": {"type": "integer"}},
+                    "source_counts": {"type": "object", "additionalProperties": {"type": "integer"}},
+                    "owner_counts": {"type": "object", "additionalProperties": {"type": "integer"}},
+                    "recommendations": {"type": "array", "items": {"type": "string"}},
+                },
+                "additionalProperties": False,
+            },
+            "trend": {
+                "type": "object",
+                "required": ["name", "current", "previous", "delta", "delta_percent"],
+                "properties": {
+                    "name": {"type": "string"},
+                    "current": {"type": "integer"},
+                    "previous": {"type": "integer"},
+                    "delta": {"type": "integer"},
+                    "delta_percent": {"anyOf": [{"type": "number"}, {"type": "null"}]},
+                },
+                "additionalProperties": False,
+            },
+        },
+        "additionalProperties": False,
+    }
+
+
+def render_operations_closed_loop_json_schema() -> str:
+    return json.dumps(build_operations_closed_loop_json_schema(), ensure_ascii=False, indent=2)
+
+
+def build_operations_closed_loop_openapi_spec(
+    server_url: str = "http://127.0.0.1:9110",
+) -> dict[str, Any]:
+    schema = build_operations_closed_loop_json_schema()["properties"]["closed_loop_dashboard"]
+    return {
+        "openapi": "3.1.0",
+        "info": {
+            "title": "Travel Agent Operations Closed Loop API",
+            "version": "travel.operations.closed_loop.v1",
+        },
+        "servers": [{"url": server_url}],
+        "paths": {
+            "/operations/closed-loop": {
+                "get": {
+                    "summary": "Query closed-loop dashboard snapshots",
+                    "parameters": [
+                        _openapi_query_param("owner"),
+                        _openapi_query_param("since"),
+                        _openapi_query_param("cursor"),
+                        _openapi_query_param("department"),
+                        _openapi_query_param("tenant"),
+                        _openapi_query_param("checkpoint"),
+                        _openapi_query_param("limit", "integer"),
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "Closed-loop dashboard payload",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {"closed_loop_dashboard": schema},
+                                        "required": ["closed_loop_dashboard"],
+                                    }
+                                }
+                            },
+                        },
+                        "401": {"description": "Missing or invalid dashboard token"},
+                    },
+                }
+            },
+            "/operations/closed-loop/snapshots": {
+                "get": {
+                    "summary": "Alias for closed-loop snapshot dashboard query",
+                    "responses": {"200": {"description": "Closed-loop dashboard payload"}},
+                }
+            },
+        },
+    }
+
+
+def render_operations_closed_loop_openapi_spec(server_url: str = "http://127.0.0.1:9110") -> str:
+    return json.dumps(build_operations_closed_loop_openapi_spec(server_url), ensure_ascii=False, indent=2)
+
+
+def build_operations_closed_loop_contract_matrix() -> list[dict[str, Any]]:
+    return [
+        {
+            "schema_version": "travel.operations.closed_loop.v1",
+            "status": "current",
+            "required_fields": [
+                "schema_version",
+                "generated_at",
+                "snapshot_count",
+                "snapshots",
+                "trends",
+                "filters",
+                "summary",
+                "limit",
+                "has_more",
+            ],
+            "optional_fields": ["latest_snapshot", "cursor", "next_cursor", "checkpoint"],
+            "compatible_consumers": ["dashboard-http", "bi-snapshot-export", "scheduled-checkpoint"],
+        }
+    ]
+
+
+def render_operations_closed_loop_contract_matrix_json() -> str:
+    return json.dumps(
+        {"closed_loop_contract_matrix": build_operations_closed_loop_contract_matrix()},
+        ensure_ascii=False,
+        indent=2,
+    )
+
+
+def validate_operations_closed_loop_dashboard_contract(
+    dashboard: OperationsClosedLoopDashboard,
+) -> dict[str, Any]:
+    payload = operations_closed_loop_dashboard_to_dict(dashboard)
+    required = [
+        "schema_version",
+        "generated_at",
+        "snapshot_count",
+        "snapshots",
+        "trends",
+        "filters",
+        "summary",
+        "limit",
+        "has_more",
+    ]
+    missing = [field for field in required if field not in payload]
+    errors: list[str] = []
+    if payload.get("schema_version") != "travel.operations.closed_loop.v1":
+        errors.append("schema_version must be travel.operations.closed_loop.v1")
+    if payload.get("limit", 0) < 1:
+        errors.append("limit must be >= 1")
+    for snapshot in payload.get("snapshots") or []:
+        if "metadata" not in snapshot:
+            errors.append(f"snapshot {snapshot.get('snapshot_id', '-')} missing metadata")
+        if "report" not in snapshot:
+            errors.append(f"snapshot {snapshot.get('snapshot_id', '-')} missing report")
+    errors.extend(f"missing required field: {field}" for field in missing)
+    return {
+        "schema_version": payload.get("schema_version"),
+        "ok": not errors,
+        "errors": errors,
+        "checkpoint": payload.get("checkpoint"),
+        "snapshot_count": payload.get("snapshot_count", 0),
+    }
+
+
+def publish_operations_closed_loop_schema_http(
+    endpoint: str,
+    token: str | None = None,
+    http_client: Any | None = None,
+    server_url: str = "http://127.0.0.1:9110",
+) -> OperationsClosedLoopSchemaPublishResult:
+    from .integrations import JsonHttpClient
+
+    payload = {
+        "source": "travel-agent",
+        "schema_version": "travel.operations.closed_loop.v1",
+        "schema": build_operations_closed_loop_json_schema(),
+        "openapi": build_operations_closed_loop_openapi_spec(server_url),
+        "compatibility_matrix": build_operations_closed_loop_contract_matrix(),
+    }
+    try:
+        client = http_client or JsonHttpClient()
+        response = client.post_json(endpoint, payload, token)
+    except Exception as exc:
+        return OperationsClosedLoopSchemaPublishResult(
+            ok=False,
+            endpoint=endpoint,
+            schema_version="travel.operations.closed_loop.v1",
+            delivered=0,
+            failed=1,
+            detail=str(exc),
+        )
+    delivered = int(response.get("accepted") or response.get("delivered") or 1)
+    failed = 0 if delivered > 0 else 1
+    return OperationsClosedLoopSchemaPublishResult(
+        ok=bool(response.get("ok", failed == 0)),
+        endpoint=endpoint,
+        schema_version=str(response.get("schema_version") or "travel.operations.closed_loop.v1"),
+        delivered=delivered,
+        failed=failed,
+        detail=str(response.get("detail") or "closed-loop schema published"),
+    )
+
+
+def render_operations_closed_loop_schema_publish_result(
+    result: OperationsClosedLoopSchemaPublishResult,
+) -> str:
+    return "\n".join(
+        [
+            "Operations closed-loop schema publish:",
+            f"- ok: {result.ok}",
+            f"- endpoint: {result.endpoint}",
+            f"- schema_version: {result.schema_version}",
+            f"- delivered: {result.delivered}",
+            f"- failed: {result.failed}",
+            f"- detail: {result.detail}",
+        ]
+    )
+
+
+def evaluate_operations_closed_loop_quality(
+    dashboard: OperationsClosedLoopDashboard,
+    generated_at: str | None = None,
+) -> OperationsClosedLoopQualityReport:
+    generated_at = generated_at or datetime.now(timezone.utc).isoformat()
+    findings: list[OperationsClosedLoopQualityFinding] = []
+    if dashboard.snapshot_count != len(dashboard.snapshots):
+        findings.append(
+            OperationsClosedLoopQualityFinding(
+                severity="critical",
+                code="snapshot_count_mismatch",
+                message="snapshot_count does not match snapshots length",
+            )
+        )
+    if dashboard.limit < 1:
+        findings.append(
+            OperationsClosedLoopQualityFinding(
+                severity="critical",
+                code="invalid_limit",
+                message="dashboard limit must be >= 1",
+            )
+        )
+    if dashboard.latest_snapshot is None:
+        findings.append(
+            OperationsClosedLoopQualityFinding(
+                severity="warning",
+                code="empty_dashboard",
+                message="no closed-loop snapshot is available for BI consumption",
+            )
+        )
+    for snapshot in dashboard.snapshots:
+        report = snapshot.report
+        if "tenant" not in snapshot.metadata:
+            findings.append(
+                OperationsClosedLoopQualityFinding(
+                    severity="warning",
+                    code="missing_tenant",
+                    message="snapshot metadata should include tenant",
+                    snapshot_id=snapshot.snapshot_id,
+                )
+            )
+        if "department" not in snapshot.metadata:
+            findings.append(
+                OperationsClosedLoopQualityFinding(
+                    severity="warning",
+                    code="missing_department",
+                    message="snapshot metadata should include department",
+                    snapshot_id=snapshot.snapshot_id,
+                )
+            )
+        numeric_fields = {
+            "trend_alerts": report.trend_alerts,
+            "action_items_total": report.action_items_total,
+            "action_items_open": report.action_items_open,
+            "action_items_closed": report.action_items_closed,
+            "action_items_overdue": report.action_items_overdue,
+            "knowledge_entries": report.knowledge_entries,
+        }
+        for field_name, value in numeric_fields.items():
+            if value < 0:
+                findings.append(
+                    OperationsClosedLoopQualityFinding(
+                        severity="critical",
+                        code="negative_metric",
+                        message=f"{field_name} must be non-negative",
+                        snapshot_id=snapshot.snapshot_id,
+                    )
+                )
+        if not 0.0 <= report.closure_rate <= 100.0:
+            findings.append(
+                OperationsClosedLoopQualityFinding(
+                    severity="critical",
+                    code="closure_rate_out_of_range",
+                    message="closure_rate must be between 0 and 100",
+                    snapshot_id=snapshot.snapshot_id,
+                )
+            )
+    ok = not any(finding.severity == "critical" for finding in findings)
+    summary = (
+        "Closed-loop dashboard quality passed."
+        if ok and not findings
+        else f"Closed-loop dashboard quality found {len(findings)} finding(s)."
+    )
+    return OperationsClosedLoopQualityReport(
+        ok=ok,
+        generated_at=generated_at,
+        snapshot_count=dashboard.snapshot_count,
+        findings=findings,
+        summary=summary,
+    )
+
+
+def operations_closed_loop_quality_finding_to_dict(
+    finding: OperationsClosedLoopQualityFinding,
+) -> dict[str, Any]:
+    return {
+        "severity": finding.severity,
+        "code": finding.code,
+        "message": finding.message,
+        "snapshot_id": finding.snapshot_id,
+    }
+
+
+def operations_closed_loop_quality_report_to_dict(report: OperationsClosedLoopQualityReport) -> dict[str, Any]:
+    return {
+        "ok": report.ok,
+        "generated_at": report.generated_at,
+        "snapshot_count": report.snapshot_count,
+        "findings": [operations_closed_loop_quality_finding_to_dict(item) for item in report.findings],
+        "summary": report.summary,
+    }
+
+
+def render_operations_closed_loop_quality_report(report: OperationsClosedLoopQualityReport) -> str:
+    lines = [
+        "Operations closed-loop quality:",
+        f"- ok: {report.ok}",
+        f"- generated_at: {report.generated_at}",
+        f"- snapshot_count: {report.snapshot_count}",
+        f"- findings: {len(report.findings)}",
+        f"- summary: {report.summary}",
+    ]
+    if report.findings:
+        lines.append("- details:")
+        for finding in report.findings:
+            lines.append(
+                f"  - {finding.severity}/{finding.code}: "
+                f"{finding.snapshot_id or '-'} {finding.message}"
+            )
+    return "\n".join(lines)
+
+
+def build_operations_closed_loop_checkpoint_plan(
+    dashboard: OperationsClosedLoopDashboard,
+    generated_at: str | None = None,
+) -> OperationsClosedLoopCheckpointPlan:
+    generated_at = generated_at or datetime.now(timezone.utc).isoformat()
+    next_checkpoint = dashboard.next_cursor or (
+        dashboard.snapshots[-1].created_at if dashboard.snapshots else dashboard.checkpoint
+    )
+    ready = bool(next_checkpoint)
+    summary = (
+        f"Next checkpoint can continue from {next_checkpoint}."
+        if ready
+        else "No checkpoint can be created because no snapshots are available."
+    )
+    return OperationsClosedLoopCheckpointPlan(
+        generated_at=generated_at,
+        checkpoint=dashboard.checkpoint,
+        next_checkpoint=next_checkpoint,
+        snapshot_count=dashboard.snapshot_count,
+        ready=ready,
+        summary=summary,
+    )
+
+
+def operations_closed_loop_checkpoint_plan_to_dict(
+    plan: OperationsClosedLoopCheckpointPlan,
+) -> dict[str, Any]:
+    return {
+        "generated_at": plan.generated_at,
+        "checkpoint": plan.checkpoint,
+        "next_checkpoint": plan.next_checkpoint,
+        "snapshot_count": plan.snapshot_count,
+        "ready": plan.ready,
+        "summary": plan.summary,
+    }
+
+
+def render_operations_closed_loop_checkpoint_plan(plan: OperationsClosedLoopCheckpointPlan) -> str:
+    return "\n".join(
+        [
+            "Operations closed-loop checkpoint plan:",
+            f"- generated_at: {plan.generated_at}",
+            f"- checkpoint: {plan.checkpoint or '-'}",
+            f"- next_checkpoint: {plan.next_checkpoint or '-'}",
+            f"- snapshot_count: {plan.snapshot_count}",
+            f"- ready: {plan.ready}",
+            f"- summary: {plan.summary}",
+        ]
+    )
+
+
+def build_operations_closed_loop_acceptance_report(
+    dashboard: OperationsClosedLoopDashboard,
+    generated_at: str | None = None,
+) -> OperationsClosedLoopAcceptanceReport:
+    generated_at = generated_at or datetime.now(timezone.utc).isoformat()
+    contract = validate_operations_closed_loop_dashboard_contract(dashboard)
+    quality = evaluate_operations_closed_loop_quality(dashboard, generated_at=generated_at)
+    checkpoint = build_operations_closed_loop_checkpoint_plan(dashboard, generated_at=generated_at)
+    findings = [str(item) for item in contract.get("errors") or []]
+    findings.extend(f"{item.severity}/{item.code}: {item.message}" for item in quality.findings)
+    publish_ready = bool(contract.get("ok")) and quality.ok and bool(dashboard.schema_version)
+    ok = bool(contract.get("ok")) and quality.ok and checkpoint.ready
+    return OperationsClosedLoopAcceptanceReport(
+        ok=ok,
+        generated_at=generated_at,
+        contract_ok=bool(contract.get("ok")),
+        quality_ok=quality.ok,
+        publish_ready=publish_ready,
+        checkpoint_ready=checkpoint.ready,
+        findings=_dedupe(findings),
+    )
+
+
+def operations_closed_loop_acceptance_report_to_dict(
+    report: OperationsClosedLoopAcceptanceReport,
+) -> dict[str, Any]:
+    return {
+        "ok": report.ok,
+        "generated_at": report.generated_at,
+        "contract_ok": report.contract_ok,
+        "quality_ok": report.quality_ok,
+        "publish_ready": report.publish_ready,
+        "checkpoint_ready": report.checkpoint_ready,
+        "findings": report.findings,
+    }
+
+
+def render_operations_closed_loop_acceptance_report(
+    report: OperationsClosedLoopAcceptanceReport,
+) -> str:
+    lines = [
+        "Operations closed-loop acceptance:",
+        f"- ok: {report.ok}",
+        f"- generated_at: {report.generated_at}",
+        f"- contract_ok: {report.contract_ok}",
+        f"- quality_ok: {report.quality_ok}",
+        f"- publish_ready: {report.publish_ready}",
+        f"- checkpoint_ready: {report.checkpoint_ready}",
+    ]
+    _append_list_section(lines, "findings", report.findings)
+    return "\n".join(lines)
+
+
+def build_operations_scheduled_tasks(
+    now: str | None = None,
+    include_replay_job_runner: bool = True,
+) -> list[OperationsScheduledTask]:
+    now = now or datetime.now(timezone.utc).isoformat()
+    tasks = [
+        OperationsScheduledTask(
+            task_id="OPS-SCHED-CLOSED-LOOP-SNAPSHOT",
+            task_type="closed_loop_snapshot",
+            cadence="hourly",
+            next_run_at=now,
+            enabled=True,
+            params={"metadata_required": ["department", "tenant"]},
+        ),
+        OperationsScheduledTask(
+            task_id="OPS-SCHED-CLOSED-LOOP-CHECKPOINT",
+            task_type="closed_loop_checkpoint",
+            cadence="hourly",
+            next_run_at=now,
+            enabled=True,
+            params={"limit": 20},
+        ),
+        OperationsScheduledTask(
+            task_id="OPS-SCHED-BI-QUALITY",
+            task_type="closed_loop_quality",
+            cadence="hourly",
+            next_run_at=now,
+            enabled=True,
+            params={"fail_on_critical": True},
+        ),
+        OperationsScheduledTask(
+            task_id="OPS-SCHED-RECOVERY-APPROVAL-SLA",
+            task_type="recovery_approval_sla",
+            cadence="hourly",
+            next_run_at=now,
+            enabled=True,
+            params={"max_pending_hours": 24.0},
+        ),
+    ]
+    if include_replay_job_runner:
+        tasks.append(
+            OperationsScheduledTask(
+                task_id="OPS-SCHED-WEBHOOK-REPLAY-JOBS",
+                task_type="webhook_replay_jobs",
+                cadence="every_5_minutes",
+                next_run_at=now,
+                enabled=True,
+                params={"limit": 20},
+            )
+        )
+    return tasks
+
+
+def operations_scheduled_task_to_dict(task: OperationsScheduledTask) -> dict[str, Any]:
+    return {
+        "task_id": task.task_id,
+        "task_type": task.task_type,
+        "cadence": task.cadence,
+        "next_run_at": task.next_run_at,
+        "enabled": task.enabled,
+        "params": task.params,
+        "last_run_at": task.last_run_at,
+        "last_status": task.last_status,
+        "run_count": task.run_count,
+        "failure_count": task.failure_count,
+        "lease_owner": task.lease_owner,
+        "lease_expires_at": task.lease_expires_at,
+    }
+
+
+def operations_scheduled_task_from_dict(payload: dict[str, Any]) -> OperationsScheduledTask:
+    return OperationsScheduledTask(
+        task_id=str(payload["task_id"]),
+        task_type=str(payload.get("task_type") or ""),
+        cadence=str(payload.get("cadence") or "manual"),
+        next_run_at=str(payload.get("next_run_at") or ""),
+        enabled=bool(payload.get("enabled", True)),
+        params=dict(payload.get("params") or {}),
+        last_run_at=str(payload["last_run_at"]) if payload.get("last_run_at") is not None else None,
+        last_status=str(payload["last_status"]) if payload.get("last_status") is not None else None,
+        run_count=int(payload.get("run_count") or 0),
+        failure_count=int(payload.get("failure_count") or 0),
+        lease_owner=str(payload["lease_owner"]) if payload.get("lease_owner") is not None else None,
+        lease_expires_at=str(payload["lease_expires_at"]) if payload.get("lease_expires_at") is not None else None,
+    )
+
+
+def next_operations_schedule_run_at(
+    cadence: str,
+    from_time: str | None = None,
+) -> str:
+    base = _parse_iso_datetime(from_time or datetime.now(timezone.utc).isoformat())
+    seconds = _operations_schedule_cadence_seconds(cadence)
+    return datetime.fromtimestamp(base.timestamp() + seconds, timezone.utc).isoformat()
+
+
+def advance_operations_scheduled_task(
+    task: OperationsScheduledTask,
+    result: OperationsScheduledTaskResult,
+) -> OperationsScheduledTask:
+    failed = result.status == "FAILED"
+    failure_count = task.failure_count + 1 if failed else 0
+    if failed:
+        retry_delay = int(task.params.get("retry_delay_seconds") or min(3600, 60 * max(1, failure_count)))
+        next_run_at = datetime.fromtimestamp(
+            _parse_iso_datetime(result.finished_at).timestamp() + retry_delay,
+            timezone.utc,
+        ).isoformat()
+    else:
+        next_run_at = next_operations_schedule_run_at(task.cadence, result.finished_at)
+    return replace(
+        task,
+        next_run_at=next_run_at,
+        last_run_at=result.finished_at,
+        last_status=result.status,
+        run_count=task.run_count + 1,
+        failure_count=failure_count,
+        lease_owner=None,
+        lease_expires_at=None,
+    )
+
+
+def operations_scheduled_task_result_to_dict(result: OperationsScheduledTaskResult) -> dict[str, Any]:
+    return {
+        "task_id": result.task_id,
+        "task_type": result.task_type,
+        "status": result.status,
+        "started_at": result.started_at,
+        "finished_at": result.finished_at,
+        "detail": result.detail,
+        "output": result.output,
+    }
+
+
+def operations_scheduler_run_report_to_dict(report: OperationsSchedulerRunReport) -> dict[str, Any]:
+    return {
+        "run_id": report.run_id,
+        "started_at": report.started_at,
+        "finished_at": report.finished_at,
+        "due_count": report.due_count,
+        "executed_count": report.executed_count,
+        "failed_count": report.failed_count,
+        "results": [operations_scheduled_task_result_to_dict(item) for item in report.results],
+        "summary": report.summary,
+    }
+
+
+def operations_scheduler_run_report_from_dict(payload: dict[str, Any]) -> OperationsSchedulerRunReport:
+    return OperationsSchedulerRunReport(
+        run_id=str(payload["run_id"]),
+        started_at=str(payload.get("started_at") or ""),
+        finished_at=str(payload.get("finished_at") or ""),
+        due_count=int(payload.get("due_count") or 0),
+        executed_count=int(payload.get("executed_count") or 0),
+        failed_count=int(payload.get("failed_count") or 0),
+        results=[
+            OperationsScheduledTaskResult(
+                task_id=str(item["task_id"]),
+                task_type=str(item.get("task_type") or ""),
+                status=str(item.get("status") or "UNKNOWN"),
+                started_at=str(item.get("started_at") or ""),
+                finished_at=str(item.get("finished_at") or ""),
+                detail=str(item.get("detail") or ""),
+                output=dict(item.get("output") or {}),
+            )
+            for item in payload.get("results") or []
+        ],
+        summary=str(payload.get("summary") or ""),
+    )
+
+
+def build_operations_scheduler_health_report(
+    run_reports: list[OperationsSchedulerRunReport],
+    tasks: list[OperationsScheduledTask],
+    now: str | None = None,
+    stale_lease_seconds: int = 900,
+    stale_task_seconds: int = 86400,
+) -> OperationsSchedulerHealthReport:
+    generated_at = now or datetime.now(timezone.utc).isoformat()
+    alerts: list[dict[str, Any]] = []
+    failed_runs = 0
+    for report in run_reports:
+        if report.failed_count <= 0:
+            continue
+        failed_runs += 1
+        alerts.append(
+            {
+                "alert_type": "operations_scheduler_run_failed",
+                "severity": "critical",
+                "message": f"scheduler run {report.run_id} failed {report.failed_count} task(s)",
+                "value": report.failed_count,
+                "run_id": report.run_id,
+                "generated_at": generated_at,
+            }
+        )
+    stale_leases = 0
+    now_ts = _timestamp_sort_key(generated_at)
+    for task in tasks:
+        lease_owner = task.lease_owner or ""
+        lease_expires_at = task.lease_expires_at or ""
+        if lease_owner and lease_expires_at:
+            lease_age = now_ts - _timestamp_sort_key(lease_expires_at)
+            if lease_age >= stale_lease_seconds:
+                stale_leases += 1
+                alerts.append(
+                    {
+                        "alert_type": "operations_scheduler_stale_lease",
+                        "severity": "warning",
+                        "message": f"scheduler task {task.task_id} lease expired but is still owned by {lease_owner}",
+                        "value": int(lease_age),
+                        "task_id": task.task_id,
+                        "lease_owner": lease_owner,
+                        "lease_expires_at": lease_expires_at,
+                        "generated_at": generated_at,
+                    }
+                )
+        if task.enabled and task.last_run_at:
+            idle_seconds = now_ts - _timestamp_sort_key(task.last_run_at)
+            if idle_seconds >= stale_task_seconds:
+                alerts.append(
+                    {
+                        "alert_type": "operations_scheduler_task_stale",
+                        "severity": "warning",
+                        "message": f"scheduler task {task.task_id} has not completed recently",
+                        "value": int(idle_seconds),
+                        "task_id": task.task_id,
+                        "last_run_at": task.last_run_at,
+                        "generated_at": generated_at,
+                    }
+                )
+        if task.failure_count >= 3:
+            alerts.append(
+                {
+                    "alert_type": "operations_scheduler_task_repeated_failures",
+                    "severity": "critical",
+                    "message": f"scheduler task {task.task_id} has {task.failure_count} consecutive failure(s)",
+                    "value": task.failure_count,
+                    "task_id": task.task_id,
+                    "generated_at": generated_at,
+                }
+            )
+    summary = (
+        f"scheduler_runs={len(run_reports)}; tasks={len(tasks)}; "
+        f"failed_runs={failed_runs}; stale_leases={stale_leases}; alerts={len(alerts)}"
+    )
+    return OperationsSchedulerHealthReport(
+        generated_at=generated_at,
+        run_count=len(run_reports),
+        task_count=len(tasks),
+        failed_runs=failed_runs,
+        stale_leases=stale_leases,
+        alerts=alerts,
+        summary=summary,
+    )
+
+
+def operations_scheduler_health_report_to_dict(report: OperationsSchedulerHealthReport) -> dict[str, Any]:
+    return {
+        "generated_at": report.generated_at,
+        "run_count": report.run_count,
+        "task_count": report.task_count,
+        "failed_runs": report.failed_runs,
+        "stale_leases": report.stale_leases,
+        "alerts": [_normalize_alert(alert) for alert in report.alerts],
+        "summary": report.summary,
+    }
+
+
+def render_operations_scheduler_health_report(report: OperationsSchedulerHealthReport) -> str:
+    lines = [
+        "Operations scheduler health:",
+        f"- generated_at: {report.generated_at}",
+        f"- run_count: {report.run_count}",
+        f"- task_count: {report.task_count}",
+        f"- failed_runs: {report.failed_runs}",
+        f"- stale_leases: {report.stale_leases}",
+        f"- summary: {report.summary}",
+    ]
+    if report.alerts:
+        lines.append("- alerts:")
+        for alert in report.alerts:
+            normalized = _normalize_alert(alert)
+            lines.append(
+                f"  - {normalized['severity']} {normalized['alert_type']}: {normalized['message']}"
+            )
+    else:
+        lines.append("- alerts: none")
+    return "\n".join(lines)
+
+
+def render_operations_scheduled_tasks(tasks: list[OperationsScheduledTask]) -> str:
+    lines = ["Operations scheduled tasks:"]
+    if not tasks:
+        lines.append("- none")
+        return "\n".join(lines)
+    for task in tasks:
+        lines.append(
+            f"- {task.task_id}: type={task.task_type} cadence={task.cadence} "
+            f"enabled={task.enabled} next_run_at={task.next_run_at}"
+        )
+    return "\n".join(lines)
+
+
+def render_operations_scheduler_run_report(report: OperationsSchedulerRunReport) -> str:
+    lines = [
+        "Operations scheduler run:",
+        f"- run_id: {report.run_id}",
+        f"- started_at: {report.started_at}",
+        f"- finished_at: {report.finished_at}",
+        f"- due_count: {report.due_count}",
+        f"- executed_count: {report.executed_count}",
+        f"- failed_count: {report.failed_count}",
+        f"- summary: {report.summary}",
+    ]
+    if report.results:
+        lines.append("- results:")
+        for result in report.results:
+            lines.append(f"  - {result.task_id}: status={result.status} detail={result.detail}")
+    return "\n".join(lines)
+
+
+def run_operations_scheduled_tasks(
+    tasks: list[OperationsScheduledTask],
+    handlers: dict[str, Any],
+    now: str | None = None,
+) -> OperationsSchedulerRunReport:
+    started_at = now or datetime.now(timezone.utc).isoformat()
+    due_tasks = [
+        task
+        for task in tasks
+        if task.enabled and _timestamp_sort_key(task.next_run_at) <= _timestamp_sort_key(started_at)
+    ]
+    results: list[OperationsScheduledTaskResult] = []
+    for task in due_tasks:
+        handler = handlers.get(task.task_type)
+        task_started_at = datetime.now(timezone.utc).isoformat()
+        if handler is None:
+            results.append(
+                OperationsScheduledTaskResult(
+                    task_id=task.task_id,
+                    task_type=task.task_type,
+                    status="SKIPPED",
+                    started_at=task_started_at,
+                    finished_at=datetime.now(timezone.utc).isoformat(),
+                    detail="no handler registered",
+                    output={},
+                )
+            )
+            continue
+        try:
+            output = handler(task)
+            status = "SUCCESS"
+            detail = "task completed"
+        except Exception as exc:
+            output = {"error": str(exc)}
+            status = "FAILED"
+            detail = str(exc)
+        results.append(
+            OperationsScheduledTaskResult(
+                task_id=task.task_id,
+                task_type=task.task_type,
+                status=status,
+                started_at=task_started_at,
+                finished_at=datetime.now(timezone.utc).isoformat(),
+                detail=detail,
+                output=dict(output or {}),
+            )
+        )
+    finished_at = datetime.now(timezone.utc).isoformat()
+    failed_count = sum(1 for result in results if result.status == "FAILED")
+    executed_count = sum(1 for result in results if result.status == "SUCCESS")
+    summary = f"Scheduler executed {executed_count}/{len(due_tasks)} due task(s); failed={failed_count}."
+    return OperationsSchedulerRunReport(
+        run_id=_stable_id("OSR", started_at, finished_at, ",".join(task.task_id for task in due_tasks)),
+        started_at=started_at,
+        finished_at=finished_at,
+        due_count=len(due_tasks),
+        executed_count=executed_count,
+        failed_count=failed_count,
+        results=results,
+        summary=summary,
+    )
+
+
+def authorize_operations_action(
+    action: str,
+    user_id: str,
+    permission_policy: PermissionPolicy | None = None,
+    department: str | None = None,
+    roles: list[str] | set[str] | tuple[str, ...] | None = None,
+    audit_sink: AuditSink | None = None,
+    payload: dict[str, Any] | None = None,
+) -> OperationsActionAuthorization:
+    policy = permission_policy or PermissionPolicy.from_env()
+    decision = evaluate_permission(
+        policy,
+        user_id=user_id,
+        action=action,
+        department=department,
+        roles=roles,
+    )
+    audit_result = None
+    if audit_sink is not None:
+        audit_payload = {
+            "action": action,
+            "user_id": user_id,
+            "department": department,
+            "roles": sorted({str(role) for role in roles or []}),
+            "allowed": decision.allowed,
+            "decision_status": decision.status,
+            "payload": dict(payload or {}),
+        }
+        audit_result = audit_sink.write([build_audit_event(f"operations.{action}", audit_payload)])
+    return OperationsActionAuthorization(
+        allowed=decision.allowed,
+        action=action,
+        user_id=user_id,
+        decision=decision,
+        audit_result=audit_result,
+    )
+
+
+def operations_action_authorization_to_dict(
+    authorization: OperationsActionAuthorization,
+) -> dict[str, Any]:
+    audit = authorization.audit_result
+    return {
+        "allowed": authorization.allowed,
+        "action": authorization.action,
+        "user_id": authorization.user_id,
+        "decision": {
+            "allowed": authorization.decision.allowed,
+            "enforced": authorization.decision.enforced,
+            "status": authorization.decision.status,
+            "action": authorization.decision.action,
+            "user_id": authorization.decision.user_id,
+            "department": authorization.decision.department,
+            "roles": authorization.decision.roles,
+            "reasons": authorization.decision.reasons,
+            "source": authorization.decision.source,
+        },
+        "audit_result": (
+            {
+                "ok": audit.ok,
+                "delivered": audit.delivered,
+                "failed": audit.failed,
+                "detail": audit.detail,
+            }
+            if audit is not None
+            else None
+        ),
+    }
+
+
+def render_operations_action_authorization(authorization: OperationsActionAuthorization) -> str:
+    lines = [
+        "Operations action authorization:",
+        f"- action: {authorization.action}",
+        f"- user_id: {authorization.user_id}",
+        f"- allowed: {authorization.allowed}",
+        f"- decision: {authorization.decision.status}",
+    ]
+    if authorization.audit_result is not None:
+        lines.append(f"- audit: ok={authorization.audit_result.ok} detail={authorization.audit_result.detail}")
+    _append_list_section(lines, "reasons", authorization.decision.reasons)
+    return "\n".join(lines)
+
+
+def execute_oncall_webhook_replay_job(
+    job: OnCallWebhookReplayJob,
+    events: list[OnCallWebhookEvent],
+    patches: dict[str, dict[str, Any]] | None = None,
+    executed_at: str | None = None,
+) -> OnCallWebhookReplayJobExecution:
+    executed_at = executed_at or datetime.now(timezone.utc).isoformat()
+    event_ids = set(job.event_ids)
+    selected = [event for event in events if event.event_id in event_ids]
+    if job.status not in {"PENDING", "FAILED"}:
+        result = OnCallWebhookReplayBatchResult(
+            batch_id=_stable_id("WHB", executed_at, job.job_id, "skipped"),
+            generated_at=executed_at,
+            attempted=0,
+            accepted=0,
+            failed=0,
+            skipped=1,
+            results=[
+                OnCallWebhookReplayResult(
+                    source_event_id=job.job_id,
+                    status="SKIPPED",
+                    accepted=False,
+                    replayed_at=executed_at,
+                    ticket_id=None,
+                    reason=f"job status {job.status} is not executable",
+                )
+            ],
+        )
+        updated_job = replace(
+            job,
+            status="SKIPPED",
+            batch_result=result,
+            audit={**job.audit, "executed_at": executed_at, "previous_status": job.status},
+        )
+        return OnCallWebhookReplayJobExecution(updated_job, [], [], result)
+    replayed_events, statuses, result = replay_dead_letter_oncall_webhook_events(
+        selected,
+        replayed_at=executed_at,
+        patches=patches,
+    )
+    if result.failed:
+        status = "FAILED"
+    elif result.accepted:
+        status = "COMPLETED"
+    elif result.skipped:
+        status = "SKIPPED"
+    else:
+        status = "EMPTY"
+    updated_job = replace(
+        job,
+        status=status,
+        batch_result=result,
+        audit={
+            **job.audit,
+            "executed_at": executed_at,
+            "selected_events": len(selected),
+            "source": "scheduler",
+        },
+    )
+    return OnCallWebhookReplayJobExecution(updated_job, replayed_events, statuses, result)
+
+
+def oncall_webhook_replay_job_execution_to_dict(
+    execution: OnCallWebhookReplayJobExecution,
+) -> dict[str, Any]:
+    return {
+        "job": oncall_webhook_replay_job_to_dict(execution.job),
+        "replayed_events": [oncall_webhook_event_to_dict(event) for event in execution.replayed_events],
+        "statuses": [oncall_ticket_status_to_dict(status) for status in execution.statuses],
+        "result": oncall_webhook_replay_batch_result_to_dict(execution.result),
+    }
+
+
+def render_oncall_webhook_replay_job_execution(execution: OnCallWebhookReplayJobExecution) -> str:
+    lines = [
+        "OnCall webhook replay job execution:",
+        f"- job_id: {execution.job.job_id}",
+        f"- status: {execution.job.status}",
+        f"- attempted: {execution.result.attempted}",
+        f"- accepted: {execution.result.accepted}",
+        f"- failed: {execution.result.failed}",
+        f"- skipped: {execution.result.skipped}",
+    ]
+    return "\n".join(lines)
+
+
+def build_operations_console_overview(
+    closed_loop_dashboard: OperationsClosedLoopDashboard,
+    webhook_ops: OnCallWebhookOpsConsole,
+    replay_jobs: list[OnCallWebhookReplayJob],
+    generated_at: str | None = None,
+) -> OperationsConsoleOverview:
+    generated_at = generated_at or datetime.now(timezone.utc).isoformat()
+    quality = evaluate_operations_closed_loop_quality(closed_loop_dashboard, generated_at=generated_at)
+    acceptance = build_operations_closed_loop_acceptance_report(closed_loop_dashboard, generated_at=generated_at)
+    pending_jobs = sum(1 for job in replay_jobs if job.status == "PENDING")
+    summary = (
+        f"closed_loop_snapshots={closed_loop_dashboard.snapshot_count}; "
+        f"dead_letters={webhook_ops.dead_letters}; pending_replay_jobs={pending_jobs}; "
+        f"quality_ok={quality.ok}"
+    )
+    return OperationsConsoleOverview(
+        generated_at=generated_at,
+        closed_loop_dashboard=closed_loop_dashboard,
+        webhook_ops=webhook_ops,
+        replay_jobs=list(replay_jobs),
+        closed_loop_quality=quality,
+        closed_loop_acceptance=acceptance,
+        summary=summary,
+    )
+
+
+def operations_console_overview_to_dict(overview: OperationsConsoleOverview) -> dict[str, Any]:
+    return {
+        "generated_at": overview.generated_at,
+        "closed_loop_dashboard": operations_closed_loop_dashboard_to_dict(overview.closed_loop_dashboard),
+        "webhook_ops": oncall_webhook_ops_console_to_dict(overview.webhook_ops),
+        "replay_jobs": [oncall_webhook_replay_job_to_dict(job) for job in overview.replay_jobs],
+        "closed_loop_quality": operations_closed_loop_quality_report_to_dict(overview.closed_loop_quality),
+        "closed_loop_acceptance": operations_closed_loop_acceptance_report_to_dict(overview.closed_loop_acceptance),
+        "summary": overview.summary,
+    }
+
+
+def render_operations_console_overview_json(overview: OperationsConsoleOverview) -> str:
+    return json.dumps(
+        {"operations_console_overview": operations_console_overview_to_dict(overview)},
+        ensure_ascii=False,
+    )
+
+
+def build_operations_console_view(
+    overview: OperationsConsoleOverview,
+    actor: str,
+    roles: list[str] | set[str] | tuple[str, ...] | None = None,
+    department: str | None = None,
+    permission_policy: PermissionPolicy | None = None,
+    audit_sink: AuditSink | None = None,
+    generated_at: str | None = None,
+) -> OperationsConsoleView:
+    generated_at = generated_at or datetime.now(timezone.utc).isoformat()
+    role_list = sorted({str(role) for role in roles or [] if str(role).strip()})
+    action_names = [
+        "view_operations_console",
+        "create_replay_job",
+        "execute_replay_job",
+        "run_operations_schedule",
+        "publish_closed_loop_schema",
+        "update_governance_policy",
+    ]
+    permissions: dict[str, OperationsActionAuthorization] = {}
+    for action in action_names:
+        permissions[action] = authorize_operations_action(
+            action,
+            user_id=actor,
+            permission_policy=permission_policy,
+            department=department,
+            roles=role_list,
+            audit_sink=audit_sink if action == "view_operations_console" else None,
+            payload={"source": "operations_console_view"},
+        )
+    can_view = permissions["view_operations_console"].allowed
+    visible_sections = ["summary"] if can_view else []
+    if can_view:
+        visible_sections.extend(["closed_loop", "webhook_ops", "replay_jobs", "quality"])
+    action_defs = [
+        ("create_replay_job", "Create replay job", "Create a dead-letter replay job from retryable webhook events."),
+        ("execute_replay_job", "Execute replay jobs", "Run pending replay jobs and write back results."),
+        ("run_operations_schedule", "Run scheduler", "Claim and run due persisted operations schedule tasks."),
+        ("publish_closed_loop_schema", "Publish BI contract", "Publish closed-loop schema and OpenAPI contract."),
+        ("update_governance_policy", "Update governance policy", "Change recovery governance or RBAC policy."),
+    ]
+    actions = [
+        {
+            "action": action,
+            "label": label,
+            "description": description,
+            "allowed": permissions[action].allowed,
+            "status": permissions[action].decision.status,
+            "reasons": permissions[action].decision.reasons,
+        }
+        for action, label, description in action_defs
+    ]
+    read_only = not any(item["allowed"] for item in actions)
+    return OperationsConsoleView(
+        generated_at=generated_at,
+        actor=actor,
+        department=department,
+        roles=role_list,
+        permissions=permissions,
+        overview=overview,
+        visible_sections=visible_sections,
+        actions=actions,
+        read_only=read_only,
+    )
+
+
+def operations_console_view_to_dict(view: OperationsConsoleView) -> dict[str, Any]:
+    return {
+        "generated_at": view.generated_at,
+        "actor": view.actor,
+        "department": view.department,
+        "roles": view.roles,
+        "permissions": {
+            action: operations_action_authorization_to_dict(authorization)
+            for action, authorization in view.permissions.items()
+        },
+        "overview": operations_console_overview_to_dict(view.overview),
+        "visible_sections": view.visible_sections,
+        "actions": view.actions,
+        "read_only": view.read_only,
+    }
+
+
+def render_operations_console_view_json(view: OperationsConsoleView) -> str:
+    return json.dumps({"operations_console_view": operations_console_view_to_dict(view)}, ensure_ascii=False)
+
+
+def render_operations_console_view_html(view: OperationsConsoleView) -> str:
+    if "summary" not in view.visible_sections:
+        return _html_page(
+            "Operations Console",
+            [
+                "<main>",
+                "<h1>Operations Console</h1>",
+                f"<p>Access denied for {escape(view.actor)}.</p>",
+                "</main>",
+            ],
+        )
+    overview = view.overview
+    action_items = "\n".join(
+        "<tr>"
+        f"<td>{escape(str(item['label']))}</td>"
+        f"<td>{'allowed' if item['allowed'] else 'denied'}</td>"
+        f"<td>{escape(str(item['status']))}</td>"
+        f"<td>{escape('; '.join(str(reason) for reason in item.get('reasons') or []))}</td>"
+        "</tr>"
+        for item in view.actions
+    )
+    replay_rows = "\n".join(
+        "<tr>"
+        f"<td>{escape(job.job_id)}</td>"
+        f"<td>{escape(job.status)}</td>"
+        f"<td>{escape(job.requested_by)}</td>"
+        f"<td>{len(job.event_ids)}</td>"
+        "</tr>"
+        for job in overview.replay_jobs[:10]
+    ) or "<tr><td colspan=\"4\">none</td></tr>"
+    sections = [
+        "<main>",
+        "<h1>Operations Console</h1>",
+        f"<p>{escape(overview.summary)}</p>",
+        "<section><h2>Actor</h2>",
+        f"<p>{escape(view.actor)} | roles={escape(','.join(view.roles) or '-')} | read_only={str(view.read_only).lower()}</p>",
+        "</section>",
+        "<section><h2>Closed Loop</h2>",
+        "<dl>",
+        f"<dt>snapshots</dt><dd>{overview.closed_loop_dashboard.snapshot_count}</dd>",
+        f"<dt>quality</dt><dd>{str(overview.closed_loop_quality.ok).lower()}</dd>",
+        f"<dt>acceptance</dt><dd>{str(overview.closed_loop_acceptance.ok).lower()}</dd>",
+        "</dl></section>",
+        "<section><h2>Webhook</h2>",
+        "<dl>",
+        f"<dt>dead letters</dt><dd>{overview.webhook_ops.dead_letters}</dd>",
+        f"<dt>retryable</dt><dd>{len(overview.webhook_ops.retryable_event_ids)}</dd>",
+        "</dl></section>",
+        "<section><h2>Replay Jobs</h2>",
+        "<table><thead><tr><th>job</th><th>status</th><th>requested by</th><th>events</th></tr></thead>",
+        f"<tbody>{replay_rows}</tbody></table></section>",
+        "<section><h2>Actions</h2>",
+        "<table><thead><tr><th>action</th><th>permission</th><th>status</th><th>reason</th></tr></thead>",
+        f"<tbody>{action_items}</tbody></table></section>",
+        "</main>",
+    ]
+    return _html_page("Operations Console", sections)
+
+
+def render_operations_closed_loop_contract_validation(result: dict[str, Any]) -> str:
+    lines = [
+        "Operations closed-loop contract validation:",
+        f"- ok: {bool(result.get('ok'))}",
+        f"- schema_version: {result.get('schema_version') or '-'}",
+        f"- snapshot_count: {result.get('snapshot_count')}",
+        f"- checkpoint: {result.get('checkpoint') or '-'}",
+    ]
+    _append_list_section(lines, "errors", [str(item) for item in result.get("errors") or []])
+    return "\n".join(lines)
 
 
 def build_operations_multidimensional_view(
@@ -2217,6 +4883,598 @@ def oncall_ticket_status_from_dict(payload: dict[str, Any]) -> OnCallTicketStatu
     )
 
 
+def oncall_ticket_status_from_webhook(payload: dict[str, Any]) -> OnCallTicketStatus:
+    data = _extract_oncall_webhook_ticket(payload)
+    ticket_id = _first_text(
+        data,
+        payload,
+        names=("ticket_id", "id", "incident_id", "issue_id", "key", "number"),
+    )
+    if not ticket_id:
+        raise ValueError("OnCall webhook payload requires ticket_id, id, incident_id, issue_id, key, or number.")
+    status = _first_text(data, payload, names=("status", "state", "resolution")) or "UNKNOWN"
+    updated_at = _first_text(
+        data,
+        payload,
+        names=("updated_at", "updatedAt", "timestamp", "time", "occurred_at", "created_at"),
+    ) or datetime.now(timezone.utc).isoformat()
+    detail = _first_text(
+        data,
+        payload,
+        names=("detail", "message", "summary", "title", "description", "event_type", "event"),
+    ) or "webhook status recorded"
+    assignee = _assignee_text(
+        data.get("assignee")
+        or data.get("owner")
+        or data.get("assigned_to")
+        or data.get("resolver")
+        or payload.get("assignee")
+        or payload.get("owner")
+    )
+    return OnCallTicketStatus(
+        ticket_id=ticket_id,
+        status=status,
+        assignee=assignee,
+        updated_at=updated_at,
+        detail=detail,
+    )
+
+
+def build_oncall_webhook_event(
+    payload: dict[str, Any],
+    raw_body: str | None = None,
+    secret: str | None = None,
+    signature: str | None = None,
+    seen_event_ids: set[str] | None = None,
+    now: str | None = None,
+    replay_window_minutes: int = 1440,
+    allow_replay: bool = False,
+) -> OnCallWebhookEvent:
+    received_at = now or datetime.now(timezone.utc).isoformat()
+    seen_event_ids = seen_event_ids or set()
+    status: OnCallTicketStatus | None = None
+    reasons: list[str] = []
+    try:
+        status = oncall_ticket_status_from_webhook(payload)
+        event_id = _oncall_webhook_event_id(payload, status)
+    except Exception as exc:
+        event_id = _stable_id("WHK", json.dumps(payload, sort_keys=True, ensure_ascii=False))
+        signature_valid = verify_oncall_webhook_signature(raw_body or json.dumps(payload, sort_keys=True), secret, signature)
+        return OnCallWebhookEvent(
+            event_id=event_id,
+            ticket_id=None,
+            status="DEAD_LETTER",
+            received_at=received_at,
+            updated_at=None,
+            accepted=False,
+            duplicate=event_id in seen_event_ids,
+            signature_valid=signature_valid,
+            replay=False,
+            dead_letter=True,
+            reason=f"invalid webhook payload: {exc}",
+            payload=payload,
+        )
+
+    raw = raw_body or json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    signature_valid = verify_oncall_webhook_signature(raw, secret, signature)
+    duplicate = event_id in seen_event_ids
+    replay = _oncall_webhook_is_replay(status.updated_at, received_at, replay_window_minutes)
+    if not signature_valid:
+        reasons.append("signature validation failed")
+    if duplicate:
+        reasons.append("duplicate event id")
+    if replay and not allow_replay:
+        reasons.append(f"event is outside replay window {replay_window_minutes} minutes")
+    accepted = signature_valid and not duplicate and (allow_replay or not replay)
+    if accepted:
+        reasons.append("event accepted")
+    return OnCallWebhookEvent(
+        event_id=event_id,
+        ticket_id=status.ticket_id,
+        status="ACCEPTED" if accepted else ("DUPLICATE" if duplicate else "DEAD_LETTER"),
+        received_at=received_at,
+        updated_at=status.updated_at,
+        accepted=accepted,
+        duplicate=duplicate,
+        signature_valid=signature_valid,
+        replay=replay,
+        dead_letter=not accepted and not duplicate,
+        reason="; ".join(_dedupe(reasons)),
+        payload={
+            "webhook": payload,
+            "ticket_status": oncall_ticket_status_to_dict(status),
+        },
+    )
+
+
+def verify_oncall_webhook_signature(
+    raw_body: str,
+    secret: str | None = None,
+    signature: str | None = None,
+) -> bool:
+    if not secret:
+        return True
+    if not signature:
+        return False
+    digest = hmac.new(secret.encode("utf-8"), raw_body.encode("utf-8"), hashlib.sha256).hexdigest()
+    normalized = signature.strip()
+    if normalized.startswith("sha256="):
+        normalized = normalized[7:]
+    return hmac.compare_digest(digest, normalized)
+
+
+def oncall_webhook_event_to_dict(event: OnCallWebhookEvent) -> dict[str, Any]:
+    return {
+        "event_id": event.event_id,
+        "ticket_id": event.ticket_id,
+        "status": event.status,
+        "received_at": event.received_at,
+        "updated_at": event.updated_at,
+        "accepted": event.accepted,
+        "duplicate": event.duplicate,
+        "signature_valid": event.signature_valid,
+        "replay": event.replay,
+        "dead_letter": event.dead_letter,
+        "reason": event.reason,
+        "payload": event.payload,
+    }
+
+
+def oncall_webhook_event_from_dict(payload: dict[str, Any]) -> OnCallWebhookEvent:
+    return OnCallWebhookEvent(
+        event_id=str(payload["event_id"]),
+        ticket_id=str(payload["ticket_id"]) if payload.get("ticket_id") is not None else None,
+        status=str(payload.get("status") or "UNKNOWN"),
+        received_at=str(payload.get("received_at") or ""),
+        updated_at=str(payload["updated_at"]) if payload.get("updated_at") is not None else None,
+        accepted=bool(payload.get("accepted", False)),
+        duplicate=bool(payload.get("duplicate", False)),
+        signature_valid=bool(payload.get("signature_valid", False)),
+        replay=bool(payload.get("replay", False)),
+        dead_letter=bool(payload.get("dead_letter", False)),
+        reason=str(payload.get("reason") or ""),
+        payload=dict(payload.get("payload") or {}),
+    )
+
+
+def list_dead_letter_oncall_webhook_events(events: list[OnCallWebhookEvent]) -> list[OnCallWebhookEvent]:
+    return [event for event in events if event.dead_letter]
+
+
+def patch_oncall_webhook_event_payload(
+    event: OnCallWebhookEvent,
+    patch: dict[str, Any],
+    patched_at: str | None = None,
+) -> OnCallWebhookEvent:
+    patched_at = patched_at or datetime.now(timezone.utc).isoformat()
+    patched_payload = _deep_merge_dict(event.payload, patch)
+    patch_audit = {
+        "status": "PATCHED",
+        "patched_at": patched_at,
+        "fields": sorted(str(key) for key in patch),
+    }
+    patched_payload = _deep_merge_dict(patched_payload, {"patch": patch_audit})
+    return replace(
+        event,
+        payload=patched_payload,
+        reason=f"{event.reason}; payload patched" if event.reason else "payload patched",
+    )
+
+
+def replay_dead_letter_oncall_webhook_event(
+    event: OnCallWebhookEvent,
+    replayed_at: str | None = None,
+) -> tuple[OnCallWebhookEvent, OnCallTicketStatus | None, OnCallWebhookReplayResult]:
+    replayed_at = replayed_at or datetime.now(timezone.utc).isoformat()
+    if not event.dead_letter:
+        return (
+            event,
+            None,
+            OnCallWebhookReplayResult(
+                source_event_id=event.event_id,
+                status="SKIPPED",
+                accepted=False,
+                replayed_at=replayed_at,
+                ticket_id=event.ticket_id,
+                reason="webhook event is not a dead letter",
+            ),
+        )
+
+    status_payload = event.payload.get("ticket_status") if isinstance(event.payload, dict) else None
+    webhook_payload = event.payload.get("webhook") if isinstance(event.payload, dict) else None
+    try:
+        status = (
+            oncall_ticket_status_from_dict(status_payload)
+            if isinstance(status_payload, dict)
+            else oncall_ticket_status_from_webhook(dict(webhook_payload or event.payload))
+        )
+    except Exception as exc:
+        replayed = OnCallWebhookEvent(
+            event_id=event.event_id,
+            ticket_id=event.ticket_id,
+            status="DEAD_LETTER",
+            received_at=event.received_at,
+            updated_at=event.updated_at,
+            accepted=False,
+            duplicate=event.duplicate,
+            signature_valid=event.signature_valid,
+            replay=True,
+            dead_letter=True,
+            reason=f"{event.reason}; replay failed: {exc}" if event.reason else f"replay failed: {exc}",
+            payload={**event.payload, "replay": {"status": "FAILED", "replayed_at": replayed_at, "reason": str(exc)}},
+        )
+        return (
+            replayed,
+            None,
+            OnCallWebhookReplayResult(
+                source_event_id=event.event_id,
+                status="FAILED",
+                accepted=False,
+                replayed_at=replayed_at,
+                ticket_id=event.ticket_id,
+                reason=str(exc),
+            ),
+        )
+
+    replayed_payload = {
+        **event.payload,
+        "ticket_status": oncall_ticket_status_to_dict(status),
+        "replay": {
+            "status": "ACCEPTED",
+            "replayed_at": replayed_at,
+            "source_event_id": event.event_id,
+        },
+    }
+    replayed = OnCallWebhookEvent(
+        event_id=event.event_id,
+        ticket_id=status.ticket_id,
+        status="REPLAYED",
+        received_at=event.received_at,
+        updated_at=status.updated_at,
+        accepted=True,
+        duplicate=event.duplicate,
+        signature_valid=event.signature_valid,
+        replay=True,
+        dead_letter=False,
+        reason="dead-letter webhook replay accepted",
+        payload=replayed_payload,
+    )
+    return (
+        replayed,
+        status,
+        OnCallWebhookReplayResult(
+            source_event_id=event.event_id,
+            status="REPLAYED",
+            accepted=True,
+            replayed_at=replayed_at,
+            ticket_id=status.ticket_id,
+            reason="dead-letter webhook replay accepted",
+        ),
+    )
+
+
+def replay_dead_letter_oncall_webhook_events(
+    events: list[OnCallWebhookEvent],
+    replayed_at: str | None = None,
+    limit: int | None = None,
+    patches: dict[str, dict[str, Any]] | None = None,
+) -> tuple[list[OnCallWebhookEvent], list[OnCallTicketStatus], OnCallWebhookReplayBatchResult]:
+    replayed_at = replayed_at or datetime.now(timezone.utc).isoformat()
+    patches = patches or {}
+    candidates = list_dead_letter_oncall_webhook_events(events)
+    if limit is not None:
+        candidates = candidates[: max(0, int(limit))]
+
+    replayed_events: list[OnCallWebhookEvent] = []
+    statuses: list[OnCallTicketStatus] = []
+    results: list[OnCallWebhookReplayResult] = []
+    for event in candidates:
+        patched = patch_oncall_webhook_event_payload(event, patches[event.event_id], patched_at=replayed_at) if event.event_id in patches else event
+        replayed_event, status, result = replay_dead_letter_oncall_webhook_event(patched, replayed_at=replayed_at)
+        replayed_events.append(replayed_event)
+        if status is not None:
+            statuses.append(status)
+        results.append(result)
+
+    accepted = sum(1 for result in results if result.accepted)
+    failed = sum(1 for result in results if result.status == "FAILED")
+    skipped = sum(1 for result in results if result.status == "SKIPPED")
+    batch = OnCallWebhookReplayBatchResult(
+        batch_id=_stable_id("WHB", replayed_at, ",".join(result.source_event_id for result in results)),
+        generated_at=replayed_at,
+        attempted=len(results),
+        accepted=accepted,
+        failed=failed,
+        skipped=skipped,
+        results=results,
+    )
+    return replayed_events, statuses, batch
+
+
+def oncall_webhook_replay_result_to_dict(result: OnCallWebhookReplayResult) -> dict[str, Any]:
+    return {
+        "source_event_id": result.source_event_id,
+        "status": result.status,
+        "accepted": result.accepted,
+        "replayed_at": result.replayed_at,
+        "ticket_id": result.ticket_id,
+        "reason": result.reason,
+    }
+
+
+def oncall_webhook_replay_result_from_dict(payload: dict[str, Any]) -> OnCallWebhookReplayResult:
+    return OnCallWebhookReplayResult(
+        source_event_id=str(payload["source_event_id"]),
+        status=str(payload.get("status") or "UNKNOWN"),
+        accepted=bool(payload.get("accepted", False)),
+        replayed_at=str(payload.get("replayed_at") or ""),
+        ticket_id=str(payload["ticket_id"]) if payload.get("ticket_id") is not None else None,
+        reason=str(payload.get("reason") or ""),
+    )
+
+
+def oncall_webhook_replay_batch_result_to_dict(result: OnCallWebhookReplayBatchResult) -> dict[str, Any]:
+    return {
+        "batch_id": result.batch_id,
+        "generated_at": result.generated_at,
+        "attempted": result.attempted,
+        "accepted": result.accepted,
+        "failed": result.failed,
+        "skipped": result.skipped,
+        "results": [oncall_webhook_replay_result_to_dict(item) for item in result.results],
+    }
+
+
+def oncall_webhook_replay_batch_result_from_dict(payload: dict[str, Any]) -> OnCallWebhookReplayBatchResult:
+    return OnCallWebhookReplayBatchResult(
+        batch_id=str(payload["batch_id"]),
+        generated_at=str(payload.get("generated_at") or ""),
+        attempted=int(payload.get("attempted") or 0),
+        accepted=int(payload.get("accepted") or 0),
+        failed=int(payload.get("failed") or 0),
+        skipped=int(payload.get("skipped") or 0),
+        results=[oncall_webhook_replay_result_from_dict(item) for item in payload.get("results") or []],
+    )
+
+
+def build_oncall_webhook_replay_job(
+    event_ids: list[str],
+    requested_by: str = "operator",
+    patch_template_id: str | None = None,
+    batch_result: OnCallWebhookReplayBatchResult | None = None,
+    created_at: str | None = None,
+    status: str | None = None,
+    audit: dict[str, Any] | None = None,
+) -> OnCallWebhookReplayJob:
+    created_at = created_at or datetime.now(timezone.utc).isoformat()
+    normalized_event_ids = [str(item) for item in event_ids]
+    if status is None:
+        if batch_result is None:
+            status = "PENDING"
+        elif batch_result.failed:
+            status = "FAILED"
+        elif batch_result.accepted:
+            status = "COMPLETED"
+        else:
+            status = "SKIPPED"
+    return OnCallWebhookReplayJob(
+        job_id=_stable_id("WHJ", created_at, requested_by, ",".join(normalized_event_ids), patch_template_id or ""),
+        created_at=created_at,
+        status=status,
+        requested_by=requested_by,
+        event_ids=normalized_event_ids,
+        patch_template_id=patch_template_id,
+        batch_result=batch_result,
+        audit=dict(audit or {}),
+    )
+
+
+def oncall_webhook_replay_job_to_dict(job: OnCallWebhookReplayJob) -> dict[str, Any]:
+    return {
+        "job_id": job.job_id,
+        "created_at": job.created_at,
+        "status": job.status,
+        "requested_by": job.requested_by,
+        "event_ids": job.event_ids,
+        "patch_template_id": job.patch_template_id,
+        "batch_result": (
+            oncall_webhook_replay_batch_result_to_dict(job.batch_result)
+            if job.batch_result is not None
+            else None
+        ),
+        "audit": job.audit,
+    }
+
+
+def oncall_webhook_replay_job_from_dict(payload: dict[str, Any]) -> OnCallWebhookReplayJob:
+    batch_payload = payload.get("batch_result")
+    return OnCallWebhookReplayJob(
+        job_id=str(payload["job_id"]),
+        created_at=str(payload.get("created_at") or ""),
+        status=str(payload.get("status") or "UNKNOWN"),
+        requested_by=str(payload.get("requested_by") or "operator"),
+        event_ids=[str(item) for item in payload.get("event_ids") or []],
+        patch_template_id=(
+            str(payload["patch_template_id"]) if payload.get("patch_template_id") is not None else None
+        ),
+        batch_result=(
+            oncall_webhook_replay_batch_result_from_dict(batch_payload)
+            if isinstance(batch_payload, dict)
+            else None
+        ),
+        audit=dict(payload.get("audit") or {}),
+    )
+
+
+def render_oncall_webhook_replay_jobs(jobs: list[OnCallWebhookReplayJob]) -> str:
+    lines = ["OnCall webhook replay jobs:"]
+    if not jobs:
+        lines.append("- none")
+        return "\n".join(lines)
+    for job in jobs:
+        lines.append(
+            f"- {job.job_id}: status={job.status} requested_by={job.requested_by} "
+            f"events={len(job.event_ids)} created_at={job.created_at}"
+        )
+        if job.patch_template_id:
+            lines.append(f"  patch_template_id: {job.patch_template_id}")
+        if job.batch_result is not None:
+            lines.append(
+                f"  batch={job.batch_result.batch_id} attempted={job.batch_result.attempted} "
+                f"accepted={job.batch_result.accepted} failed={job.batch_result.failed}"
+            )
+    return "\n".join(lines)
+
+
+def render_oncall_webhook_replay_jobs_json(jobs: list[OnCallWebhookReplayJob]) -> str:
+    return json.dumps(
+        {"oncall_webhook_replay_jobs": [oncall_webhook_replay_job_to_dict(job) for job in jobs]},
+        ensure_ascii=False,
+    )
+
+
+def render_oncall_webhook_replay_result(result: OnCallWebhookReplayResult) -> str:
+    return "\n".join(
+        [
+            "OnCall webhook replay:",
+            f"- source_event_id: {result.source_event_id}",
+            f"- status: {result.status}",
+            f"- accepted: {result.accepted}",
+            f"- ticket_id: {result.ticket_id or '-'}",
+            f"- replayed_at: {result.replayed_at}",
+            f"- reason: {result.reason or '-'}",
+        ]
+    )
+
+
+def render_oncall_webhook_replay_batch_result(result: OnCallWebhookReplayBatchResult) -> str:
+    lines = [
+        "OnCall webhook replay batch:",
+        f"- batch_id: {result.batch_id}",
+        f"- generated_at: {result.generated_at}",
+        f"- attempted: {result.attempted}",
+        f"- accepted: {result.accepted}",
+        f"- failed: {result.failed}",
+        f"- skipped: {result.skipped}",
+    ]
+    if not result.results:
+        lines.append("- results: none")
+    else:
+        lines.append("- results:")
+        for item in result.results:
+            lines.append(
+                f"  - {item.source_event_id}: status={item.status} accepted={item.accepted} "
+                f"ticket={item.ticket_id or '-'}"
+            )
+    return "\n".join(lines)
+
+
+def render_oncall_webhook_replay_audit_json(result: OnCallWebhookReplayBatchResult) -> str:
+    return json.dumps(
+        {"oncall_webhook_replay_audit": oncall_webhook_replay_batch_result_to_dict(result)},
+        ensure_ascii=False,
+    )
+
+
+def build_oncall_webhook_ops_console(
+    events: list[OnCallWebhookEvent],
+    generated_at: str | None = None,
+) -> OnCallWebhookOpsConsole:
+    generated_at = generated_at or datetime.now(timezone.utc).isoformat()
+    dead_letters = list_dead_letter_oncall_webhook_events(events)
+    replayed = [event for event in events if event.status == "REPLAYED" or event.replay and event.accepted]
+    failed_replays = [
+        event
+        for event in events
+        if isinstance(event.payload, dict)
+        and isinstance(event.payload.get("replay"), dict)
+        and event.payload["replay"].get("status") == "FAILED"
+    ]
+    failure_reasons: Counter[str] = Counter()
+    for event in dead_letters + failed_replays:
+        failure_reasons[_webhook_failure_reason_key(event.reason)] += 1
+    templates = _default_oncall_webhook_patch_templates(dead_letters)
+    return OnCallWebhookOpsConsole(
+        generated_at=generated_at,
+        total_events=len(events),
+        dead_letters=len(dead_letters),
+        replayed=len(replayed),
+        failed_replays=len(failed_replays),
+        retryable_event_ids=[event.event_id for event in dead_letters],
+        failure_reasons=dict(failure_reasons),
+        patch_templates=templates,
+    )
+
+
+def oncall_webhook_patch_template_to_dict(template: OnCallWebhookPatchTemplate) -> dict[str, Any]:
+    return {
+        "template_id": template.template_id,
+        "title": template.title,
+        "match_reason": template.match_reason,
+        "patch": template.patch,
+    }
+
+
+def oncall_webhook_ops_console_to_dict(console: OnCallWebhookOpsConsole) -> dict[str, Any]:
+    return {
+        "generated_at": console.generated_at,
+        "total_events": console.total_events,
+        "dead_letters": console.dead_letters,
+        "replayed": console.replayed,
+        "failed_replays": console.failed_replays,
+        "retryable_event_ids": console.retryable_event_ids,
+        "failure_reasons": console.failure_reasons,
+        "patch_templates": [
+            oncall_webhook_patch_template_to_dict(template) for template in console.patch_templates
+        ],
+    }
+
+
+def render_oncall_webhook_ops_console(console: OnCallWebhookOpsConsole) -> str:
+    lines = [
+        "OnCall webhook operations console:",
+        f"- generated_at: {console.generated_at}",
+        f"- total_events: {console.total_events}",
+        f"- dead_letters: {console.dead_letters}",
+        f"- replayed: {console.replayed}",
+        f"- failed_replays: {console.failed_replays}",
+    ]
+    _append_list_section(lines, "retryable_event_ids", console.retryable_event_ids)
+    _append_count_section(lines, "failure_reasons", console.failure_reasons)
+    lines.append("- patch_templates:")
+    if not console.patch_templates:
+        lines.append("  - none")
+    else:
+        for template in console.patch_templates:
+            lines.append(f"  - {template.template_id}: {template.title}")
+    return "\n".join(lines)
+
+
+def render_oncall_webhook_ops_console_json(console: OnCallWebhookOpsConsole) -> str:
+    return json.dumps(
+        {"oncall_webhook_ops_console": oncall_webhook_ops_console_to_dict(console)},
+        ensure_ascii=False,
+    )
+
+
+def render_oncall_webhook_event(event: OnCallWebhookEvent) -> str:
+    return "\n".join(
+        [
+            "OnCall webhook event:",
+            f"- event_id: {event.event_id}",
+            f"- ticket_id: {event.ticket_id or '-'}",
+            f"- status: {event.status}",
+            f"- accepted: {event.accepted}",
+            f"- duplicate: {event.duplicate}",
+            f"- signature_valid: {event.signature_valid}",
+            f"- replay: {event.replay}",
+            f"- dead_letter: {event.dead_letter}",
+            f"- received_at: {event.received_at}",
+            f"- reason: {event.reason or '-'}",
+        ]
+    )
+
+
 def render_oncall_ticket_status(status: OnCallTicketStatus) -> str:
     return "\n".join(
         [
@@ -2255,6 +5513,32 @@ def _operations_trend_metric(name: str, current: int, previous: int) -> Operatio
         delta=delta,
         delta_percent=delta_percent,
     )
+
+
+def _closed_loop_dashboard_trends(
+    latest: OperationsClosedLoopSnapshot | None,
+    previous: OperationsClosedLoopSnapshot | None,
+) -> list[OperationsTrendMetric]:
+    if latest is None:
+        return []
+    latest_metrics = _closed_loop_report_metrics(latest.report)
+    previous_metrics = _closed_loop_report_metrics(previous.report) if previous is not None else {}
+    return [
+        _operations_trend_metric(name, latest_metrics.get(name, 0), previous_metrics.get(name, 0))
+        for name in sorted(latest_metrics)
+    ]
+
+
+def _closed_loop_report_metrics(report: OperationsClosedLoopReport) -> dict[str, int]:
+    return {
+        "action_items_closed": report.action_items_closed,
+        "action_items_open": report.action_items_open,
+        "action_items_overdue": report.action_items_overdue,
+        "action_items_total": report.action_items_total,
+        "closure_rate": int(round(report.closure_rate)),
+        "knowledge_entries": report.knowledge_entries,
+        "trend_alerts": report.trend_alerts,
+    }
 
 
 def _operations_trend_anomalies(metrics: list[OperationsTrendMetric]) -> list[str]:
@@ -2633,6 +5917,49 @@ def _timestamp_sort_key(value: str) -> float:
         return 0.0
 
 
+def _parse_iso_datetime(value: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return datetime.fromtimestamp(0, timezone.utc)
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _operations_schedule_cadence_seconds(cadence: str) -> int:
+    normalized = cadence.strip().lower().replace("-", "_")
+    fixed = {
+        "manual": 3600,
+        "once": 3600,
+        "hourly": 3600,
+        "daily": 86400,
+        "weekly": 604800,
+        "every_5_minutes": 300,
+        "every_15_minutes": 900,
+        "every_30_minutes": 1800,
+    }
+    if normalized in fixed:
+        return fixed[normalized]
+    if normalized.startswith("every_"):
+        parts = normalized.removeprefix("every_").split("_", 1)
+        if len(parts) == 2:
+            try:
+                amount = max(1, int(parts[0]))
+            except ValueError:
+                return 3600
+            unit = parts[1].rstrip("s")
+            if unit == "second":
+                return amount
+            if unit == "minute":
+                return amount * 60
+            if unit == "hour":
+                return amount * 3600
+            if unit == "day":
+                return amount * 86400
+    return 3600
+
+
 def _append_count_section(lines: list[str], title: str, counts: dict[str, int]) -> None:
     lines.append(f"- {title}:")
     if not counts:
@@ -2649,6 +5976,32 @@ def _append_list_section(lines: list[str], title: str, items: list[str]) -> None
         return
     for item in items:
         lines.append(f"  - {item}")
+
+
+def _html_page(title: str, body: list[str]) -> str:
+    return "\n".join(
+        [
+            "<!doctype html>",
+            "<html lang=\"en\">",
+            "<head>",
+            "<meta charset=\"utf-8\">",
+            "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">",
+            f"<title>{escape(title)}</title>",
+            "<style>",
+            "body{font-family:Arial,sans-serif;margin:0;background:#f7f8fa;color:#1f2933}",
+            "main{max-width:1120px;margin:0 auto;padding:24px}",
+            "section{background:#fff;border:1px solid #d9dee7;border-radius:6px;margin:16px 0;padding:16px}",
+            "h1{font-size:28px;margin:0 0 8px}h2{font-size:18px;margin:0 0 12px}",
+            "table{border-collapse:collapse;width:100%;font-size:14px}th,td{border-bottom:1px solid #e5e8ef;padding:8px;text-align:left}",
+            "dl{display:grid;grid-template-columns:160px 1fr;gap:8px;margin:0}dt{font-weight:bold}",
+            "</style>",
+            "</head>",
+            "<body>",
+            *body,
+            "</body>",
+            "</html>",
+        ]
+    )
 
 
 def _sorted_count_items(counts: dict[str, int]) -> list[tuple[str, int]]:
@@ -2744,6 +6097,42 @@ def _matching_oncall_status(
     return None
 
 
+def _recovery_compensation_targets(context: TravelContext, normalized_state: str) -> list[str]:
+    targets: list[str] = []
+    if context.transport_order is not None:
+        targets.append("transport_order")
+    if context.order is not None:
+        targets.append("hotel_order")
+    if context.inventory_lock is not None:
+        targets.append("hotel_inventory")
+    if context.approval is not None and _normalize_status_value(context.approval.status) not in {
+        "REJECTED",
+        "DENIED",
+        "REFUSED",
+        "CANCELLED",
+        "CANCELED",
+    }:
+        targets.append("approval")
+    if normalized_state == "ORDER_FAILED" and not targets:
+        targets.append("order_failure_state")
+    return targets
+
+
+def _failed_recovery_compensations(context: TravelContext) -> list[str]:
+    failed: list[str] = []
+    for name, result in (
+        ("transport_order_cancellation", context.transport_order_cancellation),
+        ("order_cancellation", context.order_cancellation),
+        ("inventory_release", context.inventory_release),
+        ("approval_cancellation", context.approval_cancellation),
+    ):
+        if result is None:
+            continue
+        if _normalize_status_value(result.status) in {"FAILED", "ERROR", "REJECTED", "TIMEOUT"}:
+            failed.append(name)
+    return failed
+
+
 def _trend_alert_reason(
     metric: OperationsTrendMetric,
     rule: OperationsTrendAlertRule,
@@ -2803,6 +6192,90 @@ def _stable_id(prefix: str, *parts: str) -> str:
     return f"{prefix}-{digest}"
 
 
+def _deep_merge_dict(base: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(base)
+    for key, value in patch.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge_dict(dict(merged[key]), value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _recovery_strategy_execution_count(context: TravelContext) -> int:
+    count = 0
+    for record in context.recovery_records:
+        execution = record.payload.get("strategy_execution") if isinstance(record.payload, dict) else None
+        if isinstance(execution, dict) and not execution.get("idempotent"):
+            count += 1
+    return count
+
+
+def _default_oncall_webhook_patch_templates(
+    dead_letters: list[OnCallWebhookEvent],
+) -> list[OnCallWebhookPatchTemplate]:
+    templates: list[OnCallWebhookPatchTemplate] = []
+    reasons = " ".join(event.reason.lower() for event in dead_letters)
+    if "ticket_id" in reasons or "requires" in reasons:
+        templates.append(
+            OnCallWebhookPatchTemplate(
+                template_id="missing_ticket_status",
+                title="补齐 ticket_status",
+                match_reason="payload missing ticket id or normalized ticket status",
+                patch={
+                    "ticket_status": {
+                        "ticket_id": "<ticket-id>",
+                        "status": "CLOSED",
+                        "assignee": "ops",
+                        "updated_at": "<iso-time>",
+                        "detail": "patched before replay",
+                    }
+                },
+            )
+        )
+    if "signature" in reasons:
+        templates.append(
+            OnCallWebhookPatchTemplate(
+                template_id="signature_failed_replay",
+                title="保留原 payload 并补充 replay 说明",
+                match_reason="signature validation failed",
+                patch={"replay_note": "signature checked manually before replay"},
+            )
+        )
+    if not templates and dead_letters:
+        templates.append(
+            OnCallWebhookPatchTemplate(
+                template_id="generic_webhook_patch",
+                title="通用 webhook payload 修正",
+                match_reason="dead-letter payload requires operator correction",
+                patch={"ticket_status": {"ticket_id": "<ticket-id>", "status": "<status>", "updated_at": "<iso-time>"}},
+            )
+        )
+    return templates
+
+
+def _webhook_failure_reason_key(reason: str) -> str:
+    normalized = reason.strip().lower()
+    if not normalized:
+        return "unknown"
+    if "signature" in normalized:
+        return "signature_validation_failed"
+    if "ticket_id" in normalized or "requires" in normalized:
+        return "missing_ticket_id"
+    if "replay failed" in normalized:
+        return "replay_failed"
+    return normalized[:80]
+
+
+def _openapi_query_param(name: str, value_type: str = "string") -> dict[str, Any]:
+    return {
+        "name": name,
+        "in": "query",
+        "required": False,
+        "schema": {"type": value_type},
+    }
+
+
 def _dedupe_knowledge_entries(entries: list[OperationsKnowledgeEntry]) -> list[OperationsKnowledgeEntry]:
     seen: set[str] = set()
     result: list[OperationsKnowledgeEntry] = []
@@ -2833,6 +6306,8 @@ def _profile_name(settings: IntegrationSettings) -> str:
             settings.alert_api_url,
             settings.oncall_api_url,
             settings.closed_loop_api_url,
+            settings.closed_loop_schema_registry_url,
+            settings.recovery_governance_policy_api_url,
             settings.session_store_api_url,
             settings.session_db_path,
         ]
@@ -2848,6 +6323,79 @@ def _normalize_alert(alert: dict[str, Any]) -> dict[str, Any]:
         "message": str(alert.get("message") or ""),
         "value": int(alert.get("value") or 0),
     }
+
+
+def _extract_oncall_webhook_ticket(payload: dict[str, Any]) -> dict[str, Any]:
+    candidates: list[dict[str, Any]] = [payload]
+    for key in ("ticket", "data", "incident", "issue", "alert"):
+        value = payload.get(key)
+        if isinstance(value, dict):
+            candidates.append(value)
+    event = payload.get("event")
+    if isinstance(event, dict):
+        candidates.append(event)
+        for key in ("ticket", "data", "incident", "issue", "alert"):
+            value = event.get(key)
+            if isinstance(value, dict):
+                candidates.append(value)
+    for candidate in candidates:
+        if _first_text(candidate, names=("ticket_id", "id", "incident_id", "issue_id", "key", "number")):
+            return candidate
+    return payload
+
+
+def _oncall_webhook_event_id(payload: dict[str, Any], status: OnCallTicketStatus) -> str:
+    data = _extract_oncall_webhook_ticket(payload)
+    event_id = _first_text(
+        payload,
+        data,
+        names=("event_id", "webhook_id", "delivery_id", "deliveryId", "request_id", "uuid"),
+    )
+    if event_id:
+        return event_id
+    return _stable_id("WHK", status.ticket_id, status.status, status.updated_at, status.detail)
+
+
+def _oncall_webhook_is_replay(updated_at: str, received_at: str, replay_window_minutes: int) -> bool:
+    if replay_window_minutes < 0:
+        return False
+    updated_ts = _timestamp_sort_key(updated_at)
+    received_ts = _timestamp_sort_key(received_at)
+    if updated_ts <= 0.0 or received_ts <= 0.0:
+        return False
+    return (received_ts - updated_ts) > replay_window_minutes * 60
+
+
+def _first_text(*payloads: dict[str, Any], names: tuple[str, ...]) -> str | None:
+    for payload in payloads:
+        for name in names:
+            value = payload.get(name)
+            if value is None:
+                continue
+            if isinstance(value, dict):
+                text = _assignee_text(value)
+            else:
+                text = str(value).strip()
+            if text:
+                return text
+    return None
+
+
+def _assignee_text(value: object) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        for key in ("name", "username", "user", "id", "email"):
+            text = str(value.get(key) or "").strip()
+            if text:
+                return text
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _normalize_status_value(status: object) -> str:
+    return str(status or "").strip().upper()
 
 
 def _metric_label(value: object) -> str:

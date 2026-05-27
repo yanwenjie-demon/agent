@@ -7,6 +7,7 @@ from uuid import uuid4
 
 from .agent import TravelAgent
 from .models import TravelContext, WorkerRunRecord
+from .release_control import RolloutPolicy, evaluate_rollout
 from .state import TravelState
 
 
@@ -15,6 +16,14 @@ AUTO_ADVANCE_STATES = {
     TravelState.APPROVAL_APPROVED.value,
     TravelState.COMPLETED.value,
     TravelState.ORDER_CREATED.value,
+}
+
+
+RECOVERY_STATES = {
+    TravelState.APPROVAL_REJECTED.value,
+    TravelState.PRICE_CHANGED.value,
+    TravelState.INVENTORY_EXPIRED.value,
+    TravelState.ORDER_FAILED.value,
 }
 
 
@@ -41,8 +50,21 @@ class WorkflowLoopResult:
 
 
 class WorkflowWorker:
-    def __init__(self, agent: TravelAgent) -> None:
+    def __init__(
+        self,
+        agent: TravelAgent,
+        auto_recover: bool = False,
+        recovery_approval_override: bool = False,
+        recovery_reason: str = "worker_auto_recovery",
+        recovery_rollout_policy: RolloutPolicy | None = None,
+        recovery_approved_by: str = "workflow-worker",
+    ) -> None:
         self.agent = agent
+        self.auto_recover = auto_recover
+        self.recovery_approval_override = recovery_approval_override
+        self.recovery_reason = recovery_reason
+        self.recovery_rollout_policy = recovery_rollout_policy
+        self.recovery_approved_by = recovery_approved_by
 
     def run_once(self, limit: int = 50) -> WorkflowRunResult:
         run_id = "WRK-" + uuid4().hex[:12].upper()
@@ -137,6 +159,25 @@ class WorkflowWorker:
         if context.state in {TravelState.ORDER_CREATED.value, TravelState.COMPLETED.value} and context.order is not None:
             return self.agent.refresh_order_status(context)
 
+        if self.auto_recover and context.state in RECOVERY_STATES:
+            rollout = self._evaluate_recovery_rollout(context)
+            if rollout is not None and not rollout.enabled:
+                context.append_event(
+                    f"Worker recovery rollout skipped: {rollout.status}; {'; '.join(rollout.reasons)}."
+                )
+                self.agent.session_store.save(context)
+                return context
+            if self._recovery_blocked_without_override(context):
+                return context
+            return self.agent.execute_recovery_strategy(
+                context,
+                reason=self.recovery_reason,
+                enforce_strategy_gate=True,
+                approval_override=self.recovery_approval_override,
+                approved_by=self.recovery_approved_by,
+                approval_reason=self.recovery_reason,
+            )
+
         context.append_event(f"Worker skipped state: {context.state}.")
         self.agent.session_store.save(context)
         return context
@@ -157,7 +198,10 @@ class WorkflowWorker:
         return context
 
     def _contexts_to_process(self, limit: int) -> list[TravelContext]:
-        contexts = self.agent.session_store.list_by_states(AUTO_ADVANCE_STATES, limit)
+        states = set(AUTO_ADVANCE_STATES)
+        if self.auto_recover:
+            states.update(RECOVERY_STATES)
+        contexts = self.agent.session_store.list_by_states(states, limit)
         seen = {context.session_id for context in contexts}
         if len(contexts) >= limit:
             return contexts
@@ -188,6 +232,28 @@ class WorkflowWorker:
         return any(
             record.status == "FAILED" and record.retry_count < record.max_retries
             for record in context.calendar_syncs
+        )
+
+    def _recovery_blocked_without_override(self, context: TravelContext) -> bool:
+        if self.recovery_approval_override:
+            return False
+        for record in reversed(context.recovery_records):
+            if record.to_state != context.state:
+                continue
+            execution = record.payload.get("strategy_execution")
+            if not isinstance(execution, dict):
+                continue
+            return execution.get("status") == "BLOCKED"
+        return False
+
+    def _evaluate_recovery_rollout(self, context: TravelContext):
+        if self.recovery_rollout_policy is None:
+            return None
+        return evaluate_rollout(
+            self.recovery_rollout_policy,
+            user_id=context.request.user_id,
+            department=context.request.department,
+            scenario="worker_auto_recovery",
         )
 
 

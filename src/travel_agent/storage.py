@@ -4,7 +4,7 @@ import json
 import sqlite3
 from contextlib import closing
 from dataclasses import asdict, dataclass
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol
 from urllib.error import HTTPError, URLError
@@ -39,7 +39,7 @@ from .models import (
 )
 
 
-SQLITE_SCHEMA_VERSION = 4
+SQLITE_SCHEMA_VERSION = 9
 
 
 class StoreConcurrencyError(RuntimeError):
@@ -95,10 +95,28 @@ class SessionStore(Protocol):
     def list_operations_dashboard_snapshots(self, limit: int = 20) -> list[dict[str, Any]]:
         ...
 
+    def record_operations_closed_loop_snapshot(self, snapshot: dict[str, Any]) -> None:
+        ...
+
+    def list_operations_closed_loop_snapshots(self, limit: int = 20) -> list[dict[str, Any]]:
+        ...
+
     def record_oncall_ticket_status(self, status: dict[str, Any]) -> None:
         ...
 
     def list_oncall_ticket_statuses(self, limit: int = 20) -> list[dict[str, Any]]:
+        ...
+
+    def record_oncall_webhook_event(self, event: dict[str, Any]) -> None:
+        ...
+
+    def list_oncall_webhook_events(self, limit: int = 20) -> list[dict[str, Any]]:
+        ...
+
+    def record_oncall_webhook_replay_job(self, job: dict[str, Any]) -> None:
+        ...
+
+    def list_oncall_webhook_replay_jobs(self, limit: int = 20) -> list[dict[str, Any]]:
         ...
 
     def record_operations_action_item(self, item: dict[str, Any]) -> None:
@@ -119,16 +137,45 @@ class SessionStore(Protocol):
     def list_operations_trend_alerts(self, limit: int = 20) -> list[dict[str, Any]]:
         ...
 
+    def record_operations_scheduled_task(self, task: dict[str, Any]) -> None:
+        ...
+
+    def list_operations_scheduled_tasks(self, limit: int = 20) -> list[dict[str, Any]]:
+        ...
+
+    def claim_due_operations_scheduled_tasks(
+        self,
+        owner: str,
+        now: str,
+        lease_seconds: int = 300,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        ...
+
+    def complete_operations_scheduled_task(self, task: dict[str, Any]) -> None:
+        ...
+
+    def record_operations_scheduler_run(self, run: dict[str, Any]) -> None:
+        ...
+
+    def list_operations_scheduler_runs(self, limit: int = 20) -> list[dict[str, Any]]:
+        ...
+
 
 class InMemorySessionStore:
     def __init__(self) -> None:
         self._sessions: dict[str, TravelContext] = {}
         self._worker_runs: list[WorkerRunRecord] = []
         self._dashboard_snapshots: list[dict[str, Any]] = []
+        self._closed_loop_snapshots: list[dict[str, Any]] = []
         self._oncall_statuses: list[dict[str, Any]] = []
+        self._oncall_webhook_events: list[dict[str, Any]] = []
+        self._oncall_webhook_replay_jobs: list[dict[str, Any]] = []
         self._operations_trend_alerts: list[dict[str, Any]] = []
         self._operations_action_items: list[dict[str, Any]] = []
         self._operations_knowledge_entries: list[dict[str, Any]] = []
+        self._operations_scheduled_tasks: list[dict[str, Any]] = []
+        self._operations_scheduler_runs: list[dict[str, Any]] = []
 
     def save(self, context: TravelContext) -> None:
         self._sessions[context.session_id] = context
@@ -171,11 +218,44 @@ class InMemorySessionStore:
     def list_operations_dashboard_snapshots(self, limit: int = 20) -> list[dict[str, Any]]:
         return list(reversed(self._dashboard_snapshots[-limit:]))
 
+    def record_operations_closed_loop_snapshot(self, snapshot: dict[str, Any]) -> None:
+        self._closed_loop_snapshots = [
+            existing
+            for existing in self._closed_loop_snapshots
+            if existing.get("snapshot_id") != snapshot.get("snapshot_id")
+        ]
+        self._closed_loop_snapshots.append(dict(snapshot))
+
+    def list_operations_closed_loop_snapshots(self, limit: int = 20) -> list[dict[str, Any]]:
+        return list(reversed(self._closed_loop_snapshots[-limit:]))
+
     def record_oncall_ticket_status(self, status: dict[str, Any]) -> None:
         self._oncall_statuses.append(dict(status))
 
     def list_oncall_ticket_statuses(self, limit: int = 20) -> list[dict[str, Any]]:
         return list(reversed(self._oncall_statuses[-limit:]))
+
+    def record_oncall_webhook_event(self, event: dict[str, Any]) -> None:
+        self._oncall_webhook_events = [
+            existing
+            for existing in self._oncall_webhook_events
+            if existing.get("event_id") != event.get("event_id")
+        ]
+        self._oncall_webhook_events.append(dict(event))
+
+    def list_oncall_webhook_events(self, limit: int = 20) -> list[dict[str, Any]]:
+        return list(reversed(self._oncall_webhook_events[-limit:]))
+
+    def record_oncall_webhook_replay_job(self, job: dict[str, Any]) -> None:
+        self._oncall_webhook_replay_jobs = [
+            existing
+            for existing in self._oncall_webhook_replay_jobs
+            if existing.get("job_id") != job.get("job_id")
+        ]
+        self._oncall_webhook_replay_jobs.append(dict(job))
+
+    def list_oncall_webhook_replay_jobs(self, limit: int = 20) -> list[dict[str, Any]]:
+        return list(reversed(self._oncall_webhook_replay_jobs[-limit:]))
 
     def record_operations_trend_alert(self, alert: dict[str, Any]) -> None:
         self._operations_trend_alerts = [
@@ -205,6 +285,60 @@ class InMemorySessionStore:
 
     def list_operations_knowledge_entries(self, limit: int = 20) -> list[dict[str, Any]]:
         return list(reversed(self._operations_knowledge_entries[-limit:]))
+
+    def record_operations_scheduled_task(self, task: dict[str, Any]) -> None:
+        self._operations_scheduled_tasks = [
+            existing
+            for existing in self._operations_scheduled_tasks
+            if existing.get("task_id") != task.get("task_id")
+        ]
+        self._operations_scheduled_tasks.append(dict(task))
+
+    def list_operations_scheduled_tasks(self, limit: int = 20) -> list[dict[str, Any]]:
+        ordered = sorted(
+            self._operations_scheduled_tasks,
+            key=lambda item: (_timestamp_sort_key(str(item.get("next_run_at") or "")), str(item.get("task_id") or "")),
+        )
+        return [dict(item) for item in ordered[:limit]]
+
+    def claim_due_operations_scheduled_tasks(
+        self,
+        owner: str,
+        now: str,
+        lease_seconds: int = 300,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        lease_expires_at = _add_seconds(now, lease_seconds)
+        claimed: list[dict[str, Any]] = []
+        for task in self.list_operations_scheduled_tasks(limit=len(self._operations_scheduled_tasks)):
+            if len(claimed) >= limit:
+                break
+            if not bool(task.get("enabled", True)):
+                continue
+            if _timestamp_sort_key(str(task.get("next_run_at") or "")) > _timestamp_sort_key(now):
+                continue
+            lease_owner = str(task.get("lease_owner") or "")
+            lease_expires = str(task.get("lease_expires_at") or "")
+            if lease_owner and _timestamp_sort_key(lease_expires) > _timestamp_sort_key(now):
+                continue
+            claimed_task = {**task, "lease_owner": owner, "lease_expires_at": lease_expires_at}
+            self.record_operations_scheduled_task(claimed_task)
+            claimed.append(dict(claimed_task))
+        return claimed
+
+    def complete_operations_scheduled_task(self, task: dict[str, Any]) -> None:
+        self.record_operations_scheduled_task(task)
+
+    def record_operations_scheduler_run(self, run: dict[str, Any]) -> None:
+        self._operations_scheduler_runs = [
+            existing
+            for existing in self._operations_scheduler_runs
+            if existing.get("run_id") != run.get("run_id")
+        ]
+        self._operations_scheduler_runs.append(dict(run))
+
+    def list_operations_scheduler_runs(self, limit: int = 20) -> list[dict[str, Any]]:
+        return list(reversed(self._operations_scheduler_runs[-limit:]))
 
 
 class SQLiteSessionStore:
@@ -448,6 +582,38 @@ class SQLiteSessionStore:
             ).fetchall()
         return [json.loads(row[0]) for row in rows]
 
+    def record_operations_closed_loop_snapshot(self, snapshot: dict[str, Any]) -> None:
+        snapshot_id = str(snapshot.get("snapshot_id") or "")
+        created_at = str(snapshot.get("created_at") or "")
+        if not snapshot_id:
+            raise ValueError("Operations closed-loop snapshot requires snapshot_id.")
+        payload = json.dumps(snapshot, ensure_ascii=False, default=_json_default)
+        with closing(self._connect()) as connection:
+            connection.execute(
+                """
+                INSERT INTO operations_closed_loop_snapshots(snapshot_id, created_at, payload)
+                VALUES (?, ?, ?)
+                ON CONFLICT(snapshot_id) DO UPDATE SET
+                    created_at = excluded.created_at,
+                    payload = excluded.payload
+                """,
+                (snapshot_id, created_at, payload),
+            )
+            connection.commit()
+
+    def list_operations_closed_loop_snapshots(self, limit: int = 20) -> list[dict[str, Any]]:
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                """
+                SELECT payload
+                FROM operations_closed_loop_snapshots
+                ORDER BY created_at DESC, rowid DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [json.loads(row[0]) for row in rows]
+
     def record_oncall_ticket_status(self, status: dict[str, Any]) -> None:
         ticket_id = str(status.get("ticket_id") or "")
         updated_at = str(status.get("updated_at") or "")
@@ -475,6 +641,88 @@ class SQLiteSessionStore:
                 SELECT payload
                 FROM oncall_ticket_statuses
                 ORDER BY updated_at DESC, rowid DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [json.loads(row[0]) for row in rows]
+
+    def record_oncall_webhook_event(self, event: dict[str, Any]) -> None:
+        event_id = str(event.get("event_id") or "")
+        received_at = str(event.get("received_at") or "")
+        if not event_id:
+            raise ValueError("OnCall webhook event requires event_id.")
+        payload = json.dumps(event, ensure_ascii=False, default=_json_default)
+        with closing(self._connect()) as connection:
+            connection.execute(
+                """
+                INSERT INTO oncall_webhook_events(event_id, ticket_id, status, received_at, accepted, payload)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(event_id) DO UPDATE SET
+                    ticket_id = excluded.ticket_id,
+                    status = excluded.status,
+                    received_at = excluded.received_at,
+                    accepted = excluded.accepted,
+                    payload = excluded.payload
+                """,
+                (
+                    event_id,
+                    str(event.get("ticket_id") or ""),
+                    str(event.get("status") or "UNKNOWN"),
+                    received_at,
+                    1 if bool(event.get("accepted")) else 0,
+                    payload,
+                ),
+            )
+            connection.commit()
+
+    def list_oncall_webhook_events(self, limit: int = 20) -> list[dict[str, Any]]:
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                """
+                SELECT payload
+                FROM oncall_webhook_events
+                ORDER BY received_at DESC, rowid DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [json.loads(row[0]) for row in rows]
+
+    def record_oncall_webhook_replay_job(self, job: dict[str, Any]) -> None:
+        job_id = str(job.get("job_id") or "")
+        created_at = str(job.get("created_at") or "")
+        if not job_id:
+            raise ValueError("OnCall webhook replay job requires job_id.")
+        payload = json.dumps(job, ensure_ascii=False, default=_json_default)
+        with closing(self._connect()) as connection:
+            connection.execute(
+                """
+                INSERT INTO oncall_webhook_replay_jobs(job_id, created_at, status, requested_by, payload)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(job_id) DO UPDATE SET
+                    created_at = excluded.created_at,
+                    status = excluded.status,
+                    requested_by = excluded.requested_by,
+                    payload = excluded.payload
+                """,
+                (
+                    job_id,
+                    created_at,
+                    str(job.get("status") or "UNKNOWN"),
+                    str(job.get("requested_by") or "operator"),
+                    payload,
+                ),
+            )
+            connection.commit()
+
+    def list_oncall_webhook_replay_jobs(self, limit: int = 20) -> list[dict[str, Any]]:
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                """
+                SELECT payload
+                FROM oncall_webhook_replay_jobs
+                ORDER BY created_at DESC, rowid DESC
                 LIMIT ?
                 """,
                 (limit,),
@@ -597,6 +845,151 @@ class SQLiteSessionStore:
             ).fetchall()
         return [json.loads(row[0]) for row in rows]
 
+    def record_operations_scheduled_task(self, task: dict[str, Any]) -> None:
+        task_id = str(task.get("task_id") or "")
+        if not task_id:
+            raise ValueError("Operations scheduled task requires task_id.")
+        payload = json.dumps(task, ensure_ascii=False, default=_json_default)
+        with closing(self._connect()) as connection:
+            connection.execute(
+                """
+                INSERT INTO operations_scheduled_tasks(
+                    task_id,
+                    task_type,
+                    cadence,
+                    next_run_at,
+                    enabled,
+                    lease_owner,
+                    lease_expires_at,
+                    payload,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(task_id) DO UPDATE SET
+                    task_type = excluded.task_type,
+                    cadence = excluded.cadence,
+                    next_run_at = excluded.next_run_at,
+                    enabled = excluded.enabled,
+                    lease_owner = excluded.lease_owner,
+                    lease_expires_at = excluded.lease_expires_at,
+                    payload = excluded.payload,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (
+                    task_id,
+                    str(task.get("task_type") or ""),
+                    str(task.get("cadence") or "manual"),
+                    str(task.get("next_run_at") or ""),
+                    1 if bool(task.get("enabled", True)) else 0,
+                    str(task["lease_owner"]) if task.get("lease_owner") is not None else None,
+                    str(task["lease_expires_at"]) if task.get("lease_expires_at") is not None else None,
+                    payload,
+                ),
+            )
+            connection.commit()
+
+    def list_operations_scheduled_tasks(self, limit: int = 20) -> list[dict[str, Any]]:
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                """
+                SELECT payload
+                FROM operations_scheduled_tasks
+                ORDER BY next_run_at ASC, task_id ASC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [json.loads(row[0]) for row in rows]
+
+    def claim_due_operations_scheduled_tasks(
+        self,
+        owner: str,
+        now: str,
+        lease_seconds: int = 300,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        lease_expires_at = _add_seconds(now, lease_seconds)
+        claimed: list[dict[str, Any]] = []
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                """
+                SELECT task_id, payload
+                FROM operations_scheduled_tasks
+                WHERE enabled = 1
+                  AND next_run_at <= ?
+                  AND (
+                    lease_owner IS NULL
+                    OR lease_owner = ''
+                    OR lease_expires_at IS NULL
+                    OR lease_expires_at <= ?
+                  )
+                ORDER BY next_run_at ASC, task_id ASC
+                LIMIT ?
+                """,
+                (now, now, limit),
+            ).fetchall()
+            for row in rows:
+                task = json.loads(row[1])
+                claimed_task = {**task, "lease_owner": owner, "lease_expires_at": lease_expires_at}
+                payload = json.dumps(claimed_task, ensure_ascii=False, default=_json_default)
+                connection.execute(
+                    """
+                    UPDATE operations_scheduled_tasks
+                    SET lease_owner = ?,
+                        lease_expires_at = ?,
+                        payload = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE task_id = ?
+                    """,
+                    (owner, lease_expires_at, payload, row[0]),
+                )
+                claimed.append(claimed_task)
+            connection.commit()
+        return claimed
+
+    def complete_operations_scheduled_task(self, task: dict[str, Any]) -> None:
+        self.record_operations_scheduled_task(task)
+
+    def record_operations_scheduler_run(self, run: dict[str, Any]) -> None:
+        run_id = str(run.get("run_id") or "")
+        if not run_id:
+            raise ValueError("Operations scheduler run requires run_id.")
+        payload = json.dumps(run, ensure_ascii=False, default=_json_default)
+        with closing(self._connect()) as connection:
+            connection.execute(
+                """
+                INSERT INTO operations_scheduler_runs(run_id, started_at, finished_at, failed_count, payload)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(run_id) DO UPDATE SET
+                    started_at = excluded.started_at,
+                    finished_at = excluded.finished_at,
+                    failed_count = excluded.failed_count,
+                    payload = excluded.payload
+                """,
+                (
+                    run_id,
+                    str(run.get("started_at") or ""),
+                    str(run.get("finished_at") or ""),
+                    int(run.get("failed_count") or 0),
+                    payload,
+                ),
+            )
+            connection.commit()
+
+    def list_operations_scheduler_runs(self, limit: int = 20) -> list[dict[str, Any]]:
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                """
+                SELECT payload
+                FROM operations_scheduler_runs
+                ORDER BY finished_at DESC, started_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [json.loads(row[0]) for row in rows]
+
     def health_check(self) -> StorageHealth:
         details: dict[str, str] = {}
         try:
@@ -607,8 +1000,17 @@ class SQLiteSessionStore:
                 dashboard_snapshot_count = int(
                     connection.execute("SELECT COUNT(*) FROM operations_dashboard_snapshots").fetchone()[0]
                 )
+                closed_loop_snapshot_count = int(
+                    connection.execute("SELECT COUNT(*) FROM operations_closed_loop_snapshots").fetchone()[0]
+                )
                 oncall_status_count = int(
                     connection.execute("SELECT COUNT(*) FROM oncall_ticket_statuses").fetchone()[0]
+                )
+                oncall_webhook_count = int(
+                    connection.execute("SELECT COUNT(*) FROM oncall_webhook_events").fetchone()[0]
+                )
+                oncall_webhook_replay_job_count = int(
+                    connection.execute("SELECT COUNT(*) FROM oncall_webhook_replay_jobs").fetchone()[0]
                 )
                 trend_alert_count = int(
                     connection.execute("SELECT COUNT(*) FROM operations_trend_alerts").fetchone()[0]
@@ -619,15 +1021,26 @@ class SQLiteSessionStore:
                 knowledge_entry_count = int(
                     connection.execute("SELECT COUNT(*) FROM operations_knowledge_entries").fetchone()[0]
                 )
+                scheduled_task_count = int(
+                    connection.execute("SELECT COUNT(*) FROM operations_scheduled_tasks").fetchone()[0]
+                )
+                scheduler_run_count = int(
+                    connection.execute("SELECT COUNT(*) FROM operations_scheduler_runs").fetchone()[0]
+                )
                 integrity = str(connection.execute("PRAGMA integrity_check").fetchone()[0])
                 journal_mode = str(connection.execute("PRAGMA journal_mode").fetchone()[0])
             details["integrity_check"] = integrity
             details["journal_mode"] = journal_mode
             details["dashboard_snapshots"] = str(dashboard_snapshot_count)
+            details["closed_loop_snapshots"] = str(closed_loop_snapshot_count)
             details["oncall_ticket_statuses"] = str(oncall_status_count)
+            details["oncall_webhook_events"] = str(oncall_webhook_count)
+            details["oncall_webhook_replay_jobs"] = str(oncall_webhook_replay_job_count)
             details["operations_trend_alerts"] = str(trend_alert_count)
             details["operations_action_items"] = str(action_item_count)
             details["operations_knowledge_entries"] = str(knowledge_entry_count)
+            details["operations_scheduled_tasks"] = str(scheduled_task_count)
+            details["operations_scheduler_runs"] = str(scheduler_run_count)
             return StorageHealth(
                 backend="sqlite",
                 ok=integrity.lower() == "ok" and schema_version >= SQLITE_SCHEMA_VERSION,
@@ -709,10 +1122,42 @@ class SQLiteSessionStore:
             )
             connection.execute(
                 """
+                CREATE TABLE IF NOT EXISTS operations_closed_loop_snapshots (
+                    snapshot_id TEXT PRIMARY KEY,
+                    created_at TEXT NOT NULL,
+                    payload TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
                 CREATE TABLE IF NOT EXISTS oncall_ticket_statuses (
                     ticket_id TEXT PRIMARY KEY,
                     status TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
+                    payload TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS oncall_webhook_events (
+                    event_id TEXT PRIMARY KEY,
+                    ticket_id TEXT,
+                    status TEXT NOT NULL,
+                    received_at TEXT NOT NULL,
+                    accepted INTEGER NOT NULL,
+                    payload TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS oncall_webhook_replay_jobs (
+                    job_id TEXT PRIMARY KEY,
+                    created_at TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    requested_by TEXT NOT NULL,
                     payload TEXT NOT NULL
                 )
                 """
@@ -751,6 +1196,32 @@ class SQLiteSessionStore:
                 """
             )
             connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS operations_scheduled_tasks (
+                    task_id TEXT PRIMARY KEY,
+                    task_type TEXT NOT NULL,
+                    cadence TEXT NOT NULL,
+                    next_run_at TEXT NOT NULL,
+                    enabled INTEGER NOT NULL,
+                    lease_owner TEXT,
+                    lease_expires_at TEXT,
+                    payload TEXT NOT NULL,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS operations_scheduler_runs (
+                    run_id TEXT PRIMARY KEY,
+                    started_at TEXT NOT NULL,
+                    finished_at TEXT NOT NULL,
+                    failed_count INTEGER NOT NULL,
+                    payload TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_travel_sessions_state_updated ON travel_sessions(state, updated_at)"
             )
             connection.execute(
@@ -763,7 +1234,16 @@ class SQLiteSessionStore:
                 "CREATE INDEX IF NOT EXISTS idx_dashboard_snapshots_created ON operations_dashboard_snapshots(created_at)"
             )
             connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_closed_loop_snapshots_created ON operations_closed_loop_snapshots(created_at)"
+            )
+            connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_oncall_ticket_statuses_updated ON oncall_ticket_statuses(updated_at)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_oncall_webhook_events_received ON oncall_webhook_events(received_at)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_oncall_webhook_replay_jobs_created ON oncall_webhook_replay_jobs(created_at)"
             )
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_operations_trend_alerts_created ON operations_trend_alerts(created_at)"
@@ -773,6 +1253,12 @@ class SQLiteSessionStore:
             )
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_operations_knowledge_entries_updated ON operations_knowledge_entries(updated_at)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_operations_scheduled_tasks_due ON operations_scheduled_tasks(enabled, next_run_at, lease_expires_at)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_operations_scheduler_runs_finished ON operations_scheduler_runs(finished_at, started_at)"
             )
             connection.execute(
                 """
@@ -942,12 +1428,36 @@ class HttpSessionStore:
         records = response.get("snapshots") or response.get("records") or response.get("items") or []
         return [dict(item) for item in records]
 
+    def record_operations_closed_loop_snapshot(self, snapshot: dict[str, Any]) -> None:
+        self._post("/operations/closed-loop-snapshots/record", {"snapshot": snapshot})
+
+    def list_operations_closed_loop_snapshots(self, limit: int = 20) -> list[dict[str, Any]]:
+        response = self._post("/operations/closed-loop-snapshots/list", {"limit": limit})
+        records = response.get("snapshots") or response.get("records") or response.get("items") or []
+        return [dict(item) for item in records]
+
     def record_oncall_ticket_status(self, status: dict[str, Any]) -> None:
         self._post("/operations/oncall-statuses/record", {"status": status})
 
     def list_oncall_ticket_statuses(self, limit: int = 20) -> list[dict[str, Any]]:
         response = self._post("/operations/oncall-statuses/list", {"limit": limit})
         records = response.get("statuses") or response.get("records") or response.get("items") or []
+        return [dict(item) for item in records]
+
+    def record_oncall_webhook_event(self, event: dict[str, Any]) -> None:
+        self._post("/operations/oncall-webhooks/record", {"event": event})
+
+    def list_oncall_webhook_events(self, limit: int = 20) -> list[dict[str, Any]]:
+        response = self._post("/operations/oncall-webhooks/list", {"limit": limit})
+        records = response.get("events") or response.get("records") or response.get("items") or []
+        return [dict(item) for item in records]
+
+    def record_oncall_webhook_replay_job(self, job: dict[str, Any]) -> None:
+        self._post("/operations/oncall-webhook-replay-jobs/record", {"job": job})
+
+    def list_oncall_webhook_replay_jobs(self, limit: int = 20) -> list[dict[str, Any]]:
+        response = self._post("/operations/oncall-webhook-replay-jobs/list", {"limit": limit})
+        records = response.get("jobs") or response.get("records") or response.get("items") or []
         return [dict(item) for item in records]
 
     def record_operations_trend_alert(self, alert: dict[str, Any]) -> None:
@@ -972,6 +1482,44 @@ class HttpSessionStore:
     def list_operations_knowledge_entries(self, limit: int = 20) -> list[dict[str, Any]]:
         response = self._post("/operations/knowledge/list", {"limit": limit})
         records = response.get("entries") or response.get("records") or response.get("items") or []
+        return [dict(item) for item in records]
+
+    def record_operations_scheduled_task(self, task: dict[str, Any]) -> None:
+        self._post("/operations/scheduled-tasks/record", {"task": task})
+
+    def list_operations_scheduled_tasks(self, limit: int = 20) -> list[dict[str, Any]]:
+        response = self._post("/operations/scheduled-tasks/list", {"limit": limit})
+        records = response.get("tasks") or response.get("records") or response.get("items") or []
+        return [dict(item) for item in records]
+
+    def claim_due_operations_scheduled_tasks(
+        self,
+        owner: str,
+        now: str,
+        lease_seconds: int = 300,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        response = self._post(
+            "/operations/scheduled-tasks/claim-due",
+            {
+                "owner": owner,
+                "now": now,
+                "lease_seconds": lease_seconds,
+                "limit": limit,
+            },
+        )
+        records = response.get("tasks") or response.get("records") or response.get("items") or []
+        return [dict(item) for item in records]
+
+    def complete_operations_scheduled_task(self, task: dict[str, Any]) -> None:
+        self._post("/operations/scheduled-tasks/complete", {"task": task})
+
+    def record_operations_scheduler_run(self, run: dict[str, Any]) -> None:
+        self._post("/operations/scheduler-runs/record", {"run": run})
+
+    def list_operations_scheduler_runs(self, limit: int = 20) -> list[dict[str, Any]]:
+        response = self._post("/operations/scheduler-runs/list", {"limit": limit})
+        records = response.get("runs") or response.get("records") or response.get("items") or []
         return [dict(item) for item in records]
 
     def health_check(self) -> StorageHealth:
@@ -1090,6 +1638,21 @@ def _date(value: date | str) -> date:
     if isinstance(value, date):
         return value
     return date.fromisoformat(value)
+
+
+def _timestamp_sort_key(value: str) -> float:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.timestamp()
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _add_seconds(value: str, seconds: int) -> str:
+    timestamp = _timestamp_sort_key(value) or datetime.now(timezone.utc).timestamp()
+    return datetime.fromtimestamp(timestamp + max(1, int(seconds)), timezone.utc).isoformat()
 
 
 def _json_default(value: Any) -> str:
