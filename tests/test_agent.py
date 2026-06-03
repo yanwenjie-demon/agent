@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from datetime import date
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError
@@ -34,6 +35,7 @@ from travel_agent.cli import (
     render_prometheus_metrics,
     render_storage_health,
     render_worker_runs,
+    run_operations_console_action,
     run_metrics_server_in_thread,
 )
 from travel_agent.config import IntegrationSettings
@@ -66,6 +68,7 @@ from travel_agent.operations import (
     build_operations_closed_loop_snapshot,
     build_operations_console_overview,
     build_operations_console_view,
+    build_operations_audit_timeline,
     build_operations_closed_loop_dashboard,
     build_operations_dashboard_trend_report,
     build_operations_knowledge_entries,
@@ -79,6 +82,8 @@ from travel_agent.operations import (
     build_operations_closed_loop_openapi_spec,
     build_operations_scheduled_tasks,
     build_operations_scheduler_health_report,
+    build_operations_governance_policy_change,
+    build_operations_console_action_audit,
     build_recovery_strategy_metrics,
     build_oncall_webhook_replay_job,
     build_recovery_approval_sla_policy,
@@ -130,6 +135,10 @@ from travel_agent.operations import (
     operations_scheduled_task_to_dict,
     operations_scheduler_run_report_from_dict,
     operations_scheduler_run_report_to_dict,
+    operations_governance_policy_change_from_dict,
+    operations_governance_policy_change_to_dict,
+    operations_console_action_audit_from_dict,
+    operations_console_action_audit_to_dict,
     operations_trend_alert_from_dict,
     operations_trend_alert_to_dict,
     render_alert_route_rules,
@@ -191,6 +200,10 @@ from travel_agent.operations import (
     render_operations_scheduled_tasks,
     render_operations_scheduler_health_report,
     render_operations_scheduler_run_report,
+    render_operations_governance_policy_changes,
+    render_operations_console_action_audits,
+    render_operations_audit_timeline,
+    render_operations_audit_timeline_json,
     render_recovery_approval_export_result,
     render_recovery_strategy_metrics_prometheus,
     render_recovery_strategy_gate_result,
@@ -198,7 +211,11 @@ from travel_agent.operations import (
     recovery_strategy_decision_from_dict,
     recovery_governance_policy_from_dict,
     recovery_governance_policy_from_json,
+    recovery_governance_policy_to_dict,
     recovery_governance_decision_from_dict,
+    approve_operations_governance_policy_change,
+    apply_operations_governance_policy_change,
+    rollback_operations_governance_policy_change,
     recovery_strategy_execution_result_from_dict,
     recovery_strategy_execution_result_to_dict,
     recovery_strategy_gate_result_from_dict,
@@ -1522,6 +1539,148 @@ class IntegrationAdapterTest(unittest.TestCase):
         self.assertEqual(sla_report.findings[0].severity, "critical")
         self.assertIn("Recovery approval SLA:", render_recovery_approval_sla_report(sla_report))
 
+    def test_builds_approves_and_rolls_back_governance_policy_change(self) -> None:
+        previous = recovery_governance_policy_from_dict({"allowed_actions": ["replan"]})
+        current = recovery_governance_policy_from_dict(
+            {"allowed_actions": ["replan", "retry_status_refresh"], "max_executions_per_session": 2}
+        )
+
+        change = build_operations_governance_policy_change(
+            previous,
+            current,
+            requested_by="ops-a",
+            requested_at="2026-05-20T03:00:00+00:00",
+            reason="allow safe retry",
+        )
+        approved = approve_operations_governance_policy_change(change, "ops-b")
+        applied = apply_operations_governance_policy_change(approved, "2026-05-20T03:05:00+00:00")
+        rollback = rollback_operations_governance_policy_change(
+            applied,
+            requested_by="ops-c",
+            requested_at="2026-05-20T03:10:00+00:00",
+        )
+        reloaded = operations_governance_policy_change_from_dict(
+            operations_governance_policy_change_to_dict(applied)
+        )
+
+        self.assertEqual(change.status, "PENDING_APPROVAL")
+        self.assertTrue(any("max_executions_per_session" in item for item in change.changes))
+        self.assertEqual(approved.status, "APPROVED")
+        self.assertEqual(applied.status, "APPLIED")
+        self.assertEqual(reloaded.change_id, applied.change_id)
+        self.assertEqual(rollback.status, "ROLLED_BACK")
+        self.assertEqual(rollback.after, change.before)
+        self.assertIn("Operations governance policy changes:", render_operations_governance_policy_changes([applied]))
+
+    def test_builds_console_action_audit_summary(self) -> None:
+        authorization = {
+            "allowed": True,
+            "action": "update_governance_policy",
+            "decision": {"status": "NOT_ENFORCED"},
+        }
+        audit = build_operations_console_action_audit(
+            action="propose_governance_policy_change",
+            actor="ops-a",
+            roles=["ops"],
+            department="platform",
+            authorization=authorization,
+            request_payload={
+                "action": "propose_governance_policy_change",
+                "before": {"allowed_actions": ["replan"]},
+                "after": {"allowed_actions": ["replan", "retry_status_refresh"]},
+                "token": "secret-token",
+            },
+            result_body={
+                "ok": True,
+                "action": "propose_governance_policy_change",
+                "change": {"change_id": "OGP-1", "status": "PENDING_APPROVAL"},
+            },
+            requested_at="2026-05-20T03:00:00+00:00",
+            completed_at="2026-05-20T03:01:00+00:00",
+        )
+        reloaded = operations_console_action_audit_from_dict(operations_console_action_audit_to_dict(audit))
+
+        self.assertEqual(audit.status, "SUCCESS")
+        self.assertEqual(audit.request_summary["token"]["present"], True)
+        self.assertNotIn("secret-token", str(audit.request_summary))
+        self.assertEqual(audit.result_summary["change_id"], "OGP-1")
+        self.assertEqual(reloaded.audit_id, audit.audit_id)
+        self.assertIn("Operations console action audits:", render_operations_console_action_audits([audit]))
+
+    def test_builds_operations_audit_timeline_with_filters(self) -> None:
+        audit = build_operations_console_action_audit(
+            action="propose_governance_policy_change",
+            actor="ops-a",
+            roles=["ops"],
+            department="platform",
+            authorization={"allowed": True, "action": "update_governance_policy"},
+            request_payload={"action": "propose_governance_policy_change"},
+            result_body={
+                "ok": True,
+                "change": {"change_id": "OGP-TL", "status": "PENDING_APPROVAL"},
+            },
+            requested_at="2026-05-20T03:00:00+00:00",
+            completed_at="2026-05-20T03:01:00+00:00",
+        )
+        change = operations_governance_policy_change_from_dict(
+            {
+                "change_id": "OGP-TL",
+                "status": "APPLIED",
+                "policy_type": "recovery_governance",
+                "requested_by": "ops-a",
+                "requested_at": "2026-05-20T03:02:00+00:00",
+                "before": {"allowed_actions": ["replan"]},
+                "after": {"allowed_actions": ["replan", "retry_status_refresh"]},
+                "changes": ["allowed_actions: ['replan'] -> ['replan', 'retry_status_refresh']"],
+                "approvals": ["ops-b"],
+                "applied_at": "2026-05-20T03:03:00+00:00",
+            }
+        )
+        replay_job = build_oncall_webhook_replay_job(
+            ["WHK-TL"],
+            requested_by="ops-c",
+            patch_template_id="missing_ticket_status",
+            created_at="2026-05-20T03:04:00+00:00",
+        )
+        scheduler_run = operations_scheduler_run_report_from_dict(
+            {
+                "run_id": "OSR-TL",
+                "started_at": "2026-05-20T03:05:00+00:00",
+                "finished_at": "2026-05-20T03:06:00+00:00",
+                "due_count": 1,
+                "executed_count": 1,
+                "failed_count": 0,
+                "results": [],
+                "summary": "executed=1 failed=0",
+            }
+        )
+
+        timeline = build_operations_audit_timeline(
+            [audit],
+            [change],
+            [replay_job],
+            [scheduler_run],
+            generated_at="2026-05-20T03:07:00+00:00",
+        )
+        action_filtered = build_operations_audit_timeline([audit], [change], [replay_job], [scheduler_run], action="run_operations_schedule")
+        actor_filtered = build_operations_audit_timeline([audit], [change], [replay_job], [scheduler_run], actor="ops-c")
+        status_filtered = build_operations_audit_timeline([audit], [change], [replay_job], [scheduler_run], status="APPLIED")
+        type_filtered = build_operations_audit_timeline(
+            [audit],
+            [change],
+            [replay_job],
+            [scheduler_run],
+            event_type="console_action",
+        )
+
+        self.assertEqual([event.event_type for event in timeline.events], ["scheduler_run", "replay_job", "governance_policy_change", "console_action"])
+        self.assertEqual(action_filtered.events[0].event_id, "OSR-TL")
+        self.assertEqual(actor_filtered.events[0].event_id, replay_job.job_id)
+        self.assertEqual(status_filtered.events[0].event_id, "OGP-TL")
+        self.assertEqual(type_filtered.events[0].event_id, audit.audit_id)
+        self.assertIn("operations_audit_timeline", render_operations_audit_timeline_json(timeline))
+        self.assertIn("Operations audit timeline:", render_operations_audit_timeline(timeline))
+
     def test_falls_back_to_mock_when_real_system_fails(self) -> None:
         settings = IntegrationSettings(
             policy_api_url="https://policy.example/check",
@@ -1760,6 +1919,27 @@ class SessionStoreTest(unittest.TestCase):
             now="2026-05-19T10:02:00+00:00",
         )
         store.record_operations_scheduler_run(operations_scheduler_run_report_to_dict(scheduler_report))
+        governance_change = build_operations_governance_policy_change(
+            recovery_governance_policy_from_dict({"allowed_actions": ["replan"]}),
+            recovery_governance_policy_from_dict({"allowed_actions": ["replan", "retry_status_refresh"]}),
+            requested_by="ops",
+            requested_at="2026-05-19T10:09:00+00:00",
+        )
+        store.record_operations_governance_policy_change(
+            operations_governance_policy_change_to_dict(governance_change)
+        )
+        console_audit = build_operations_console_action_audit(
+            action="propose_governance_policy_change",
+            actor="ops",
+            roles=["ops"],
+            department="platform",
+            authorization={"allowed": True, "action": "update_governance_policy"},
+            request_payload={"action": "propose_governance_policy_change", "after": {"allowed_actions": ["replan"]}},
+            result_body={"ok": True, "action": "propose_governance_policy_change"},
+            requested_at="2026-05-19T10:10:00+00:00",
+            completed_at="2026-05-19T10:11:00+00:00",
+        )
+        store.record_operations_console_action_audit(operations_console_action_audit_to_dict(console_audit))
 
         self.assertEqual(store.list_operations_dashboard_snapshots()[0]["snapshot_id"], "DASH-HTTP")
         self.assertEqual(store.list_operations_closed_loop_snapshots()[0]["snapshot_id"], "CLP-HTTP")
@@ -1772,6 +1952,11 @@ class SessionStoreTest(unittest.TestCase):
         self.assertEqual(claimed_tasks[0]["lease_owner"], "worker-a")
         self.assertEqual(store.list_operations_scheduled_tasks()[0]["next_run_at"], "2026-05-19T11:01:00+00:00")
         self.assertEqual(store.list_operations_scheduler_runs()[0]["run_id"], scheduler_report.run_id)
+        self.assertEqual(
+            store.list_operations_governance_policy_changes()[0]["change_id"],
+            governance_change.change_id,
+        )
+        self.assertEqual(store.list_operations_console_action_audits()[0]["audit_id"], console_audit.audit_id)
         self.assertTrue(any(call[0].endswith("/operations/dashboard-snapshots/record") for call in http.calls))
         self.assertTrue(any(call[0].endswith("/operations/closed-loop-snapshots/record") for call in http.calls))
         self.assertTrue(any(call[0].endswith("/operations/oncall-statuses/record") for call in http.calls))
@@ -1782,6 +1967,8 @@ class SessionStoreTest(unittest.TestCase):
         self.assertTrue(any(call[0].endswith("/operations/knowledge/record") for call in http.calls))
         self.assertTrue(any(call[0].endswith("/operations/scheduled-tasks/claim-due") for call in http.calls))
         self.assertTrue(any(call[0].endswith("/operations/scheduler-runs/record") for call in http.calls))
+        self.assertTrue(any(call[0].endswith("/operations/governance-policy-changes/record") for call in http.calls))
+        self.assertTrue(any(call[0].endswith("/operations/console-action-audits/record") for call in http.calls))
 
     def test_build_session_store_selects_configured_backends(self) -> None:
         http = FakeSessionStoreHttpClient()
@@ -1930,6 +2117,27 @@ class SessionStoreTest(unittest.TestCase):
                 now="2026-05-19T10:04:00+00:00",
             )
             store.record_operations_scheduler_run(operations_scheduler_run_report_to_dict(scheduler_report))
+            governance_change = build_operations_governance_policy_change(
+                recovery_governance_policy_from_dict({"allowed_actions": ["replan"]}),
+                recovery_governance_policy_from_dict({"allowed_actions": ["replan", "retry_status_refresh"]}),
+                requested_by="ops",
+                requested_at="2026-05-19T10:09:00+00:00",
+            )
+            store.record_operations_governance_policy_change(
+                operations_governance_policy_change_to_dict(governance_change)
+            )
+            console_audit = build_operations_console_action_audit(
+                action="propose_governance_policy_change",
+                actor="ops",
+                roles=["ops"],
+                department="platform",
+                authorization={"allowed": True, "action": "update_governance_policy"},
+                request_payload={"action": "propose_governance_policy_change"},
+                result_body={"ok": True, "action": "propose_governance_policy_change"},
+                requested_at="2026-05-19T10:10:00+00:00",
+                completed_at="2026-05-19T10:11:00+00:00",
+            )
+            store.record_operations_console_action_audit(operations_console_action_audit_to_dict(console_audit))
             closed_loop = build_operations_closed_loop_report(
                 trend_alerts=trend_alerts,
                 action_items=action_items,
@@ -1955,6 +2163,12 @@ class SessionStoreTest(unittest.TestCase):
             reloaded_entry = operations_knowledge_entry_from_dict(store.list_operations_knowledge_entries()[0])
             reloaded_task = operations_scheduled_task_from_dict(store.list_operations_scheduled_tasks()[0])
             reloaded_run = operations_scheduler_run_report_from_dict(store.list_operations_scheduler_runs()[0])
+            reloaded_governance_change = operations_governance_policy_change_from_dict(
+                store.list_operations_governance_policy_changes()[0]
+            )
+            reloaded_console_audit = operations_console_action_audit_from_dict(
+                store.list_operations_console_action_audits()[0]
+            )
             health = store.health_check()
 
             self.assertEqual(reloaded_snapshot.snapshot_id, "DASH-SQL")
@@ -1972,7 +2186,9 @@ class SessionStoreTest(unittest.TestCase):
             self.assertIsNone(reloaded_task.lease_owner)
             self.assertGreater(reloaded_task.next_run_at, "2026-05-19T10:04:00+00:00")
             self.assertEqual(reloaded_run.run_id, scheduler_report.run_id)
-            self.assertGreaterEqual(health.schema_version, 9)
+            self.assertEqual(reloaded_governance_change.change_id, governance_change.change_id)
+            self.assertEqual(reloaded_console_audit.audit_id, console_audit.audit_id)
+            self.assertGreaterEqual(health.schema_version, 11)
             self.assertEqual(health.details["dashboard_snapshots"], "1")
             self.assertEqual(health.details["closed_loop_snapshots"], "1")
             self.assertEqual(health.details["oncall_ticket_statuses"], "1")
@@ -1983,6 +2199,8 @@ class SessionStoreTest(unittest.TestCase):
             self.assertEqual(health.details["operations_knowledge_entries"], "1")
             self.assertEqual(health.details["operations_scheduled_tasks"], "1")
             self.assertEqual(health.details["operations_scheduler_runs"], "1")
+            self.assertEqual(health.details["operations_governance_policy_changes"], "1")
+            self.assertEqual(health.details["operations_console_action_audits"], "1")
 
     def test_sqlite_session_store_tracks_metadata_and_versions(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -3607,6 +3825,58 @@ class OperationsReadinessTest(unittest.TestCase):
         self.assertIn("Operations action authorization:", render_operations_action_authorization(allowed))
         self.assertIn("missing required role", denied.decision.reasons[0])
 
+    def test_runs_operations_console_action_for_replay_job_creation(self) -> None:
+        payload = {
+            "event_id": "WHK-ACTION",
+            "data": {
+                "status": "CLOSED",
+                "updated_at": "2026-05-20T03:00:00+00:00",
+                "detail": "missing ticket id",
+            },
+        }
+        event = build_oncall_webhook_event(
+            payload,
+            raw_body=json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+            now="2026-05-20T03:05:00+00:00",
+        )
+        store = InMemorySessionStore()
+        store.record_oncall_webhook_event(oncall_webhook_event_to_dict(event))
+
+        result = json.loads(
+            run_operations_console_action(
+                store,
+                "create_replay_job",
+                actor="ops-user",
+                roles=["ops"],
+                payload={"limit": 1, "requested_by": "ops-ui"},
+            )
+        )
+
+        action = result["operations_console_action"]
+        self.assertTrue(action["ok"])
+        self.assertEqual(action["authorization"]["action"], "create_replay_job")
+        self.assertEqual(action["job"]["requested_by"], "ops-ui")
+        self.assertEqual(store.list_oncall_webhook_replay_jobs(1)[0]["job_id"], action["job"]["job_id"])
+
+    def test_runs_operations_console_scheduler_action(self) -> None:
+        store = InMemorySessionStore()
+
+        result = json.loads(
+            run_operations_console_action(
+                store,
+                "run_operations_schedule",
+                actor="ops-user",
+                roles=["ops"],
+                payload={"limit": 10, "now": "2026-05-20T03:05:00+00:00"},
+            )
+        )
+
+        action = result["operations_console_action"]
+        self.assertTrue(action["ok"])
+        self.assertEqual(action["authorization"]["action"], "run_operations_schedule")
+        self.assertEqual(action["scheduler_run"]["due_count"], 5)
+        self.assertEqual(store.list_operations_scheduler_runs(1)[0]["run_id"], action["scheduler_run"]["run_id"])
+
     def test_executes_pending_oncall_webhook_replay_job(self) -> None:
         payload = {
             "event_id": "WHK-JOB",
@@ -3893,6 +4163,11 @@ class OperationsReadinessTest(unittest.TestCase):
             created_at="2026-05-20T03:06:00+00:00",
         )
         store.record_oncall_webhook_replay_job(oncall_webhook_replay_job_to_dict(replay_job))
+        schedule_task = build_operations_scheduled_tasks(now="2026-05-20T03:00:00+00:00")[2]
+        store.record_operations_scheduled_task(operations_scheduled_task_to_dict(schedule_task))
+        registry_server = create_schema_registry_server(token="schema-token")
+        registry_thread = run_metrics_server_in_thread(registry_server)
+        registry_host, registry_port = registry_server.server_address
         server = create_operations_dashboard_server(store, port=0, limit=10, token="dash-token")
         thread = run_metrics_server_in_thread(server)
         host, port = server.server_address
@@ -3951,10 +4226,184 @@ class OperationsReadinessTest(unittest.TestCase):
             )
             with urlopen(console_ui_request, timeout=5) as response:
                 console_ui = response.read().decode("utf-8")
+            create_action_request = Request(
+                f"http://{host}:{port}/operations/console/actions",
+                data=json.dumps(
+                    {
+                        "action": "create_replay_job",
+                        "limit": 1,
+                        "requested_by": "ops-ui",
+                        "patch_template_id": "missing_ticket_status",
+                    },
+                    ensure_ascii=False,
+                ).encode("utf-8"),
+                headers={
+                    "Authorization": "Bearer dash-token",
+                    "Content-Type": "application/json",
+                    "X-Operations-Actor": "ops-user",
+                    "X-Operations-Roles": "ops",
+                },
+                method="POST",
+            )
+            with urlopen(create_action_request, timeout=5) as response:
+                create_action_payload = json.loads(response.read().decode("utf-8"))
+            execute_action_request = Request(
+                f"http://{host}:{port}/operations/console/actions",
+                data=json.dumps(
+                    {
+                        "action": "execute_replay_jobs",
+                        "limit": 10,
+                        "patches": {
+                            dead_letter_event.event_id: {
+                                "ticket_status": {
+                                    "ticket_id": "INC-HTTP-CONSOLE",
+                                    "status": "CLOSED",
+                                    "updated_at": "2026-05-20T03:00:00+00:00",
+                                }
+                            }
+                        },
+                    },
+                    ensure_ascii=False,
+                ).encode("utf-8"),
+                headers={
+                    "Authorization": "Bearer dash-token",
+                    "Content-Type": "application/json",
+                    "X-Operations-Actor": "ops-user",
+                    "X-Operations-Roles": "ops",
+                },
+                method="POST",
+            )
+            with urlopen(execute_action_request, timeout=5) as response:
+                execute_action_payload = json.loads(response.read().decode("utf-8"))
+            scheduler_action_request = Request(
+                f"http://{host}:{port}/operations/console/actions",
+                data=json.dumps(
+                    {
+                        "action": "run_operations_schedule",
+                        "limit": 10,
+                        "persisted": True,
+                        "owner": "ops-ui",
+                        "now": "2026-05-20T03:05:00+00:00",
+                    },
+                    ensure_ascii=False,
+                ).encode("utf-8"),
+                headers={
+                    "Authorization": "Bearer dash-token",
+                    "Content-Type": "application/json",
+                    "X-Operations-Actor": "ops-user",
+                    "X-Operations-Roles": "ops",
+                },
+                method="POST",
+            )
+            with urlopen(scheduler_action_request, timeout=5) as response:
+                scheduler_action_payload = json.loads(response.read().decode("utf-8"))
+            publish_action_request = Request(
+                f"http://{host}:{port}/operations/console/actions",
+                data=json.dumps(
+                    {
+                        "action": "publish_closed_loop_schema",
+                        "endpoint": f"http://{registry_host}:{registry_port}/schema-registry",
+                        "token": "schema-token",
+                        "server_url": f"http://{host}:{port}",
+                    },
+                    ensure_ascii=False,
+                ).encode("utf-8"),
+                headers={
+                    "Authorization": "Bearer dash-token",
+                    "Content-Type": "application/json",
+                    "X-Operations-Actor": "ops-user",
+                    "X-Operations-Roles": "ops",
+                },
+                method="POST",
+            )
+            with urlopen(publish_action_request, timeout=5) as response:
+                publish_action_payload = json.loads(response.read().decode("utf-8"))
+            propose_governance_request = Request(
+                f"http://{host}:{port}/operations/console/actions",
+                data=json.dumps(
+                    {
+                        "action": "propose_governance_policy_change",
+                        "before": {"allowed_actions": ["replan"]},
+                        "after": {
+                            "allowed_actions": ["replan", "retry_status_refresh"],
+                            "max_executions_per_session": 2,
+                        },
+                        "reason": "allow safe retry",
+                    },
+                    ensure_ascii=False,
+                ).encode("utf-8"),
+                headers={
+                    "Authorization": "Bearer dash-token",
+                    "Content-Type": "application/json",
+                    "X-Operations-Actor": "ops-a",
+                    "X-Operations-Roles": "ops",
+                },
+                method="POST",
+            )
+            with urlopen(propose_governance_request, timeout=5) as response:
+                propose_governance_payload = json.loads(response.read().decode("utf-8"))
+            proposed_change_id = propose_governance_payload["operations_console_action"]["change"]["change_id"]
+            approve_governance_request = Request(
+                f"http://{host}:{port}/operations/console/actions",
+                data=json.dumps(
+                    {
+                        "action": "approve_governance_policy_change",
+                        "change_id": proposed_change_id,
+                        "approved_by": "ops-b",
+                        "applied_at": "2026-05-20T03:20:00+00:00",
+                    },
+                    ensure_ascii=False,
+                ).encode("utf-8"),
+                headers={
+                    "Authorization": "Bearer dash-token",
+                    "Content-Type": "application/json",
+                    "X-Operations-Actor": "ops-b",
+                    "X-Operations-Roles": "ops",
+                },
+                method="POST",
+            )
+            with urlopen(approve_governance_request, timeout=5) as response:
+                approve_governance_payload = json.loads(response.read().decode("utf-8"))
+            rollback_governance_request = Request(
+                f"http://{host}:{port}/operations/console/actions",
+                data=json.dumps(
+                    {
+                        "action": "rollback_governance_policy_change",
+                        "change_id": proposed_change_id,
+                        "requested_by": "ops-c",
+                        "requested_at": "2026-05-20T03:25:00+00:00",
+                    },
+                    ensure_ascii=False,
+                ).encode("utf-8"),
+                headers={
+                    "Authorization": "Bearer dash-token",
+                    "Content-Type": "application/json",
+                    "X-Operations-Actor": "ops-c",
+                    "X-Operations-Roles": "ops",
+                },
+                method="POST",
+            )
+            with urlopen(rollback_governance_request, timeout=5) as response:
+                rollback_governance_payload = json.loads(response.read().decode("utf-8"))
+            audit_timeline_request = Request(
+                f"http://{host}:{port}/operations/console/audit-timeline?limit=20",
+                headers={"Authorization": "Bearer dash-token"},
+            )
+            with urlopen(audit_timeline_request, timeout=5) as response:
+                audit_timeline_payload = json.loads(response.read().decode("utf-8"))
+            governance_timeline_request = Request(
+                f"http://{host}:{port}/operations/console/audit-timeline?event_type=governance_policy_change&status=ROLLED_BACK",
+                headers={"Authorization": "Bearer dash-token"},
+            )
+            with urlopen(governance_timeline_request, timeout=5) as response:
+                governance_timeline_payload = json.loads(response.read().decode("utf-8"))
         finally:
             server.shutdown()
             server.server_close()
             thread.join(timeout=5)
+            registry_server.shutdown()
+            registry_server.server_close()
+            registry_thread.join(timeout=5)
 
         self.assertEqual(serialized["schema_version"], "travel.operations.closed_loop.v1")
         self.assertEqual(dashboard.snapshot_count, 1)
@@ -3979,6 +4428,62 @@ class OperationsReadinessTest(unittest.TestCase):
         self.assertIn("replay_jobs", console_view_payload["operations_console_view"]["visible_sections"])
         self.assertIn("Operations Console", console_ui)
         self.assertIn("Replay Jobs", console_ui)
+        create_action = create_action_payload["operations_console_action"]
+        self.assertTrue(create_action["ok"])
+        self.assertEqual(create_action["authorization"]["action"], "create_replay_job")
+        self.assertEqual(create_action["job"]["requested_by"], "ops-ui")
+        self.assertEqual(create_action["job"]["status"], "PENDING")
+        self.assertEqual(create_action["job"]["patch_template_id"], "missing_ticket_status")
+        self.assertTrue(create_action["action_audit"]["recorded"])
+        execute_action = execute_action_payload["operations_console_action"]
+        self.assertTrue(execute_action["ok"])
+        self.assertEqual(execute_action["authorization"]["action"], "execute_replay_job")
+        self.assertGreaterEqual(len(execute_action["executions"]), 1)
+        self.assertEqual(execute_action["executions"][0]["job"]["status"], "COMPLETED")
+        self.assertEqual(store.list_oncall_ticket_statuses(1)[0]["ticket_id"], "INC-HTTP-CONSOLE")
+        self.assertEqual(store.list_oncall_webhook_events(1)[0]["status"], "REPLAYED")
+        scheduler_action = scheduler_action_payload["operations_console_action"]
+        self.assertTrue(scheduler_action["ok"])
+        self.assertEqual(scheduler_action["authorization"]["action"], "run_operations_schedule")
+        self.assertEqual(scheduler_action["scheduler_run"]["due_count"], 1)
+        self.assertEqual(store.list_operations_scheduler_runs(1)[0]["run_id"], scheduler_action["scheduler_run"]["run_id"])
+        publish_action = publish_action_payload["operations_console_action"]
+        self.assertTrue(publish_action["ok"])
+        self.assertEqual(publish_action["authorization"]["action"], "publish_closed_loop_schema")
+        self.assertEqual(publish_action["publish_result"]["schema_version"], "travel.operations.closed_loop.v1")
+        self.assertEqual(registry_server.captured_payload["schema_version"], "travel.operations.closed_loop.v1")
+        self.assertEqual(registry_server.captured_token, "Bearer schema-token")
+        propose_governance = propose_governance_payload["operations_console_action"]
+        self.assertTrue(propose_governance["ok"])
+        self.assertEqual(propose_governance["authorization"]["action"], "update_governance_policy")
+        self.assertEqual(propose_governance["change"]["status"], "PENDING_APPROVAL")
+        approve_governance = approve_governance_payload["operations_console_action"]
+        self.assertTrue(approve_governance["ok"])
+        self.assertEqual(approve_governance["change"]["status"], "APPLIED")
+        self.assertIn("ops-b", approve_governance["change"]["approvals"])
+        rollback_governance = rollback_governance_payload["operations_console_action"]
+        self.assertTrue(rollback_governance["ok"])
+        self.assertEqual(rollback_governance["change"]["status"], "ROLLED_BACK")
+        self.assertEqual(store.list_operations_governance_policy_changes(1)[0]["status"], "ROLLED_BACK")
+        self.assertTrue(rollback_governance["action_audit"]["recorded"])
+        action_audits = store.list_operations_console_action_audits(10)
+        self.assertGreaterEqual(len(action_audits), 7)
+        self.assertEqual(action_audits[0]["action"], "rollback_governance_policy_change")
+        self.assertEqual(action_audits[0]["status"], "SUCCESS")
+        self.assertEqual(action_audits[0]["result_summary"]["change_status"], "ROLLED_BACK")
+        timeline_events = audit_timeline_payload["operations_audit_timeline"]["events"]
+        self.assertGreaterEqual(len(timeline_events), 4)
+        self.assertIn("console_action", {item["event_type"] for item in timeline_events})
+        self.assertIn("replay_job", {item["event_type"] for item in timeline_events})
+        self.assertIn("scheduler_run", {item["event_type"] for item in timeline_events})
+        self.assertEqual(
+            governance_timeline_payload["operations_audit_timeline"]["events"][0]["event_type"],
+            "governance_policy_change",
+        )
+        self.assertEqual(
+            governance_timeline_payload["operations_audit_timeline"]["events"][0]["status"],
+            "ROLLED_BACK",
+        )
         self.assertIn("oncall_webhook_ops_console", build_oncall_webhook_ops_console_json(store))
         self.assertIn("oncall_webhook_replay_jobs", build_oncall_webhook_replay_jobs_json(store))
         self.assertIn("operations_console_overview", build_operations_console_overview_json(store))
@@ -4391,6 +4896,42 @@ class CapturingAnyHttpClient:
         return self.responses[url]
 
 
+def create_schema_registry_server(token: str | None = None) -> ThreadingHTTPServer:
+    class SchemaRegistryHandler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            length = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(length).decode("utf-8") if length else "{}"
+            self.server.captured_payload = json.loads(raw)
+            self.server.captured_token = self.headers.get("Authorization")
+            expected = f"Bearer {token}" if token else None
+            if expected and self.server.captured_token != expected:
+                self.send_response(401)
+                self.end_headers()
+                return
+            body = json.dumps(
+                {
+                    "ok": True,
+                    "accepted": 1,
+                    "schema_version": self.server.captured_payload.get("schema_version"),
+                    "detail": "accepted by test registry",
+                },
+                ensure_ascii=False,
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format: str, *args: object) -> None:
+            del format, args
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), SchemaRegistryHandler)
+    server.captured_payload = {}
+    server.captured_token = None
+    return server
+
+
 class FailingHttpClient:
     def post_json(self, url: str, payload: dict[str, Any], token: str | None = None) -> dict[str, Any]:
         del url, payload, token
@@ -4420,6 +4961,8 @@ class FakeSessionStoreHttpClient:
         self.knowledge_entries: list[dict[str, Any]] = []
         self.scheduled_tasks: list[dict[str, Any]] = []
         self.scheduler_runs: list[dict[str, Any]] = []
+        self.governance_policy_changes: list[dict[str, Any]] = []
+        self.console_action_audits: list[dict[str, Any]] = []
         self.calls: list[tuple[str, dict[str, Any], str | None]] = []
 
     def post_json(self, url: str, payload: dict[str, Any], token: str | None = None) -> dict[str, Any]:
@@ -4556,6 +5099,24 @@ class FakeSessionStoreHttpClient:
             return {"ok": True}
         if path == "/operations/scheduler-runs/list":
             return {"runs": list(reversed(self.scheduler_runs))[0 : int(payload["limit"])]}
+        if path == "/operations/governance-policy-changes/record":
+            self.governance_policy_changes = [
+                change
+                for change in self.governance_policy_changes
+                if change.get("change_id") != payload["change"].get("change_id")
+            ]
+            self.governance_policy_changes.append(dict(payload["change"]))
+            return {"ok": True}
+        if path == "/operations/governance-policy-changes/list":
+            return {"changes": list(reversed(self.governance_policy_changes))[0 : int(payload["limit"])]}
+        if path == "/operations/console-action-audits/record":
+            self.console_action_audits = [
+                audit for audit in self.console_action_audits if audit.get("audit_id") != payload["audit"].get("audit_id")
+            ]
+            self.console_action_audits.append(dict(payload["audit"]))
+            return {"ok": True}
+        if path == "/operations/console-action-audits/list":
+            return {"audits": list(reversed(self.console_action_audits))[0 : int(payload["limit"])]}
         if path == "/health":
             return {
                 "backend": "http-json",
@@ -4575,6 +5136,8 @@ class FakeSessionStoreHttpClient:
                     "operations_knowledge_entries": str(len(self.knowledge_entries)),
                     "operations_scheduled_tasks": str(len(self.scheduled_tasks)),
                     "operations_scheduler_runs": str(len(self.scheduler_runs)),
+                    "operations_governance_policy_changes": str(len(self.governance_policy_changes)),
+                    "operations_console_action_audits": str(len(self.console_action_audits)),
                 },
             }
         raise AssertionError(f"Unexpected HTTP store URL: {url}")

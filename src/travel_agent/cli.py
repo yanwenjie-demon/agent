@@ -19,6 +19,8 @@ from .models import DeadLetterCalendarSync, DeadLetterNotification, TravelContex
 from .observability import build_otlp_payloads, export_otlp_http
 from .operations import (
     OnCallWebhookReplayBatchResult,
+    OnCallWebhookReplayJobExecution,
+    OperationsClosedLoopSchemaPublishResult,
     advance_operations_scheduled_task,
     authorize_operations_action,
     build_alert_route_rules,
@@ -39,11 +41,15 @@ from .operations import (
     build_operations_scheduler_health_report,
     build_operations_console_overview,
     build_operations_console_view,
+    build_operations_console_action_audit,
+    build_operations_audit_timeline,
+    build_operations_governance_policy_change,
     build_operations_multidimensional_view,
     build_operations_postmortem_report,
     build_operations_trend_alert_rules,
     build_oncall_webhook_event,
     build_recovery_strategy_metrics,
+    RecoveryGovernancePolicy,
     collect_recovery_approval_receipts,
     build_postmortem_action_items,
     build_trend_alert_action_items,
@@ -63,6 +69,7 @@ from .operations import (
     oncall_ticket_status_from_dict,
     oncall_ticket_status_from_webhook,
     oncall_ticket_status_to_dict,
+    oncall_webhook_replay_job_execution_to_dict,
     oncall_webhook_replay_job_from_dict,
     oncall_webhook_replay_job_to_dict,
     open_recovery_failure_ticket_http,
@@ -76,8 +83,13 @@ from .operations import (
     operations_closed_loop_snapshot_to_dict,
     operations_dashboard_snapshot_from_dict,
     operations_dashboard_snapshot_to_dict,
+    operations_governance_policy_change_from_dict,
+    operations_governance_policy_change_to_dict,
+    operations_console_action_audit_from_dict,
+    operations_console_action_audit_to_dict,
     operations_knowledge_entry_from_dict,
     operations_knowledge_entry_to_dict,
+    operations_action_authorization_to_dict,
     operations_scheduled_task_from_dict,
     operations_scheduled_task_to_dict,
     operations_scheduler_run_report_from_dict,
@@ -85,8 +97,12 @@ from .operations import (
     operations_trend_alert_from_dict,
     operations_trend_alert_to_dict,
     recovery_governance_policy_from_json,
+    recovery_governance_policy_from_dict,
     build_recovery_approval_sla_policy,
     build_recovery_governance_policy_audit,
+    apply_operations_governance_policy_change,
+    approve_operations_governance_policy_change,
+    rollback_operations_governance_policy_change,
     recovery_strategy_execution_result_from_dict,
     publish_operations_closed_loop_schema_http,
     render_operations_alert_export_result,
@@ -120,6 +136,7 @@ from .operations import (
     render_operations_console_overview_json,
     render_operations_console_view_html,
     render_operations_console_view_json,
+    render_operations_audit_timeline_json,
     render_operations_scheduled_tasks,
     render_operations_scheduler_health_report,
     render_operations_scheduler_run_report,
@@ -1333,25 +1350,8 @@ def main() -> None:
         print(render_operations_action_authorization(authorization))
         if not authorization.allowed:
             raise SystemExit(1)
-        events = [
-            oncall_webhook_event_from_dict(item)
-            for item in agent.session_store.list_oncall_webhook_events(args.observability_limit)
-        ]
-        jobs = [
-            oncall_webhook_replay_job_from_dict(item)
-            for item in agent.session_store.list_oncall_webhook_replay_jobs(args.observability_limit)
-        ]
-        executions = []
-        for job in jobs:
-            if job.status != "PENDING":
-                continue
-            execution = execute_oncall_webhook_replay_job(job, events)
-            executions.append(execution)
-            agent.session_store.record_oncall_webhook_replay_job(oncall_webhook_replay_job_to_dict(execution.job))
-            for event in execution.replayed_events:
-                agent.session_store.record_oncall_webhook_event(oncall_webhook_event_to_dict(event))
-            for status in execution.statuses:
-                agent.session_store.record_oncall_ticket_status(oncall_ticket_status_to_dict(status))
+        executions = _execute_pending_replay_jobs(agent.session_store, args.observability_limit)
+        for execution in executions:
             print(render_oncall_webhook_replay_job_execution(execution))
         if not executions:
             print("OnCall webhook replay job execution:\n- none")
@@ -2796,6 +2796,45 @@ def build_operations_console_overview_json(session_store: SessionStore, limit: i
     return render_operations_console_overview_json(overview)
 
 
+def build_operations_audit_timeline_json(
+    session_store: SessionStore,
+    limit: int = 20,
+    event_type: str | None = None,
+    actor: str | None = None,
+    action: str | None = None,
+    status: str | None = None,
+) -> str:
+    read_limit = max(100, limit * 2)
+    action_audits = [
+        operations_console_action_audit_from_dict(item)
+        for item in session_store.list_operations_console_action_audits(read_limit)
+    ]
+    governance_changes = [
+        operations_governance_policy_change_from_dict(item)
+        for item in session_store.list_operations_governance_policy_changes(read_limit)
+    ]
+    replay_jobs = [
+        oncall_webhook_replay_job_from_dict(item)
+        for item in session_store.list_oncall_webhook_replay_jobs(read_limit)
+    ]
+    scheduler_runs = [
+        operations_scheduler_run_report_from_dict(item)
+        for item in session_store.list_operations_scheduler_runs(read_limit)
+    ]
+    timeline = build_operations_audit_timeline(
+        action_audits=action_audits,
+        governance_changes=governance_changes,
+        replay_jobs=replay_jobs,
+        scheduler_runs=scheduler_runs,
+        limit=limit,
+        event_type=event_type,
+        actor=actor,
+        action=action,
+        status=status,
+    )
+    return render_operations_audit_timeline_json(timeline)
+
+
 def build_operations_console_view_json(
     session_store: SessionStore,
     limit: int = 20,
@@ -2854,6 +2893,215 @@ def _build_operations_console_view(
     )
 
 
+def run_operations_console_action(
+    session_store: SessionStore,
+    action: str,
+    actor: str,
+    roles: list[str] | None = None,
+    department: str | None = None,
+    payload: dict[str, object] | None = None,
+    audit_sink: object | None = None,
+    limit: int = 20,
+) -> str:
+    payload = dict(payload or {})
+    action = action.strip()
+    requested_at = _utc_now()
+    action_limit = _payload_limit(payload, limit)
+    permission_action = {
+        "create_replay_job": "create_replay_job",
+        "execute_replay_jobs": "execute_replay_job",
+        "run_operations_schedule": "run_operations_schedule",
+        "publish_closed_loop_schema": "publish_closed_loop_schema",
+        "propose_governance_policy_change": "update_governance_policy",
+        "approve_governance_policy_change": "update_governance_policy",
+        "rollback_governance_policy_change": "update_governance_policy",
+    }.get(action)
+    if permission_action is None:
+        return _finalize_operations_console_action(
+            session_store,
+            {
+                "ok": False,
+                "action": action,
+                "error": "unsupported action",
+            },
+            action,
+            actor,
+            roles,
+            department,
+            payload,
+            {},
+            requested_at,
+        )
+    authorization = authorize_operations_action(
+        permission_action,
+        user_id=actor,
+        permission_policy=PermissionPolicy.from_env(),
+        department=department,
+        roles=roles or [],
+        audit_sink=audit_sink,
+        payload={"source": "operations_console_action", **payload},
+    )
+    if not authorization.allowed:
+        authorization_payload = operations_action_authorization_to_dict(authorization)
+        return _finalize_operations_console_action(
+            session_store,
+            {
+                "ok": False,
+                "action": action,
+                "authorization": authorization_payload,
+            },
+            action,
+            actor,
+            roles,
+            department,
+            payload,
+            authorization_payload,
+            requested_at,
+        )
+    if action == "create_replay_job":
+        events = [
+            oncall_webhook_event_from_dict(item)
+            for item in session_store.list_oncall_webhook_events(action_limit)
+        ]
+        if action_limit <= 0:
+            events = []
+        dead_letters = list_dead_letter_oncall_webhook_events(events)
+        dead_letters = dead_letters[:action_limit]
+        job = build_oncall_webhook_replay_job(
+            [event.event_id for event in dead_letters],
+            requested_by=str(payload.get("requested_by") or actor),
+            patch_template_id=(
+                str(payload["patch_template_id"]) if payload.get("patch_template_id") is not None else None
+            ),
+            audit={
+                "status": "PENDING",
+                "candidate_count": len(dead_letters),
+                "source": "operations_console_action",
+            },
+        )
+        session_store.record_oncall_webhook_replay_job(oncall_webhook_replay_job_to_dict(job))
+        body = {
+            "ok": True,
+            "action": action,
+            "authorization": operations_action_authorization_to_dict(authorization),
+            "job": oncall_webhook_replay_job_to_dict(job),
+        }
+    elif action == "execute_replay_jobs":
+        executions = _execute_pending_replay_jobs(
+            session_store,
+            action_limit,
+            patches=_payload_replay_patches(payload),
+        )
+        body = {
+            "ok": not any(execution.result.failed for execution in executions),
+            "action": action,
+            "authorization": operations_action_authorization_to_dict(authorization),
+            "executions": [
+                oncall_webhook_replay_job_execution_to_dict(execution)
+                for execution in executions
+            ],
+        }
+    elif action == "run_operations_schedule":
+        report = _run_operations_schedule_action(session_store, payload, limit=action_limit)
+        body = {
+            "ok": report.failed_count == 0,
+            "action": action,
+            "authorization": operations_action_authorization_to_dict(authorization),
+            "scheduler_run": operations_scheduler_run_report_to_dict(report),
+        }
+    elif action == "publish_closed_loop_schema":
+        result = _publish_closed_loop_schema_action(payload)
+        body = {
+            "ok": result.ok,
+            "action": action,
+            "authorization": operations_action_authorization_to_dict(authorization),
+            "publish_result": {
+                "ok": result.ok,
+                "endpoint": result.endpoint,
+                "schema_version": result.schema_version,
+                "delivered": result.delivered,
+                "failed": result.failed,
+                "detail": result.detail,
+            },
+        }
+    elif action == "propose_governance_policy_change":
+        change = _propose_governance_policy_change(session_store, payload, actor)
+        body = {
+            "ok": True,
+            "action": action,
+            "authorization": operations_action_authorization_to_dict(authorization),
+            "change": operations_governance_policy_change_to_dict(change),
+        }
+    elif action == "approve_governance_policy_change":
+        change = _approve_governance_policy_change(session_store, payload, actor)
+        body = {
+            "ok": change is not None,
+            "action": action,
+            "authorization": operations_action_authorization_to_dict(authorization),
+            "change": operations_governance_policy_change_to_dict(change) if change is not None else None,
+            "error": None if change is not None else "governance policy change not found",
+        }
+    else:
+        change = _rollback_governance_policy_change(session_store, payload, actor)
+        body = {
+            "ok": change is not None,
+            "action": action,
+            "authorization": operations_action_authorization_to_dict(authorization),
+            "change": operations_governance_policy_change_to_dict(change) if change is not None else None,
+            "error": None if change is not None else "governance policy change not found",
+        }
+    return _finalize_operations_console_action(
+        session_store,
+        body,
+        action,
+        actor,
+        roles,
+        department,
+        payload,
+        body.get("authorization") if isinstance(body.get("authorization"), dict) else {},
+        requested_at,
+    )
+
+
+def _finalize_operations_console_action(
+    session_store: SessionStore,
+    body: dict[str, object],
+    action: str,
+    actor: str,
+    roles: list[str] | None,
+    department: str | None,
+    payload: dict[str, object],
+    authorization: dict[str, object],
+    requested_at: str,
+) -> str:
+    audit = build_operations_console_action_audit(
+        action=action,
+        actor=actor,
+        roles=roles or [],
+        department=department,
+        authorization=dict(authorization),
+        request_payload=payload,
+        result_body=body,
+        requested_at=requested_at,
+        completed_at=_utc_now(),
+    )
+    try:
+        session_store.record_operations_console_action_audit(operations_console_action_audit_to_dict(audit))
+        body["action_audit"] = {
+            "audit_id": audit.audit_id,
+            "status": audit.status,
+            "recorded": True,
+        }
+    except Exception as exc:
+        body["action_audit"] = {
+            "audit_id": audit.audit_id,
+            "status": audit.status,
+            "recorded": False,
+            "error": str(exc),
+        }
+    return json.dumps({"operations_console_action": body}, ensure_ascii=False)
+
+
 def make_metrics_handler(
     metrics_provider: Callable[[], str],
     closed_loop_dashboard_provider: Callable[
@@ -2866,9 +3114,47 @@ def make_metrics_handler(
     operations_console_provider: Callable[[int | None], str] | None = None,
     operations_console_view_provider: Callable[[int | None, str, list[str], str | None], str] | None = None,
     operations_console_html_provider: Callable[[int | None, str, list[str], str | None], str] | None = None,
+    operations_audit_timeline_provider: Callable[
+        [int | None, str | None, str | None, str | None, str | None],
+        str,
+    ]
+    | None = None,
+    operations_console_action_provider: Callable[[str, str, list[str], str | None, dict[str, object]], str] | None = None,
     dashboard_token: str | None = None,
 ) -> type[BaseHTTPRequestHandler]:
     class MetricsHandler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            parsed = urlsplit(self.path)
+            path = parsed.path
+            if path == "/operations/console/actions":
+                if operations_console_action_provider is None:
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                if not self._authorized():
+                    self.send_response(401)
+                    self.end_headers()
+                    return
+                payload = self._json_body()
+                action = str(payload.get("action") or "")
+                if not action:
+                    self.send_response(400)
+                    self.end_headers()
+                    return
+                self._send_text(
+                    operations_console_action_provider(
+                        action,
+                        self._actor(),
+                        self._roles(),
+                        self._department(),
+                        payload,
+                    ) + "\n",
+                    "application/json; charset=utf-8",
+                )
+                return
+            self.send_response(404)
+            self.end_headers()
+
         def do_GET(self) -> None:
             parsed = urlsplit(self.path)
             path = parsed.path
@@ -2966,6 +3252,27 @@ def make_metrics_handler(
                     "application/json; charset=utf-8",
                 )
                 return
+            if path == "/operations/console/audit-timeline":
+                if operations_audit_timeline_provider is None:
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                if not self._authorized():
+                    self.send_response(401)
+                    self.end_headers()
+                    return
+                query = parse_qs(parsed.query)
+                self._send_text(
+                    operations_audit_timeline_provider(
+                        _first_query_int(query, "limit"),
+                        _first_query_value(query, "event_type"),
+                        _first_query_value(query, "actor"),
+                        _first_query_value(query, "action"),
+                        _first_query_value(query, "status"),
+                    ) + "\n",
+                    "application/json; charset=utf-8",
+                )
+                return
             if path == "/operations/console/ui":
                 if operations_console_html_provider is None:
                     self.send_response(404)
@@ -3020,6 +3327,17 @@ def make_metrics_handler(
             value = self.headers.get("X-Operations-Department")
             return value.strip() if value and value.strip() else None
 
+        def _json_body(self) -> dict[str, object]:
+            length = int(self.headers.get("Content-Length") or 0)
+            if length <= 0:
+                return {}
+            raw = self.rfile.read(length).decode("utf-8")
+            try:
+                payload = json.loads(raw)
+            except json.JSONDecodeError:
+                return {}
+            return dict(payload) if isinstance(payload, dict) else {}
+
     return MetricsHandler
 
 
@@ -3073,6 +3391,23 @@ def create_operations_dashboard_server(
                 roles=roles,
                 department=department,
             ),
+            lambda request_limit, event_type, actor, action, status: build_operations_audit_timeline_json(
+                session_store,
+                request_limit or limit,
+                event_type=event_type,
+                actor=actor,
+                action=action,
+                status=status,
+            ),
+            lambda action, actor, roles, department, payload: run_operations_console_action(
+                session_store,
+                action,
+                actor=actor,
+                roles=roles,
+                department=department,
+                payload=payload,
+                limit=limit,
+            ),
             dashboard_token=token,
         ),
     )
@@ -3107,6 +3442,7 @@ def serve_operations_dashboard(
     print(f"Serving operations dashboard on http://{actual_host}:{actual_port}/operations/closed-loop")
     print(f"Serving OnCall webhook ops on http://{actual_host}:{actual_port}/operations/oncall-webhook-ops")
     print(f"Serving operations console on http://{actual_host}:{actual_port}/operations/console")
+    print(f"Serving operations audit timeline on http://{actual_host}:{actual_port}/operations/console/audit-timeline")
     print(f"Serving operations console UI on http://{actual_host}:{actual_port}/operations/console/ui")
     try:
         server.serve_forever()
@@ -3269,6 +3605,272 @@ def _load_json_object(
     return payload
 
 
+def _payload_limit(payload: dict[str, object], default: int) -> int:
+    value = payload.get("limit")
+    if value is None:
+        return max(0, default)
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return max(0, default)
+
+
+def _payload_replay_patches(payload: dict[str, object]) -> dict[str, dict[str, Any]] | None:
+    patches = payload.get("patches")
+    if isinstance(patches, dict):
+        normalized = {
+            str(event_id): dict(patch)
+            for event_id, patch in patches.items()
+            if isinstance(patch, dict)
+        }
+        return normalized or None
+    patch = payload.get("patch")
+    if not isinstance(patch, dict):
+        return None
+    event_ids = payload.get("event_ids")
+    if isinstance(event_ids, list):
+        ids = [str(event_id) for event_id in event_ids if str(event_id)]
+    else:
+        single = payload.get("event_id")
+        ids = [str(single)] if single else []
+    return {event_id: dict(patch) for event_id in ids} or None
+
+
+def _run_operations_schedule_action(
+    session_store: SessionStore,
+    payload: dict[str, object],
+    limit: int,
+):
+    schedule_args = _operations_schedule_action_args(payload, limit)
+    handlers = _build_operations_schedule_handlers(session_store, schedule_args)
+    if bool(payload.get("persisted")):
+        now = str(payload.get("now") or _utc_now())
+        tasks = [
+            operations_scheduled_task_from_dict(item)
+            for item in session_store.claim_due_operations_scheduled_tasks(
+                owner=str(payload.get("owner") or "operations-console"),
+                now=now,
+                lease_seconds=_payload_int(payload, "lease_seconds", 300),
+                limit=limit,
+            )
+        ]
+        report = run_operations_scheduled_tasks(tasks, handlers, now=now)
+        results_by_task_id = {result.task_id: result for result in report.results}
+        for task in tasks:
+            result = results_by_task_id.get(task.task_id)
+            if result is None:
+                continue
+            session_store.complete_operations_scheduled_task(
+                operations_scheduled_task_to_dict(advance_operations_scheduled_task(task, result))
+            )
+    else:
+        now = str(payload.get("now")) if payload.get("now") is not None else None
+        report = run_operations_scheduled_tasks(build_operations_scheduled_tasks(now=now), handlers, now=now)
+    session_store.record_operations_scheduler_run(operations_scheduler_run_report_to_dict(report))
+    return report
+
+
+def _operations_schedule_action_args(payload: dict[str, object], limit: int) -> argparse.Namespace:
+    return argparse.Namespace(
+        observability_limit=limit,
+        closed_loop_dashboard_limit=_payload_int(payload, "closed_loop_dashboard_limit", limit),
+        closed_loop_dashboard_owner=_payload_optional_str(payload, "owner_filter"),
+        closed_loop_dashboard_since=_payload_optional_str(payload, "since"),
+        closed_loop_dashboard_cursor=_payload_optional_str(payload, "cursor"),
+        closed_loop_dashboard_department=_payload_optional_str(payload, "department_filter"),
+        closed_loop_dashboard_tenant=_payload_optional_str(payload, "tenant"),
+        closed_loop_dashboard_checkpoint=_payload_optional_str(payload, "checkpoint"),
+        recovery_approval_sla_policy_json=_payload_optional_str(payload, "recovery_approval_sla_policy_json"),
+        recovery_approval_sla_now=_payload_optional_str(payload, "now"),
+    )
+
+
+def _publish_closed_loop_schema_action(payload: dict[str, object]) -> OperationsClosedLoopSchemaPublishResult:
+    endpoint = _payload_optional_str(payload, "endpoint") or IntegrationSettings.from_env().closed_loop_schema_registry_url
+    if not endpoint:
+        return OperationsClosedLoopSchemaPublishResult(
+            ok=False,
+            endpoint="",
+            schema_version="travel.operations.closed_loop.v1",
+            delivered=0,
+            failed=1,
+            detail="missing schema registry endpoint",
+        )
+    token = _payload_optional_str(payload, "token") or IntegrationSettings.from_env().closed_loop_schema_registry_api_token
+    return publish_operations_closed_loop_schema_http(
+        endpoint,
+        token=token,
+        server_url=_payload_optional_str(payload, "server_url") or "http://127.0.0.1:9110",
+    )
+
+
+def _propose_governance_policy_change(
+    session_store: SessionStore,
+    payload: dict[str, object],
+    actor: str,
+):
+    previous = (
+        _payload_governance_policy(payload, "before")
+        or _payload_governance_policy(payload, "previous_policy")
+        or _current_governance_policy(session_store)
+    )
+    proposed = (
+        _payload_governance_policy(payload, "after")
+        or _payload_governance_policy(payload, "policy")
+        or _payload_governance_policy(payload, "proposed_policy")
+        or RecoveryGovernancePolicy()
+    )
+    change = build_operations_governance_policy_change(
+        previous,
+        proposed,
+        requested_by=str(payload.get("requested_by") or actor),
+        requested_at=_payload_optional_str(payload, "requested_at"),
+        reason=_payload_optional_str(payload, "reason"),
+    )
+    session_store.record_operations_governance_policy_change(operations_governance_policy_change_to_dict(change))
+    return change
+
+
+def _approve_governance_policy_change(
+    session_store: SessionStore,
+    payload: dict[str, object],
+    actor: str,
+):
+    change = _find_governance_policy_change(
+        session_store,
+        _payload_optional_str(payload, "change_id"),
+        statuses={"PENDING_APPROVAL", "APPROVED"},
+    )
+    if change is None:
+        return None
+    approved = approve_operations_governance_policy_change(
+        change,
+        approver=str(payload.get("approved_by") or actor),
+    )
+    if approved.status == "APPROVED" and _payload_bool(payload, "apply", True):
+        approved = apply_operations_governance_policy_change(
+            approved,
+            applied_at=_payload_optional_str(payload, "applied_at"),
+        )
+    session_store.record_operations_governance_policy_change(operations_governance_policy_change_to_dict(approved))
+    return approved
+
+
+def _rollback_governance_policy_change(
+    session_store: SessionStore,
+    payload: dict[str, object],
+    actor: str,
+):
+    change = _find_governance_policy_change(
+        session_store,
+        _payload_optional_str(payload, "change_id"),
+        statuses={"APPLIED", "ROLLED_BACK"},
+    )
+    if change is None:
+        return None
+    rollback = rollback_operations_governance_policy_change(
+        change,
+        requested_by=str(payload.get("requested_by") or actor),
+        requested_at=_payload_optional_str(payload, "requested_at"),
+        reason=_payload_optional_str(payload, "reason"),
+    )
+    session_store.record_operations_governance_policy_change(operations_governance_policy_change_to_dict(rollback))
+    return rollback
+
+
+def _find_governance_policy_change(
+    session_store: SessionStore,
+    change_id: str | None,
+    statuses: set[str] | None = None,
+):
+    for item in session_store.list_operations_governance_policy_changes(100):
+        change = operations_governance_policy_change_from_dict(item)
+        if change_id and change.change_id != change_id:
+            continue
+        if statuses and change.status not in statuses:
+            continue
+        return change
+    return None
+
+
+def _current_governance_policy(session_store: SessionStore) -> RecoveryGovernancePolicy:
+    for item in session_store.list_operations_governance_policy_changes(100):
+        change = operations_governance_policy_change_from_dict(item)
+        if change.status in {"APPLIED", "ROLLED_BACK"}:
+            return recovery_governance_policy_from_dict(change.after)
+    return recovery_governance_policy_from_json(IntegrationSettings.from_env().recovery_governance_policy_json)
+
+
+def _payload_governance_policy(payload: dict[str, object], key: str) -> RecoveryGovernancePolicy | None:
+    value = payload.get(key)
+    if isinstance(value, dict):
+        return recovery_governance_policy_from_dict(value)
+    if isinstance(value, str) and value.strip():
+        return recovery_governance_policy_from_json(value)
+    return None
+
+
+def _payload_int(payload: dict[str, object], key: str, default: int) -> int:
+    value = payload.get(key)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _payload_optional_str(payload: dict[str, object], key: str) -> str | None:
+    value = payload.get(key)
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _payload_bool(payload: dict[str, object], key: str, default: bool) -> bool:
+    value = payload.get(key)
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
+
+
+def _execute_pending_replay_jobs(
+    session_store: SessionStore,
+    limit: int,
+    patches: dict[str, dict[str, Any]] | None = None,
+) -> list[OnCallWebhookReplayJobExecution]:
+    if limit <= 0:
+        return []
+    events = [
+        oncall_webhook_event_from_dict(item)
+        for item in session_store.list_oncall_webhook_events(limit)
+    ]
+    jobs = [
+        oncall_webhook_replay_job_from_dict(item)
+        for item in session_store.list_oncall_webhook_replay_jobs(limit)
+    ]
+    executions = []
+    for job in jobs:
+        if job.status != "PENDING":
+            continue
+        execution = execute_oncall_webhook_replay_job(job, events, patches=patches)
+        executions.append(execution)
+        session_store.record_oncall_webhook_replay_job(oncall_webhook_replay_job_to_dict(execution.job))
+        for event in execution.replayed_events:
+            session_store.record_oncall_webhook_event(oncall_webhook_event_to_dict(event))
+        for status in execution.statuses:
+            session_store.record_oncall_ticket_status(oncall_ticket_status_to_dict(status))
+    return executions
+
+
 def _save_scheduled_closed_loop_snapshot(
     session_store: SessionStore,
     limit: int,
@@ -3322,25 +3924,7 @@ def _build_operations_schedule_handlers(session_store: SessionStore, args: argpa
         )
 
     def _execute_replay_jobs(_: object) -> dict[str, object]:
-        events = [
-            oncall_webhook_event_from_dict(item)
-            for item in session_store.list_oncall_webhook_events(args.observability_limit)
-        ]
-        jobs = [
-            oncall_webhook_replay_job_from_dict(item)
-            for item in session_store.list_oncall_webhook_replay_jobs(args.observability_limit)
-        ]
-        executions = []
-        for job in jobs:
-            if job.status != "PENDING":
-                continue
-            execution = execute_oncall_webhook_replay_job(job, events)
-            executions.append(execution)
-            session_store.record_oncall_webhook_replay_job(oncall_webhook_replay_job_to_dict(execution.job))
-            for event in execution.replayed_events:
-                session_store.record_oncall_webhook_event(oncall_webhook_event_to_dict(event))
-            for status in execution.statuses:
-                session_store.record_oncall_ticket_status(oncall_ticket_status_to_dict(status))
+        executions = _execute_pending_replay_jobs(session_store, args.observability_limit)
         return {
             "executed_jobs": len(executions),
             "failed_jobs": sum(1 for execution in executions if execution.result.failed),

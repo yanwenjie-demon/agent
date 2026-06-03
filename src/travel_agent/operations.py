@@ -476,6 +476,59 @@ class RecoveryGovernancePolicyAudit:
 
 
 @dataclass(frozen=True)
+class OperationsGovernancePolicyChange:
+    change_id: str
+    status: str
+    policy_type: str
+    requested_by: str
+    requested_at: str
+    before: dict[str, Any]
+    after: dict[str, Any]
+    changes: list[str]
+    approvals: list[str] = field(default_factory=list)
+    applied_at: str | None = None
+    rolled_back_at: str | None = None
+    reason: str | None = None
+
+
+@dataclass(frozen=True)
+class OperationsConsoleActionAudit:
+    audit_id: str
+    action: str
+    actor: str
+    roles: list[str]
+    department: str | None
+    status: str
+    requested_at: str
+    completed_at: str
+    authorization: dict[str, Any]
+    request_summary: dict[str, Any]
+    result_summary: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class OperationsAuditTimelineEvent:
+    event_id: str
+    event_type: str
+    occurred_at: str
+    actor: str | None
+    action: str | None
+    status: str
+    summary: str
+    refs: dict[str, Any] = field(default_factory=dict)
+    payload: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class OperationsAuditTimeline:
+    generated_at: str
+    events: list[OperationsAuditTimelineEvent]
+    filters: dict[str, str]
+    total_events: int
+    summary: str
+
+
+@dataclass(frozen=True)
 class OnCallWebhookEvent:
     event_id: str
     ticket_id: str | None
@@ -1694,6 +1747,452 @@ def render_recovery_governance_policy_audit(audit: RecoveryGovernancePolicyAudit
     ]
     _append_list_section(lines, "changes", audit.changes)
     return "\n".join(lines)
+
+
+def build_operations_governance_policy_change(
+    previous: RecoveryGovernancePolicy,
+    current: RecoveryGovernancePolicy,
+    requested_by: str,
+    requested_at: str | None = None,
+    policy_type: str = "recovery_governance",
+    reason: str | None = None,
+) -> OperationsGovernancePolicyChange:
+    requested_at = requested_at or datetime.now(timezone.utc).isoformat()
+    before = recovery_governance_policy_to_dict(previous)
+    after = recovery_governance_policy_to_dict(current)
+    changes = _dict_changes(before, after)
+    return OperationsGovernancePolicyChange(
+        change_id=_stable_id(
+            "OGP",
+            policy_type,
+            requested_by,
+            requested_at,
+            json.dumps(before, sort_keys=True),
+            json.dumps(after, sort_keys=True),
+        ),
+        status="PENDING_APPROVAL",
+        policy_type=policy_type,
+        requested_by=requested_by,
+        requested_at=requested_at,
+        before=before,
+        after=after,
+        changes=changes,
+        approvals=[],
+        reason=reason,
+    )
+
+
+def approve_operations_governance_policy_change(
+    change: OperationsGovernancePolicyChange,
+    approver: str,
+) -> OperationsGovernancePolicyChange:
+    approvals = list(change.approvals)
+    if approver and approver not in approvals:
+        approvals.append(approver)
+    status = "APPROVED" if len({item for item in approvals if item and item != change.requested_by}) >= 1 else change.status
+    return replace(change, status=status, approvals=approvals)
+
+
+def apply_operations_governance_policy_change(
+    change: OperationsGovernancePolicyChange,
+    applied_at: str | None = None,
+) -> OperationsGovernancePolicyChange:
+    applied_at = applied_at or datetime.now(timezone.utc).isoformat()
+    return replace(change, status="APPLIED", applied_at=applied_at)
+
+
+def rollback_operations_governance_policy_change(
+    change: OperationsGovernancePolicyChange,
+    requested_by: str,
+    requested_at: str | None = None,
+    reason: str | None = None,
+) -> OperationsGovernancePolicyChange:
+    requested_at = requested_at or datetime.now(timezone.utc).isoformat()
+    rollback = OperationsGovernancePolicyChange(
+        change_id=_stable_id("OGR", change.change_id, requested_by, requested_at),
+        status="ROLLED_BACK",
+        policy_type=change.policy_type,
+        requested_by=requested_by,
+        requested_at=requested_at,
+        before=dict(change.after),
+        after=dict(change.before),
+        changes=_dict_changes(change.after, change.before),
+        approvals=[requested_by] if requested_by else [],
+        rolled_back_at=requested_at,
+        reason=reason or f"rollback {change.change_id}",
+    )
+    return rollback
+
+
+def operations_governance_policy_change_to_dict(change: OperationsGovernancePolicyChange) -> dict[str, Any]:
+    return {
+        "change_id": change.change_id,
+        "status": change.status,
+        "policy_type": change.policy_type,
+        "requested_by": change.requested_by,
+        "requested_at": change.requested_at,
+        "before": change.before,
+        "after": change.after,
+        "changes": change.changes,
+        "approvals": change.approvals,
+        "applied_at": change.applied_at,
+        "rolled_back_at": change.rolled_back_at,
+        "reason": change.reason,
+    }
+
+
+def operations_governance_policy_change_from_dict(payload: dict[str, Any]) -> OperationsGovernancePolicyChange:
+    return OperationsGovernancePolicyChange(
+        change_id=str(payload["change_id"]),
+        status=str(payload.get("status") or "PENDING_APPROVAL"),
+        policy_type=str(payload.get("policy_type") or "recovery_governance"),
+        requested_by=str(payload.get("requested_by") or "operator"),
+        requested_at=str(payload.get("requested_at") or ""),
+        before=dict(payload.get("before") or {}),
+        after=dict(payload.get("after") or {}),
+        changes=[str(item) for item in payload.get("changes") or []],
+        approvals=[str(item) for item in payload.get("approvals") or []],
+        applied_at=str(payload["applied_at"]) if payload.get("applied_at") is not None else None,
+        rolled_back_at=str(payload["rolled_back_at"]) if payload.get("rolled_back_at") is not None else None,
+        reason=str(payload["reason"]) if payload.get("reason") is not None else None,
+    )
+
+
+def render_operations_governance_policy_changes(changes: list[OperationsGovernancePolicyChange]) -> str:
+    lines = ["Operations governance policy changes:"]
+    if not changes:
+        lines.append("- none")
+        return "\n".join(lines)
+    for change in changes:
+        lines.append(
+            f"- {change.change_id}: status={change.status} type={change.policy_type} "
+            f"requested_by={change.requested_by} approvals={','.join(change.approvals) or '-'}"
+        )
+        for item in change.changes:
+            lines.append(f"  - {item}")
+    return "\n".join(lines)
+
+
+def build_operations_console_action_audit(
+    action: str,
+    actor: str,
+    roles: list[str] | set[str] | tuple[str, ...] | None,
+    department: str | None,
+    authorization: dict[str, Any],
+    request_payload: dict[str, Any],
+    result_body: dict[str, Any],
+    requested_at: str | None = None,
+    completed_at: str | None = None,
+) -> OperationsConsoleActionAudit:
+    requested_at = requested_at or datetime.now(timezone.utc).isoformat()
+    completed_at = completed_at or datetime.now(timezone.utc).isoformat()
+    status = "SUCCESS" if bool(result_body.get("ok")) else "FAILED"
+    if authorization and not bool(authorization.get("allowed", True)):
+        status = "DENIED"
+    request_summary = _summarize_operations_console_action_request(request_payload)
+    result_summary = _summarize_operations_console_action_result(result_body)
+    return OperationsConsoleActionAudit(
+        audit_id=_stable_id("OCA", action, actor, requested_at, completed_at, json.dumps(result_summary, sort_keys=True)),
+        action=action,
+        actor=actor,
+        roles=sorted({str(role) for role in roles or [] if str(role).strip()}),
+        department=department,
+        status=status,
+        requested_at=requested_at,
+        completed_at=completed_at,
+        authorization=dict(authorization or {}),
+        request_summary=request_summary,
+        result_summary=result_summary,
+    )
+
+
+def operations_console_action_audit_to_dict(audit: OperationsConsoleActionAudit) -> dict[str, Any]:
+    return {
+        "audit_id": audit.audit_id,
+        "action": audit.action,
+        "actor": audit.actor,
+        "roles": audit.roles,
+        "department": audit.department,
+        "status": audit.status,
+        "requested_at": audit.requested_at,
+        "completed_at": audit.completed_at,
+        "authorization": audit.authorization,
+        "request_summary": audit.request_summary,
+        "result_summary": audit.result_summary,
+    }
+
+
+def operations_console_action_audit_from_dict(payload: dict[str, Any]) -> OperationsConsoleActionAudit:
+    return OperationsConsoleActionAudit(
+        audit_id=str(payload["audit_id"]),
+        action=str(payload.get("action") or ""),
+        actor=str(payload.get("actor") or ""),
+        roles=[str(item) for item in payload.get("roles") or []],
+        department=str(payload["department"]) if payload.get("department") is not None else None,
+        status=str(payload.get("status") or "UNKNOWN"),
+        requested_at=str(payload.get("requested_at") or ""),
+        completed_at=str(payload.get("completed_at") or ""),
+        authorization=dict(payload.get("authorization") or {}),
+        request_summary=dict(payload.get("request_summary") or {}),
+        result_summary=dict(payload.get("result_summary") or {}),
+    )
+
+
+def render_operations_console_action_audits(audits: list[OperationsConsoleActionAudit]) -> str:
+    lines = ["Operations console action audits:"]
+    if not audits:
+        lines.append("- none")
+        return "\n".join(lines)
+    for audit in audits:
+        lines.append(
+            f"- {audit.audit_id}: action={audit.action} actor={audit.actor} "
+            f"status={audit.status} completed_at={audit.completed_at}"
+        )
+    return "\n".join(lines)
+
+
+def build_operations_audit_timeline(
+    action_audits: list[OperationsConsoleActionAudit] | None = None,
+    governance_changes: list[OperationsGovernancePolicyChange] | None = None,
+    replay_jobs: list[OnCallWebhookReplayJob] | None = None,
+    scheduler_runs: list[OperationsSchedulerRunReport] | None = None,
+    limit: int = 20,
+    event_type: str | None = None,
+    actor: str | None = None,
+    action: str | None = None,
+    status: str | None = None,
+    generated_at: str | None = None,
+) -> OperationsAuditTimeline:
+    generated_at = generated_at or datetime.now(timezone.utc).isoformat()
+    filters = {
+        key: value
+        for key, value in {
+            "event_type": event_type,
+            "actor": actor,
+            "action": action,
+            "status": status,
+        }.items()
+        if value
+    }
+    events: list[OperationsAuditTimelineEvent] = []
+    for audit in action_audits or []:
+        events.append(_timeline_event_from_console_action_audit(audit))
+    for change in governance_changes or []:
+        events.append(_timeline_event_from_governance_change(change))
+    for job in replay_jobs or []:
+        events.append(_timeline_event_from_replay_job(job))
+    for run in scheduler_runs or []:
+        events.append(_timeline_event_from_scheduler_run(run))
+    filtered = [
+        item
+        for item in events
+        if _timeline_event_matches(item, event_type=event_type, actor=actor, action=action, status=status)
+    ]
+    filtered.sort(key=lambda item: (_timestamp_sort_key(item.occurred_at), item.event_id), reverse=True)
+    limited = filtered[: max(0, limit)]
+    summary = f"audit_timeline_events={len(limited)}/{len(filtered)} total={len(events)}"
+    return OperationsAuditTimeline(
+        generated_at=generated_at,
+        events=limited,
+        filters=filters,
+        total_events=len(filtered),
+        summary=summary,
+    )
+
+
+def operations_audit_timeline_event_to_dict(event: OperationsAuditTimelineEvent) -> dict[str, Any]:
+    return {
+        "event_id": event.event_id,
+        "event_type": event.event_type,
+        "occurred_at": event.occurred_at,
+        "actor": event.actor,
+        "action": event.action,
+        "status": event.status,
+        "summary": event.summary,
+        "refs": event.refs,
+        "payload": event.payload,
+    }
+
+
+def operations_audit_timeline_to_dict(timeline: OperationsAuditTimeline) -> dict[str, Any]:
+    return {
+        "generated_at": timeline.generated_at,
+        "events": [operations_audit_timeline_event_to_dict(event) for event in timeline.events],
+        "filters": timeline.filters,
+        "total_events": timeline.total_events,
+        "summary": timeline.summary,
+    }
+
+
+def render_operations_audit_timeline_json(timeline: OperationsAuditTimeline) -> str:
+    return json.dumps({"operations_audit_timeline": operations_audit_timeline_to_dict(timeline)}, ensure_ascii=False)
+
+
+def render_operations_audit_timeline(timeline: OperationsAuditTimeline) -> str:
+    lines = [
+        "Operations audit timeline:",
+        f"- generated_at: {timeline.generated_at}",
+        f"- total_events: {timeline.total_events}",
+        f"- summary: {timeline.summary}",
+    ]
+    if timeline.filters:
+        lines.append(f"- filters: {timeline.filters}")
+    if not timeline.events:
+        lines.append("- events: none")
+        return "\n".join(lines)
+    lines.append("- events:")
+    for event in timeline.events:
+        lines.append(
+            f"  - {event.occurred_at} {event.event_type} status={event.status} "
+            f"actor={event.actor or '-'} action={event.action or '-'}"
+        )
+        lines.append(f"    {event.summary}")
+    return "\n".join(lines)
+
+
+def _timeline_event_from_console_action_audit(audit: OperationsConsoleActionAudit) -> OperationsAuditTimelineEvent:
+    result = audit.result_summary
+    return OperationsAuditTimelineEvent(
+        event_id=audit.audit_id,
+        event_type="console_action",
+        occurred_at=audit.completed_at,
+        actor=audit.actor,
+        action=audit.action,
+        status=audit.status,
+        summary=f"{audit.action} {audit.status.lower()}",
+        refs={
+            "audit_id": audit.audit_id,
+            "change_id": result.get("change_id"),
+            "job_id": result.get("job_id"),
+            "scheduler_run_id": result.get("scheduler_run_id"),
+        },
+        payload={
+            "request_summary": audit.request_summary,
+            "result_summary": audit.result_summary,
+            "authorization": audit.authorization,
+        },
+    )
+
+
+def _timeline_event_from_governance_change(change: OperationsGovernancePolicyChange) -> OperationsAuditTimelineEvent:
+    return OperationsAuditTimelineEvent(
+        event_id=change.change_id,
+        event_type="governance_policy_change",
+        occurred_at=change.applied_at or change.rolled_back_at or change.requested_at,
+        actor=change.requested_by,
+        action="update_governance_policy",
+        status=change.status,
+        summary=f"{change.policy_type} {change.status.lower()} with {len(change.changes)} change(s)",
+        refs={"change_id": change.change_id},
+        payload=operations_governance_policy_change_to_dict(change),
+    )
+
+
+def _timeline_event_from_replay_job(job: OnCallWebhookReplayJob) -> OperationsAuditTimelineEvent:
+    return OperationsAuditTimelineEvent(
+        event_id=job.job_id,
+        event_type="replay_job",
+        occurred_at=str(job.audit.get("executed_at") or job.created_at),
+        actor=job.requested_by,
+        action="execute_replay_job" if job.batch_result is not None else "create_replay_job",
+        status=job.status,
+        summary=f"replay job {job.status.lower()} for {len(job.event_ids)} event(s)",
+        refs={"job_id": job.job_id, "event_ids": job.event_ids},
+        payload=oncall_webhook_replay_job_to_dict(job),
+    )
+
+
+def _timeline_event_from_scheduler_run(run: OperationsSchedulerRunReport) -> OperationsAuditTimelineEvent:
+    return OperationsAuditTimelineEvent(
+        event_id=run.run_id,
+        event_type="scheduler_run",
+        occurred_at=run.finished_at or run.started_at,
+        actor=None,
+        action="run_operations_schedule",
+        status="FAILED" if run.failed_count else "SUCCESS",
+        summary=run.summary,
+        refs={"run_id": run.run_id},
+        payload=operations_scheduler_run_report_to_dict(run),
+    )
+
+
+def _timeline_event_matches(
+    event: OperationsAuditTimelineEvent,
+    event_type: str | None = None,
+    actor: str | None = None,
+    action: str | None = None,
+    status: str | None = None,
+) -> bool:
+    if event_type and event.event_type != event_type:
+        return False
+    if actor and event.actor != actor:
+        return False
+    if action and event.action != action:
+        return False
+    if status and event.status != status:
+        return False
+    return True
+
+
+def _summarize_operations_console_action_request(payload: dict[str, Any]) -> dict[str, Any]:
+    summary: dict[str, Any] = {}
+    for key in (
+        "action",
+        "limit",
+        "requested_by",
+        "patch_template_id",
+        "persisted",
+        "owner",
+        "endpoint",
+        "server_url",
+        "change_id",
+        "approved_by",
+        "reason",
+    ):
+        if key in payload:
+            summary[key] = payload.get(key)
+    for key in ("before", "after", "policy", "proposed_policy", "patch", "patches", "token"):
+        if key in payload:
+            value = payload.get(key)
+            summary[key] = {
+                "present": True,
+                "type": type(value).__name__,
+                "keys": sorted(str(item) for item in value) if isinstance(value, dict) else None,
+            }
+    return summary
+
+
+def _summarize_operations_console_action_result(body: dict[str, Any]) -> dict[str, Any]:
+    summary: dict[str, Any] = {
+        "ok": bool(body.get("ok")),
+        "action": body.get("action"),
+    }
+    if body.get("error") is not None:
+        summary["error"] = body.get("error")
+    if isinstance(body.get("job"), dict):
+        summary["job_id"] = body["job"].get("job_id")
+        summary["job_status"] = body["job"].get("status")
+    if isinstance(body.get("executions"), list):
+        summary["execution_count"] = len(body["executions"])
+    if isinstance(body.get("scheduler_run"), dict):
+        summary["scheduler_run_id"] = body["scheduler_run"].get("run_id")
+        summary["scheduler_failed_count"] = body["scheduler_run"].get("failed_count")
+    if isinstance(body.get("publish_result"), dict):
+        summary["publish_endpoint"] = body["publish_result"].get("endpoint")
+        summary["publish_failed"] = body["publish_result"].get("failed")
+    if isinstance(body.get("change"), dict):
+        summary["change_id"] = body["change"].get("change_id")
+        summary["change_status"] = body["change"].get("status")
+    return summary
+
+
+def _dict_changes(before: dict[str, Any], after: dict[str, Any]) -> list[str]:
+    changes = [
+        f"{key}: {before.get(key)!r} -> {after.get(key)!r}"
+        for key in sorted(set(before) | set(after))
+        if before.get(key) != after.get(key)
+    ]
+    return changes or ["no policy changes"]
 
 
 def evaluate_recovery_governance_policy(

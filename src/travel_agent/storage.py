@@ -39,7 +39,7 @@ from .models import (
 )
 
 
-SQLITE_SCHEMA_VERSION = 9
+SQLITE_SCHEMA_VERSION = 11
 
 
 class StoreConcurrencyError(RuntimeError):
@@ -161,6 +161,18 @@ class SessionStore(Protocol):
     def list_operations_scheduler_runs(self, limit: int = 20) -> list[dict[str, Any]]:
         ...
 
+    def record_operations_governance_policy_change(self, change: dict[str, Any]) -> None:
+        ...
+
+    def list_operations_governance_policy_changes(self, limit: int = 20) -> list[dict[str, Any]]:
+        ...
+
+    def record_operations_console_action_audit(self, audit: dict[str, Any]) -> None:
+        ...
+
+    def list_operations_console_action_audits(self, limit: int = 20) -> list[dict[str, Any]]:
+        ...
+
 
 class InMemorySessionStore:
     def __init__(self) -> None:
@@ -176,6 +188,8 @@ class InMemorySessionStore:
         self._operations_knowledge_entries: list[dict[str, Any]] = []
         self._operations_scheduled_tasks: list[dict[str, Any]] = []
         self._operations_scheduler_runs: list[dict[str, Any]] = []
+        self._operations_governance_policy_changes: list[dict[str, Any]] = []
+        self._operations_console_action_audits: list[dict[str, Any]] = []
 
     def save(self, context: TravelContext) -> None:
         self._sessions[context.session_id] = context
@@ -339,6 +353,28 @@ class InMemorySessionStore:
 
     def list_operations_scheduler_runs(self, limit: int = 20) -> list[dict[str, Any]]:
         return list(reversed(self._operations_scheduler_runs[-limit:]))
+
+    def record_operations_governance_policy_change(self, change: dict[str, Any]) -> None:
+        self._operations_governance_policy_changes = [
+            existing
+            for existing in self._operations_governance_policy_changes
+            if existing.get("change_id") != change.get("change_id")
+        ]
+        self._operations_governance_policy_changes.append(dict(change))
+
+    def list_operations_governance_policy_changes(self, limit: int = 20) -> list[dict[str, Any]]:
+        return list(reversed(self._operations_governance_policy_changes[-limit:]))
+
+    def record_operations_console_action_audit(self, audit: dict[str, Any]) -> None:
+        self._operations_console_action_audits = [
+            existing
+            for existing in self._operations_console_action_audits
+            if existing.get("audit_id") != audit.get("audit_id")
+        ]
+        self._operations_console_action_audits.append(dict(audit))
+
+    def list_operations_console_action_audits(self, limit: int = 20) -> list[dict[str, Any]]:
+        return list(reversed(self._operations_console_action_audits[-limit:]))
 
 
 class SQLiteSessionStore:
@@ -990,6 +1026,102 @@ class SQLiteSessionStore:
             ).fetchall()
         return [json.loads(row[0]) for row in rows]
 
+    def record_operations_governance_policy_change(self, change: dict[str, Any]) -> None:
+        change_id = str(change.get("change_id") or "")
+        if not change_id:
+            raise ValueError("Operations governance policy change requires change_id.")
+        payload = json.dumps(change, ensure_ascii=False, default=_json_default)
+        with closing(self._connect()) as connection:
+            connection.execute(
+                """
+                INSERT INTO operations_governance_policy_changes(
+                    change_id,
+                    status,
+                    policy_type,
+                    requested_by,
+                    requested_at,
+                    payload
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(change_id) DO UPDATE SET
+                    status = excluded.status,
+                    policy_type = excluded.policy_type,
+                    requested_by = excluded.requested_by,
+                    requested_at = excluded.requested_at,
+                    payload = excluded.payload
+                """,
+                (
+                    change_id,
+                    str(change.get("status") or ""),
+                    str(change.get("policy_type") or ""),
+                    str(change.get("requested_by") or ""),
+                    str(change.get("requested_at") or ""),
+                    payload,
+                ),
+            )
+            connection.commit()
+
+    def list_operations_governance_policy_changes(self, limit: int = 20) -> list[dict[str, Any]]:
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                """
+                SELECT payload
+                FROM operations_governance_policy_changes
+                ORDER BY requested_at DESC, rowid DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [json.loads(row[0]) for row in rows]
+
+    def record_operations_console_action_audit(self, audit: dict[str, Any]) -> None:
+        audit_id = str(audit.get("audit_id") or "")
+        if not audit_id:
+            raise ValueError("Operations console action audit requires audit_id.")
+        payload = json.dumps(audit, ensure_ascii=False, default=_json_default)
+        with closing(self._connect()) as connection:
+            connection.execute(
+                """
+                INSERT INTO operations_console_action_audits(
+                    audit_id,
+                    action,
+                    actor,
+                    status,
+                    completed_at,
+                    payload
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(audit_id) DO UPDATE SET
+                    action = excluded.action,
+                    actor = excluded.actor,
+                    status = excluded.status,
+                    completed_at = excluded.completed_at,
+                    payload = excluded.payload
+                """,
+                (
+                    audit_id,
+                    str(audit.get("action") or ""),
+                    str(audit.get("actor") or ""),
+                    str(audit.get("status") or ""),
+                    str(audit.get("completed_at") or ""),
+                    payload,
+                ),
+            )
+            connection.commit()
+
+    def list_operations_console_action_audits(self, limit: int = 20) -> list[dict[str, Any]]:
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                """
+                SELECT payload
+                FROM operations_console_action_audits
+                ORDER BY completed_at DESC, rowid DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [json.loads(row[0]) for row in rows]
+
     def health_check(self) -> StorageHealth:
         details: dict[str, str] = {}
         try:
@@ -1027,6 +1159,12 @@ class SQLiteSessionStore:
                 scheduler_run_count = int(
                     connection.execute("SELECT COUNT(*) FROM operations_scheduler_runs").fetchone()[0]
                 )
+                governance_policy_change_count = int(
+                    connection.execute("SELECT COUNT(*) FROM operations_governance_policy_changes").fetchone()[0]
+                )
+                console_action_audit_count = int(
+                    connection.execute("SELECT COUNT(*) FROM operations_console_action_audits").fetchone()[0]
+                )
                 integrity = str(connection.execute("PRAGMA integrity_check").fetchone()[0])
                 journal_mode = str(connection.execute("PRAGMA journal_mode").fetchone()[0])
             details["integrity_check"] = integrity
@@ -1041,6 +1179,8 @@ class SQLiteSessionStore:
             details["operations_knowledge_entries"] = str(knowledge_entry_count)
             details["operations_scheduled_tasks"] = str(scheduled_task_count)
             details["operations_scheduler_runs"] = str(scheduler_run_count)
+            details["operations_governance_policy_changes"] = str(governance_policy_change_count)
+            details["operations_console_action_audits"] = str(console_action_audit_count)
             return StorageHealth(
                 backend="sqlite",
                 ok=integrity.lower() == "ok" and schema_version >= SQLITE_SCHEMA_VERSION,
@@ -1222,6 +1362,30 @@ class SQLiteSessionStore:
                 """
             )
             connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS operations_governance_policy_changes (
+                    change_id TEXT PRIMARY KEY,
+                    status TEXT NOT NULL,
+                    policy_type TEXT NOT NULL,
+                    requested_by TEXT NOT NULL,
+                    requested_at TEXT NOT NULL,
+                    payload TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS operations_console_action_audits (
+                    audit_id TEXT PRIMARY KEY,
+                    action TEXT NOT NULL,
+                    actor TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    completed_at TEXT NOT NULL,
+                    payload TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_travel_sessions_state_updated ON travel_sessions(state, updated_at)"
             )
             connection.execute(
@@ -1259,6 +1423,12 @@ class SQLiteSessionStore:
             )
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_operations_scheduler_runs_finished ON operations_scheduler_runs(finished_at, started_at)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_operations_governance_policy_changes_requested ON operations_governance_policy_changes(requested_at, status)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_operations_console_action_audits_completed ON operations_console_action_audits(completed_at, action, actor)"
             )
             connection.execute(
                 """
@@ -1520,6 +1690,22 @@ class HttpSessionStore:
     def list_operations_scheduler_runs(self, limit: int = 20) -> list[dict[str, Any]]:
         response = self._post("/operations/scheduler-runs/list", {"limit": limit})
         records = response.get("runs") or response.get("records") or response.get("items") or []
+        return [dict(item) for item in records]
+
+    def record_operations_governance_policy_change(self, change: dict[str, Any]) -> None:
+        self._post("/operations/governance-policy-changes/record", {"change": change})
+
+    def list_operations_governance_policy_changes(self, limit: int = 20) -> list[dict[str, Any]]:
+        response = self._post("/operations/governance-policy-changes/list", {"limit": limit})
+        records = response.get("changes") or response.get("records") or response.get("items") or []
+        return [dict(item) for item in records]
+
+    def record_operations_console_action_audit(self, audit: dict[str, Any]) -> None:
+        self._post("/operations/console-action-audits/record", {"audit": audit})
+
+    def list_operations_console_action_audits(self, limit: int = 20) -> list[dict[str, Any]]:
+        response = self._post("/operations/console-action-audits/list", {"limit": limit})
+        records = response.get("audits") or response.get("records") or response.get("items") or []
         return [dict(item) for item in records]
 
     def health_check(self) -> StorageHealth:
