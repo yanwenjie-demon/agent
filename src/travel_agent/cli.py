@@ -20,6 +20,7 @@ from .observability import build_otlp_payloads, export_otlp_http
 from .operations import (
     OnCallWebhookReplayBatchResult,
     OnCallWebhookReplayJobExecution,
+    OnCallTicketStatus,
     OperationsClosedLoopSchemaPublishResult,
     advance_operations_scheduled_task,
     authorize_operations_action,
@@ -63,6 +64,7 @@ from .operations import (
     evaluate_operations_drill_gate,
     evaluate_operations_trend_alerts,
     evaluate_recovery_approval_sla,
+    execute_operations_compensation_tasks,
     execute_oncall_webhook_replay_job,
     export_recovery_approval_receipt_http,
     export_operations_closed_loop_report_http,
@@ -148,6 +150,7 @@ from .operations import (
     render_operations_audit_sink_deliveries_json,
     render_operations_audit_sink_replay_report_json,
     render_operations_compensation_task_board_json,
+    render_operations_compensation_task_execution_report_json,
     render_operations_scheduled_tasks,
     render_operations_scheduler_health_report,
     render_operations_scheduler_run_report,
@@ -2897,6 +2900,41 @@ def build_operations_compensation_tasks_json(
     return render_operations_compensation_task_board_json(board)
 
 
+def execute_operations_compensation_tasks_json(
+    session_store: SessionStore,
+    limit: int = 20,
+    oncall_endpoint: str | None = None,
+    oncall_token: str | None = None,
+) -> str:
+    board_payload = json.loads(build_operations_compensation_tasks_json(session_store, max(100, limit * 2)))
+    tasks = [
+        operations_compensation_task_from_dict(item)
+        for item in board_payload["operations_compensation_tasks"]["tasks"]
+    ]
+    report = execute_operations_compensation_tasks(
+        tasks,
+        limit=limit,
+        oncall_endpoint=oncall_endpoint,
+        oncall_token=oncall_token,
+        actor="operations_console",
+    )
+    for execution in report.executions:
+        session_store.record_operations_compensation_task(operations_compensation_task_to_dict(execution.task))
+        if execution.ticket_result is not None and execution.ticket_result.ticket_id:
+            session_store.record_oncall_ticket_status(
+                oncall_ticket_status_to_dict(
+                    OnCallTicketStatus(
+                        ticket_id=execution.ticket_result.ticket_id,
+                        status="OPEN",
+                        assignee=None,
+                        updated_at=execution.executed_at,
+                        detail=execution.ticket_result.detail,
+                    )
+                )
+            )
+    return render_operations_compensation_task_execution_report_json(report)
+
+
 def retry_operations_audit_sink_deliveries_json(
     session_store: SessionStore,
     audit_sink: AuditSink,
@@ -3004,6 +3042,7 @@ def run_operations_console_action(
         "rollback_governance_policy_change": "update_governance_policy",
         "retry_audit_sink_deliveries": "retry_audit_sink_delivery",
         "close_compensation_task": "manage_compensation_task",
+        "execute_compensation_tasks": "manage_compensation_task",
     }.get(action)
     if permission_action is None:
         return _finalize_operations_console_action(
@@ -3159,7 +3198,7 @@ def run_operations_console_action(
                 "authorization": operations_action_authorization_to_dict(authorization),
                 "audit_sink_replay": report,
             }
-    else:
+    elif action == "close_compensation_task":
         task_id = str(payload.get("task_id") or "")
         if not task_id:
             body = {
@@ -3196,6 +3235,23 @@ def run_operations_console_action(
                     "authorization": operations_action_authorization_to_dict(authorization),
                     "task": operations_compensation_task_to_dict(closed),
                 }
+    else:
+        endpoint = payload.get("endpoint") or payload.get("oncall_endpoint")
+        execution_payload = json.loads(
+            execute_operations_compensation_tasks_json(
+                session_store,
+                limit=action_limit,
+                oncall_endpoint=str(endpoint) if endpoint is not None else None,
+                oncall_token=str(payload["token"]) if payload.get("token") is not None else None,
+            )
+        )
+        report = execution_payload["operations_compensation_task_execution"]
+        body = {
+            "ok": int(report.get("failed") or 0) == 0,
+            "action": action,
+            "authorization": operations_action_authorization_to_dict(authorization),
+            "compensation_task_execution": report,
+        }
     return _finalize_operations_console_action(
         session_store,
         body,

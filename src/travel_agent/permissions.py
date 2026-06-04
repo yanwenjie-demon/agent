@@ -22,6 +22,7 @@ KNOWN_ACTIONS = {
     "update_governance_policy",
     "retry_audit_sink_delivery",
     "manage_compensation_task",
+    "execute_compensation_task",
 }
 
 

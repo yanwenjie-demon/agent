@@ -585,6 +585,29 @@ class OperationsCompensationTaskBoard:
 
 
 @dataclass(frozen=True)
+class OperationsCompensationTaskExecution:
+    execution_id: str
+    task_id: str
+    action: str
+    status: str
+    detail: str
+    executed_at: str
+    task: OperationsCompensationTask
+    ticket_result: OnCallTicketResult | None = None
+
+
+@dataclass(frozen=True)
+class OperationsCompensationTaskExecutionReport:
+    generated_at: str
+    attempted: int
+    succeeded: int
+    failed: int
+    skipped: int
+    executions: list[OperationsCompensationTaskExecution]
+    summary: str
+
+
+@dataclass(frozen=True)
 class OnCallWebhookEvent:
     event_id: str
     ticket_id: str | None
@@ -1567,6 +1590,233 @@ def render_operations_compensation_tasks(tasks: list[OperationsCompensationTask]
 
 def render_operations_compensation_task_board_json(board: OperationsCompensationTaskBoard) -> str:
     return json.dumps({"operations_compensation_tasks": operations_compensation_task_board_to_dict(board)}, ensure_ascii=False)
+
+
+def execute_operations_compensation_tasks(
+    tasks: list[OperationsCompensationTask],
+    limit: int = 20,
+    oncall_endpoint: str | None = None,
+    oncall_token: str | None = None,
+    http_client: Any | None = None,
+    executed_at: str | None = None,
+    actor: str = "operations",
+) -> OperationsCompensationTaskExecutionReport:
+    executed_at = executed_at or datetime.now(timezone.utc).isoformat()
+    selected = [task for task in tasks if task.status in {"OPEN", "ESCALATED"}][: max(0, limit)]
+    executions: list[OperationsCompensationTaskExecution] = []
+    for task in selected:
+        execution = _execute_single_compensation_task(
+            task,
+            oncall_endpoint=oncall_endpoint,
+            oncall_token=oncall_token,
+            http_client=http_client,
+            executed_at=executed_at,
+            actor=actor,
+        )
+        executions.append(execution)
+    succeeded = sum(1 for item in executions if item.status == "SUCCESS")
+    failed = sum(1 for item in executions if item.status == "FAILED")
+    skipped = sum(1 for item in executions if item.status == "SKIPPED")
+    summary = f"compensation_task_executions attempted={len(executions)} succeeded={succeeded} failed={failed} skipped={skipped}"
+    return OperationsCompensationTaskExecutionReport(
+        generated_at=executed_at,
+        attempted=len(executions),
+        succeeded=succeeded,
+        failed=failed,
+        skipped=skipped,
+        executions=executions,
+        summary=summary,
+    )
+
+
+def operations_compensation_task_execution_to_dict(
+    execution: OperationsCompensationTaskExecution,
+) -> dict[str, Any]:
+    return {
+        "execution_id": execution.execution_id,
+        "task_id": execution.task_id,
+        "action": execution.action,
+        "status": execution.status,
+        "detail": execution.detail,
+        "executed_at": execution.executed_at,
+        "task": operations_compensation_task_to_dict(execution.task),
+        "ticket_result": (
+            {
+                "ok": execution.ticket_result.ok,
+                "endpoint": execution.ticket_result.endpoint,
+                "ticket_id": execution.ticket_result.ticket_id,
+                "delivered": execution.ticket_result.delivered,
+                "failed": execution.ticket_result.failed,
+                "detail": execution.ticket_result.detail,
+            }
+            if execution.ticket_result is not None
+            else None
+        ),
+    }
+
+
+def operations_compensation_task_execution_report_to_dict(
+    report: OperationsCompensationTaskExecutionReport,
+) -> dict[str, Any]:
+    return {
+        "generated_at": report.generated_at,
+        "attempted": report.attempted,
+        "succeeded": report.succeeded,
+        "failed": report.failed,
+        "skipped": report.skipped,
+        "executions": [operations_compensation_task_execution_to_dict(item) for item in report.executions],
+        "summary": report.summary,
+    }
+
+
+def render_operations_compensation_task_execution_report_json(
+    report: OperationsCompensationTaskExecutionReport,
+) -> str:
+    return json.dumps(
+        {"operations_compensation_task_execution": operations_compensation_task_execution_report_to_dict(report)},
+        ensure_ascii=False,
+    )
+
+
+def open_compensation_task_ticket_http(
+    task: OperationsCompensationTask,
+    endpoint: str,
+    token: str | None = None,
+    http_client: Any | None = None,
+) -> OnCallTicketResult:
+    from .integrations import JsonHttpClient
+
+    payload = {
+        "source": "travel-agent",
+        "summary": task.title,
+        "task_id": task.task_id,
+        "severity": task.severity,
+        "status": task.status,
+        "owner": task.owner,
+        "source_type": task.source_type,
+        "source_id": task.source_id,
+        "refs": task.refs,
+        "lifecycle": task.lifecycle,
+    }
+    try:
+        client = http_client or JsonHttpClient()
+        response = client.post_json(endpoint, payload, token)
+    except Exception as exc:
+        return OnCallTicketResult(
+            ok=False,
+            endpoint=endpoint,
+            ticket_id=None,
+            delivered=0,
+            failed=1,
+            detail=str(exc),
+        )
+    ticket_id = response.get("ticket_id") or response.get("id") or response.get("incident_id")
+    ok = bool(response.get("ok", True))
+    return OnCallTicketResult(
+        ok=ok,
+        endpoint=endpoint,
+        ticket_id=str(ticket_id) if ticket_id is not None else None,
+        delivered=1 if ok else 0,
+        failed=0 if ok else 1,
+        detail=str(response.get("detail") or "compensation task ticket opened"),
+    )
+
+
+def _execute_single_compensation_task(
+    task: OperationsCompensationTask,
+    oncall_endpoint: str | None,
+    oncall_token: str | None,
+    http_client: Any | None,
+    executed_at: str,
+    actor: str,
+) -> OperationsCompensationTaskExecution:
+    if task.linked_ticket_id:
+        updated = replace(
+            task,
+            status="WAITING_ONCALL",
+            updated_at=executed_at,
+            lifecycle=[
+                *task.lifecycle,
+                {
+                    "status": "WAITING_ONCALL",
+                    "at": executed_at,
+                    "actor": actor,
+                    "detail": f"waiting for ticket {task.linked_ticket_id}",
+                },
+            ],
+        )
+        return OperationsCompensationTaskExecution(
+            execution_id=_stable_id("OCTX", task.task_id, executed_at, "wait"),
+            task_id=task.task_id,
+            action="wait_oncall",
+            status="SUCCESS",
+            detail=f"waiting for ticket {task.linked_ticket_id}",
+            executed_at=executed_at,
+            task=updated,
+        )
+    if not oncall_endpoint:
+        updated = replace(
+            task,
+            status="PENDING_MANUAL",
+            updated_at=executed_at,
+            lifecycle=[
+                *task.lifecycle,
+                {
+                    "status": "PENDING_MANUAL",
+                    "at": executed_at,
+                    "actor": actor,
+                    "detail": "oncall endpoint is not configured",
+                },
+            ],
+        )
+        return OperationsCompensationTaskExecution(
+            execution_id=_stable_id("OCTX", task.task_id, executed_at, "manual"),
+            task_id=task.task_id,
+            action="mark_pending_manual",
+            status="SKIPPED",
+            detail="oncall endpoint is not configured",
+            executed_at=executed_at,
+            task=updated,
+        )
+    ticket = open_compensation_task_ticket_http(task, oncall_endpoint, token=oncall_token, http_client=http_client)
+    next_status = "WAITING_ONCALL" if ticket.ok and ticket.ticket_id else "ESCALATED"
+    updated = replace(
+        task,
+        status=next_status,
+        updated_at=executed_at,
+        linked_ticket_id=ticket.ticket_id or task.linked_ticket_id,
+        lifecycle=[
+            *task.lifecycle,
+            {
+                "status": next_status,
+                "at": executed_at,
+                "actor": actor,
+                "detail": ticket.detail,
+                "ticket_id": ticket.ticket_id,
+            },
+        ],
+        payload={
+            **task.payload,
+            "ticket_result": {
+                "ok": ticket.ok,
+                "endpoint": ticket.endpoint,
+                "ticket_id": ticket.ticket_id,
+                "delivered": ticket.delivered,
+                "failed": ticket.failed,
+                "detail": ticket.detail,
+            },
+        },
+    )
+    return OperationsCompensationTaskExecution(
+        execution_id=_stable_id("OCTX", task.task_id, executed_at, "ticket", ticket.ticket_id or ticket.detail),
+        task_id=task.task_id,
+        action="open_oncall_ticket",
+        status="SUCCESS" if ticket.ok else "FAILED",
+        detail=ticket.detail,
+        executed_at=executed_at,
+        task=updated,
+        ticket_result=ticket,
+    )
 
 
 def _compensation_tasks_from_session(context: TravelContext, generated_at: str) -> list[OperationsCompensationTask]:

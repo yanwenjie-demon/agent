@@ -96,6 +96,7 @@ from travel_agent.operations import (
     close_operations_compensation_task,
     evaluate_operations_action_sla,
     evaluate_operations_closed_loop_quality,
+    execute_operations_compensation_tasks,
     execute_oncall_webhook_replay_job,
     build_operations_runbook,
     evaluate_operations_drill_gate,
@@ -212,6 +213,7 @@ from travel_agent.operations import (
     operations_compensation_task_to_dict,
     render_operations_compensation_tasks,
     render_operations_compensation_task_board_json,
+    render_operations_compensation_task_execution_report_json,
     render_recovery_approval_export_result,
     render_recovery_strategy_metrics_prometheus,
     render_recovery_strategy_gate_result,
@@ -507,13 +509,60 @@ class MultiAgentStructureTest(unittest.TestCase):
             actor="ops",
         )
         reloaded = operations_compensation_task_from_dict(operations_compensation_task_to_dict(closed))
+        execution_report = execute_operations_compensation_tasks(
+            [action_task],
+            limit=1,
+            executed_at="2026-05-23T02:00:00+00:00",
+            actor="ops",
+        )
+        execution = execution_report.executions[0]
+        unlinked_task_payload = operations_compensation_task_to_dict(action_task)
+        unlinked_task_payload.update(
+            {
+                "task_id": "OCT-UNLINKED",
+                "status": "OPEN",
+                "linked_ticket_id": None,
+                "lifecycle": [],
+            }
+        )
+        unlinked_task = operations_compensation_task_from_dict(unlinked_task_payload)
+        http = CapturingAnyHttpClient(
+            {
+                "https://oncall.example/compensation-tasks": {
+                    "ok": True,
+                    "ticket_id": "INC-AUTO-COMP",
+                    "detail": "opened by test oncall",
+                }
+            }
+        )
+        external_report = execute_operations_compensation_tasks(
+            [unlinked_task],
+            limit=1,
+            oncall_endpoint="https://oncall.example/compensation-tasks",
+            oncall_token="oncall-token",
+            http_client=http,
+            executed_at="2026-05-23T03:00:00+00:00",
+            actor="ops",
+        )
+        external_execution = external_report.executions[0]
 
         self.assertGreaterEqual(board.total_tasks, 4)
         self.assertEqual(action_task.status, "ESCALATED")
         self.assertEqual(action_task.linked_ticket_id, "INC-COMP")
         self.assertEqual(reloaded.status, "CLOSED")
+        self.assertEqual(execution.action, "wait_oncall")
+        self.assertEqual(execution.task.status, "WAITING_ONCALL")
+        self.assertEqual(external_execution.action, "open_oncall_ticket")
+        self.assertEqual(external_execution.task.status, "WAITING_ONCALL")
+        self.assertEqual(external_execution.task.linked_ticket_id, "INC-AUTO-COMP")
+        self.assertEqual(http.calls[0][2], "oncall-token")
+        self.assertEqual(http.calls[0][1]["task_id"], "OCT-UNLINKED")
         self.assertIn("Operations compensation tasks:", render_operations_compensation_tasks([closed]))
         self.assertIn("operations_compensation_tasks", render_operations_compensation_task_board_json(board))
+        self.assertIn(
+            "operations_compensation_task_execution",
+            render_operations_compensation_task_execution_report_json(execution_report),
+        )
 
 
 class IntegrationAdapterTest(unittest.TestCase):
@@ -4619,6 +4668,25 @@ class OperationsReadinessTest(unittest.TestCase):
             with urlopen(compensation_tasks_request, timeout=5) as response:
                 compensation_tasks_payload = json.loads(response.read().decode("utf-8"))
             compensation_task_id = compensation_tasks_payload["operations_compensation_tasks"]["tasks"][0]["task_id"]
+            execute_compensation_request = Request(
+                f"http://{host}:{port}/operations/console/actions",
+                data=json.dumps(
+                    {
+                        "action": "execute_compensation_tasks",
+                        "limit": 1,
+                    },
+                    ensure_ascii=False,
+                ).encode("utf-8"),
+                headers={
+                    "Authorization": "Bearer dash-token",
+                    "Content-Type": "application/json",
+                    "X-Operations-Actor": "ops-user",
+                    "X-Operations-Roles": "ops",
+                },
+                method="POST",
+            )
+            with urlopen(execute_compensation_request, timeout=5) as response:
+                execute_compensation_payload = json.loads(response.read().decode("utf-8"))
             close_compensation_request = Request(
                 f"http://{host}:{port}/operations/console/actions",
                 data=json.dumps(
@@ -4731,6 +4799,13 @@ class OperationsReadinessTest(unittest.TestCase):
             "OASD-HTTP-DASH",
         )
         self.assertEqual(compensation_tasks_payload["operations_compensation_tasks"]["tasks"][0]["source_type"], "action_item")
+        execute_compensation = execute_compensation_payload["operations_console_action"]
+        self.assertTrue(execute_compensation["ok"])
+        self.assertGreaterEqual(execute_compensation["compensation_task_execution"]["attempted"], 1)
+        self.assertEqual(
+            execute_compensation["compensation_task_execution"]["executions"][0]["task"]["status"],
+            "WAITING_ONCALL",
+        )
         close_compensation = close_compensation_payload["operations_console_action"]
         self.assertTrue(close_compensation["ok"])
         self.assertEqual(close_compensation["task"]["status"], "CLOSED")
