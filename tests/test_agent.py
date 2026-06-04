@@ -69,6 +69,7 @@ from travel_agent.operations import (
     build_operations_console_overview,
     build_operations_console_view,
     build_operations_audit_timeline,
+    build_operations_compensation_tasks,
     build_operations_closed_loop_dashboard,
     build_operations_dashboard_trend_report,
     build_operations_knowledge_entries,
@@ -92,6 +93,7 @@ from travel_agent.operations import (
     build_postmortem_action_items,
     build_trend_alert_action_items,
     close_operations_action_item,
+    close_operations_compensation_task,
     evaluate_operations_action_sla,
     evaluate_operations_closed_loop_quality,
     execute_oncall_webhook_replay_job,
@@ -204,6 +206,12 @@ from travel_agent.operations import (
     render_operations_console_action_audits,
     render_operations_audit_timeline,
     render_operations_audit_timeline_json,
+    operations_audit_sink_delivery_from_dict,
+    render_operations_audit_sink_deliveries_json,
+    operations_compensation_task_from_dict,
+    operations_compensation_task_to_dict,
+    render_operations_compensation_tasks,
+    render_operations_compensation_task_board_json,
     render_recovery_approval_export_result,
     render_recovery_strategy_metrics_prometheus,
     render_recovery_strategy_gate_result,
@@ -458,6 +466,54 @@ class MultiAgentStructureTest(unittest.TestCase):
         self.assertEqual(context.order_cancellation.status, "CANCELLED")
         self.assertEqual(context.transport_order_cancellation.status, "CANCELLED")
         self.assertEqual(context.inventory_release.status, "RELEASED")
+
+    def test_builds_operations_compensation_task_lifecycle_board(self) -> None:
+        agent = build_default_agent()
+        context = agent.cancel_trip(agent.run_to_order(_request()), "meeting_cancelled")
+        action_item = operations_action_item_from_dict(
+            {
+                "action_id": "ACT-COMP",
+                "source_type": "compensation",
+                "source_id": context.session_id,
+                "title": "Verify supplier compensation",
+                "owner": "ops",
+                "status": "OPEN",
+                "eta": "2026-05-20T00:00:00+00:00",
+                "created_at": "2026-05-19T00:00:00+00:00",
+                "updated_at": "2026-05-19T00:00:00+00:00",
+                "evidence": ["INC-COMP"],
+                "closure_note": None,
+            }
+        )
+        sla_report = evaluate_operations_action_sla(
+            [action_item],
+            policy=build_operations_action_sla_policy(),
+            now="2026-05-23T00:00:00+00:00",
+        )
+
+        board = build_operations_compensation_tasks(
+            sessions=[context],
+            action_items=[action_item],
+            oncall_statuses=[],
+            sla_report=sla_report,
+            generated_at="2026-05-23T00:00:00+00:00",
+            limit=20,
+        )
+        action_task = next(task for task in board.tasks if task.source_type == "action_item")
+        closed = close_operations_compensation_task(
+            action_task,
+            "verified supplier compensation",
+            updated_at="2026-05-23T01:00:00+00:00",
+            actor="ops",
+        )
+        reloaded = operations_compensation_task_from_dict(operations_compensation_task_to_dict(closed))
+
+        self.assertGreaterEqual(board.total_tasks, 4)
+        self.assertEqual(action_task.status, "ESCALATED")
+        self.assertEqual(action_task.linked_ticket_id, "INC-COMP")
+        self.assertEqual(reloaded.status, "CLOSED")
+        self.assertIn("Operations compensation tasks:", render_operations_compensation_tasks([closed]))
+        self.assertIn("operations_compensation_tasks", render_operations_compensation_task_board_json(board))
 
 
 class IntegrationAdapterTest(unittest.TestCase):
@@ -1940,6 +1996,38 @@ class SessionStoreTest(unittest.TestCase):
             completed_at="2026-05-19T10:11:00+00:00",
         )
         store.record_operations_console_action_audit(operations_console_action_audit_to_dict(console_audit))
+        delivery = {
+            "delivery_id": "OASD-HTTP",
+            "audit_id": console_audit.audit_id,
+            "event_type": "operations.console_action.propose_governance_policy_change",
+            "status": "FAILED",
+            "attempted_at": "2026-05-19T10:12:00+00:00",
+            "delivered": 0,
+            "failed": 1,
+            "detail": "audit sink unavailable",
+            "attempts": 1,
+            "last_error": "audit sink unavailable",
+            "payload": {},
+        }
+        store.record_operations_audit_sink_delivery(delivery)
+        compensation_task = {
+            "task_id": "OCT-HTTP",
+            "source_type": "action_item",
+            "source_id": "ACT-HTTP",
+            "status": "CLOSED",
+            "owner": "ops",
+            "title": "Verify compensation",
+            "severity": "info",
+            "created_at": "2026-05-19T10:00:00+00:00",
+            "updated_at": "2026-05-19T10:13:00+00:00",
+            "due_at": None,
+            "linked_ticket_id": "INC-HTTP",
+            "lifecycle": [{"status": "CLOSED", "at": "2026-05-19T10:13:00+00:00", "actor": "ops"}],
+            "refs": {"action_id": "ACT-HTTP"},
+            "payload": {},
+            "closure_note": "closed",
+        }
+        store.record_operations_compensation_task(compensation_task)
 
         self.assertEqual(store.list_operations_dashboard_snapshots()[0]["snapshot_id"], "DASH-HTTP")
         self.assertEqual(store.list_operations_closed_loop_snapshots()[0]["snapshot_id"], "CLP-HTTP")
@@ -1957,6 +2045,8 @@ class SessionStoreTest(unittest.TestCase):
             governance_change.change_id,
         )
         self.assertEqual(store.list_operations_console_action_audits()[0]["audit_id"], console_audit.audit_id)
+        self.assertEqual(store.list_operations_audit_sink_deliveries()[0]["delivery_id"], "OASD-HTTP")
+        self.assertEqual(store.list_operations_compensation_tasks()[0]["task_id"], "OCT-HTTP")
         self.assertTrue(any(call[0].endswith("/operations/dashboard-snapshots/record") for call in http.calls))
         self.assertTrue(any(call[0].endswith("/operations/closed-loop-snapshots/record") for call in http.calls))
         self.assertTrue(any(call[0].endswith("/operations/oncall-statuses/record") for call in http.calls))
@@ -1969,6 +2059,8 @@ class SessionStoreTest(unittest.TestCase):
         self.assertTrue(any(call[0].endswith("/operations/scheduler-runs/record") for call in http.calls))
         self.assertTrue(any(call[0].endswith("/operations/governance-policy-changes/record") for call in http.calls))
         self.assertTrue(any(call[0].endswith("/operations/console-action-audits/record") for call in http.calls))
+        self.assertTrue(any(call[0].endswith("/operations/audit-sink-deliveries/record") for call in http.calls))
+        self.assertTrue(any(call[0].endswith("/operations/compensation-tasks/record") for call in http.calls))
 
     def test_build_session_store_selects_configured_backends(self) -> None:
         http = FakeSessionStoreHttpClient()
@@ -2138,6 +2230,40 @@ class SessionStoreTest(unittest.TestCase):
                 completed_at="2026-05-19T10:11:00+00:00",
             )
             store.record_operations_console_action_audit(operations_console_action_audit_to_dict(console_audit))
+            store.record_operations_audit_sink_delivery(
+                {
+                    "delivery_id": "OASD-SQL",
+                    "audit_id": console_audit.audit_id,
+                    "event_type": "operations.console_action.propose_governance_policy_change",
+                    "status": "FAILED",
+                    "attempted_at": "2026-05-19T10:12:00+00:00",
+                    "delivered": 0,
+                    "failed": 1,
+                    "detail": "audit sink unavailable",
+                    "attempts": 1,
+                    "last_error": "audit sink unavailable",
+                    "payload": {},
+                }
+            )
+            store.record_operations_compensation_task(
+                {
+                    "task_id": "OCT-SQL",
+                    "source_type": "action_item",
+                    "source_id": "ACT-SQL",
+                    "status": "CLOSED",
+                    "owner": "ops",
+                    "title": "Verify compensation",
+                    "severity": "info",
+                    "created_at": "2026-05-19T10:00:00+00:00",
+                    "updated_at": "2026-05-19T10:13:00+00:00",
+                    "due_at": None,
+                    "linked_ticket_id": "INC-SQL",
+                    "lifecycle": [{"status": "CLOSED", "at": "2026-05-19T10:13:00+00:00", "actor": "ops"}],
+                    "refs": {"action_id": "ACT-SQL"},
+                    "payload": {},
+                    "closure_note": "closed",
+                }
+            )
             closed_loop = build_operations_closed_loop_report(
                 trend_alerts=trend_alerts,
                 action_items=action_items,
@@ -2169,6 +2295,12 @@ class SessionStoreTest(unittest.TestCase):
             reloaded_console_audit = operations_console_action_audit_from_dict(
                 store.list_operations_console_action_audits()[0]
             )
+            reloaded_audit_sink_delivery = operations_audit_sink_delivery_from_dict(
+                store.list_operations_audit_sink_deliveries()[0]
+            )
+            reloaded_compensation_task = operations_compensation_task_from_dict(
+                store.list_operations_compensation_tasks()[0]
+            )
             health = store.health_check()
 
             self.assertEqual(reloaded_snapshot.snapshot_id, "DASH-SQL")
@@ -2188,7 +2320,9 @@ class SessionStoreTest(unittest.TestCase):
             self.assertEqual(reloaded_run.run_id, scheduler_report.run_id)
             self.assertEqual(reloaded_governance_change.change_id, governance_change.change_id)
             self.assertEqual(reloaded_console_audit.audit_id, console_audit.audit_id)
-            self.assertGreaterEqual(health.schema_version, 11)
+            self.assertEqual(reloaded_audit_sink_delivery.delivery_id, "OASD-SQL")
+            self.assertEqual(reloaded_compensation_task.task_id, "OCT-SQL")
+            self.assertGreaterEqual(health.schema_version, 13)
             self.assertEqual(health.details["dashboard_snapshots"], "1")
             self.assertEqual(health.details["closed_loop_snapshots"], "1")
             self.assertEqual(health.details["oncall_ticket_statuses"], "1")
@@ -2201,6 +2335,8 @@ class SessionStoreTest(unittest.TestCase):
             self.assertEqual(health.details["operations_scheduler_runs"], "1")
             self.assertEqual(health.details["operations_governance_policy_changes"], "1")
             self.assertEqual(health.details["operations_console_action_audits"], "1")
+            self.assertEqual(health.details["operations_audit_sink_deliveries"], "1")
+            self.assertEqual(health.details["operations_compensation_tasks"], "1")
 
     def test_sqlite_session_store_tracks_metadata_and_versions(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -3877,6 +4013,48 @@ class OperationsReadinessTest(unittest.TestCase):
         self.assertEqual(action["scheduler_run"]["due_count"], 5)
         self.assertEqual(store.list_operations_scheduler_runs(1)[0]["run_id"], action["scheduler_run"]["run_id"])
 
+    def test_records_and_retries_operations_console_audit_sink_delivery(self) -> None:
+        store = InMemorySessionStore()
+        failing_sink = HttpAuditSink("https://audit.example/events", http_client=FailingHttpClient())
+
+        failed_result = json.loads(
+            run_operations_console_action(
+                store,
+                "run_operations_schedule",
+                actor="ops-user",
+                roles=["ops"],
+                payload={"limit": 1, "now": "2026-05-20T03:05:00+00:00"},
+                audit_sink=failing_sink,
+            )
+        )
+        failed_action = failed_result["operations_console_action"]
+        failed_delivery = operations_audit_sink_delivery_from_dict(store.list_operations_audit_sink_deliveries(1)[0])
+
+        retry_result = json.loads(
+            run_operations_console_action(
+                store,
+                "retry_audit_sink_deliveries",
+                actor="ops-user",
+                roles=["ops"],
+                payload={"limit": 10},
+                audit_sink=InMemoryAuditSink(),
+            )
+        )
+        retry_action = retry_result["operations_console_action"]
+        retried_delivery = next(
+            operations_audit_sink_delivery_from_dict(item)
+            for item in store.list_operations_audit_sink_deliveries(10)
+            if item["audit_id"] == failed_delivery.audit_id
+        )
+
+        self.assertEqual(failed_action["action_audit"]["sink_delivery"]["status"], "FAILED")
+        self.assertEqual(failed_delivery.status, "FAILED")
+        self.assertEqual(retry_action["audit_sink_replay"]["attempted"], 1)
+        self.assertEqual(retry_action["audit_sink_replay"]["failed"], 0)
+        self.assertEqual(retried_delivery.status, "DELIVERED")
+        self.assertEqual(retried_delivery.attempts, 2)
+        self.assertIn("operations_audit_sink_deliveries", render_operations_audit_sink_deliveries_json([retried_delivery]))
+
     def test_executes_pending_oncall_webhook_replay_job(self) -> None:
         payload = {
             "event_id": "WHK-JOB",
@@ -4163,6 +4341,37 @@ class OperationsReadinessTest(unittest.TestCase):
             created_at="2026-05-20T03:06:00+00:00",
         )
         store.record_oncall_webhook_replay_job(oncall_webhook_replay_job_to_dict(replay_job))
+        store.record_operations_audit_sink_delivery(
+            {
+                "delivery_id": "OASD-HTTP-DASH",
+                "audit_id": "OCA-HTTP-DASH",
+                "event_type": "operations.console_action.create_replay_job",
+                "status": "FAILED",
+                "attempted_at": "2026-05-20T03:07:00+00:00",
+                "delivered": 0,
+                "failed": 1,
+                "detail": "audit sink unavailable",
+                "attempts": 1,
+                "last_error": "audit sink unavailable",
+                "payload": {},
+            }
+        )
+        compensation_action_item = operations_action_item_from_dict(
+            {
+                "action_id": "ACT-COMP-DASH",
+                "source_type": "compensation",
+                "source_id": "CMP-DASH",
+                "title": "Verify dashboard compensation",
+                "owner": "ops",
+                "status": "OPEN",
+                "eta": "2026-05-20T04:00:00+00:00",
+                "created_at": "2026-05-20T03:00:00+00:00",
+                "updated_at": "2026-05-20T03:00:00+00:00",
+                "evidence": ["INC-COMP-DASH"],
+                "closure_note": None,
+            }
+        )
+        store.record_operations_action_item(operations_action_item_to_dict(compensation_action_item))
         schedule_task = build_operations_scheduled_tasks(now="2026-05-20T03:00:00+00:00")[2]
         store.record_operations_scheduled_task(operations_scheduled_task_to_dict(schedule_task))
         registry_server = create_schema_registry_server(token="schema-token")
@@ -4397,6 +4606,39 @@ class OperationsReadinessTest(unittest.TestCase):
             )
             with urlopen(governance_timeline_request, timeout=5) as response:
                 governance_timeline_payload = json.loads(response.read().decode("utf-8"))
+            audit_sink_deliveries_request = Request(
+                f"http://{host}:{port}/operations/console/audit-sink-deliveries?limit=10",
+                headers={"Authorization": "Bearer dash-token"},
+            )
+            with urlopen(audit_sink_deliveries_request, timeout=5) as response:
+                audit_sink_deliveries_payload = json.loads(response.read().decode("utf-8"))
+            compensation_tasks_request = Request(
+                f"http://{host}:{port}/operations/console/compensation-tasks?source_type=action_item&limit=10",
+                headers={"Authorization": "Bearer dash-token"},
+            )
+            with urlopen(compensation_tasks_request, timeout=5) as response:
+                compensation_tasks_payload = json.loads(response.read().decode("utf-8"))
+            compensation_task_id = compensation_tasks_payload["operations_compensation_tasks"]["tasks"][0]["task_id"]
+            close_compensation_request = Request(
+                f"http://{host}:{port}/operations/console/actions",
+                data=json.dumps(
+                    {
+                        "action": "close_compensation_task",
+                        "task_id": compensation_task_id,
+                        "closure_note": "verified in console",
+                    },
+                    ensure_ascii=False,
+                ).encode("utf-8"),
+                headers={
+                    "Authorization": "Bearer dash-token",
+                    "Content-Type": "application/json",
+                    "X-Operations-Actor": "ops-user",
+                    "X-Operations-Roles": "ops",
+                },
+                method="POST",
+            )
+            with urlopen(close_compensation_request, timeout=5) as response:
+                close_compensation_payload = json.loads(response.read().decode("utf-8"))
         finally:
             server.shutdown()
             server.server_close()
@@ -4468,9 +4710,9 @@ class OperationsReadinessTest(unittest.TestCase):
         self.assertTrue(rollback_governance["action_audit"]["recorded"])
         action_audits = store.list_operations_console_action_audits(10)
         self.assertGreaterEqual(len(action_audits), 7)
-        self.assertEqual(action_audits[0]["action"], "rollback_governance_policy_change")
-        self.assertEqual(action_audits[0]["status"], "SUCCESS")
-        self.assertEqual(action_audits[0]["result_summary"]["change_status"], "ROLLED_BACK")
+        rollback_audit = next(item for item in action_audits if item["action"] == "rollback_governance_policy_change")
+        self.assertEqual(rollback_audit["status"], "SUCCESS")
+        self.assertEqual(rollback_audit["result_summary"]["change_status"], "ROLLED_BACK")
         timeline_events = audit_timeline_payload["operations_audit_timeline"]["events"]
         self.assertGreaterEqual(len(timeline_events), 4)
         self.assertIn("console_action", {item["event_type"] for item in timeline_events})
@@ -4484,6 +4726,15 @@ class OperationsReadinessTest(unittest.TestCase):
             governance_timeline_payload["operations_audit_timeline"]["events"][0]["status"],
             "ROLLED_BACK",
         )
+        self.assertEqual(
+            audit_sink_deliveries_payload["operations_audit_sink_deliveries"][0]["delivery_id"],
+            "OASD-HTTP-DASH",
+        )
+        self.assertEqual(compensation_tasks_payload["operations_compensation_tasks"]["tasks"][0]["source_type"], "action_item")
+        close_compensation = close_compensation_payload["operations_console_action"]
+        self.assertTrue(close_compensation["ok"])
+        self.assertEqual(close_compensation["task"]["status"], "CLOSED")
+        self.assertEqual(store.list_operations_compensation_tasks(1)[0]["closure_note"], "verified in console")
         self.assertIn("oncall_webhook_ops_console", build_oncall_webhook_ops_console_json(store))
         self.assertIn("oncall_webhook_replay_jobs", build_oncall_webhook_replay_jobs_json(store))
         self.assertIn("operations_console_overview", build_operations_console_overview_json(store))
@@ -4963,6 +5214,8 @@ class FakeSessionStoreHttpClient:
         self.scheduler_runs: list[dict[str, Any]] = []
         self.governance_policy_changes: list[dict[str, Any]] = []
         self.console_action_audits: list[dict[str, Any]] = []
+        self.audit_sink_deliveries: list[dict[str, Any]] = []
+        self.compensation_tasks: list[dict[str, Any]] = []
         self.calls: list[tuple[str, dict[str, Any], str | None]] = []
 
     def post_json(self, url: str, payload: dict[str, Any], token: str | None = None) -> dict[str, Any]:
@@ -5117,11 +5370,29 @@ class FakeSessionStoreHttpClient:
             return {"ok": True}
         if path == "/operations/console-action-audits/list":
             return {"audits": list(reversed(self.console_action_audits))[0 : int(payload["limit"])]}
+        if path == "/operations/audit-sink-deliveries/record":
+            self.audit_sink_deliveries = [
+                delivery
+                for delivery in self.audit_sink_deliveries
+                if delivery.get("delivery_id") != payload["delivery"].get("delivery_id")
+            ]
+            self.audit_sink_deliveries.append(dict(payload["delivery"]))
+            return {"ok": True}
+        if path == "/operations/audit-sink-deliveries/list":
+            return {"deliveries": list(reversed(self.audit_sink_deliveries))[0 : int(payload["limit"])]}
+        if path == "/operations/compensation-tasks/record":
+            self.compensation_tasks = [
+                task for task in self.compensation_tasks if task.get("task_id") != payload["task"].get("task_id")
+            ]
+            self.compensation_tasks.append(dict(payload["task"]))
+            return {"ok": True}
+        if path == "/operations/compensation-tasks/list":
+            return {"tasks": list(reversed(self.compensation_tasks))[0 : int(payload["limit"])]}
         if path == "/health":
             return {
                 "backend": "http-json",
                 "ok": True,
-                "schema_version": 8,
+                "schema_version": 10,
                 "session_count": len(self.sessions),
                 "worker_run_count": len(self.worker_runs),
                 "details": {
@@ -5138,6 +5409,8 @@ class FakeSessionStoreHttpClient:
                     "operations_scheduler_runs": str(len(self.scheduler_runs)),
                     "operations_governance_policy_changes": str(len(self.governance_policy_changes)),
                     "operations_console_action_audits": str(len(self.console_action_audits)),
+                    "operations_audit_sink_deliveries": str(len(self.audit_sink_deliveries)),
+                    "operations_compensation_tasks": str(len(self.compensation_tasks)),
                 },
             }
         raise AssertionError(f"Unexpected HTTP store URL: {url}")

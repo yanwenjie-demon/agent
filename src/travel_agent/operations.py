@@ -14,6 +14,7 @@ from .config import IntegrationSettings
 from .data_governance import AuditSink, AuditSinkResult, build_audit_event
 from .governance import ReleaseReadinessReport, run_release_readiness_report
 from .models import (
+    CompensationResult,
     DeadLetterCalendarSync,
     DeadLetterNotification,
     NotificationRecord,
@@ -525,6 +526,61 @@ class OperationsAuditTimeline:
     events: list[OperationsAuditTimelineEvent]
     filters: dict[str, str]
     total_events: int
+    summary: str
+
+
+@dataclass(frozen=True)
+class OperationsAuditSinkDelivery:
+    delivery_id: str
+    audit_id: str
+    event_type: str
+    status: str
+    attempted_at: str
+    delivered: int
+    failed: int
+    detail: str
+    attempts: int = 1
+    last_error: str | None = None
+    payload: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class OperationsAuditSinkReplayReport:
+    generated_at: str
+    attempted: int
+    delivered: int
+    failed: int
+    deliveries: list[OperationsAuditSinkDelivery]
+    summary: str
+
+
+@dataclass(frozen=True)
+class OperationsCompensationTask:
+    task_id: str
+    source_type: str
+    source_id: str
+    status: str
+    owner: str
+    title: str
+    severity: str
+    created_at: str
+    updated_at: str
+    due_at: str | None
+    linked_ticket_id: str | None
+    lifecycle: list[dict[str, Any]]
+    refs: dict[str, Any] = field(default_factory=dict)
+    payload: dict[str, Any] = field(default_factory=dict)
+    closure_note: str | None = None
+
+
+@dataclass(frozen=True)
+class OperationsCompensationTaskBoard:
+    generated_at: str
+    tasks: list[OperationsCompensationTask]
+    status_counts: dict[str, int]
+    severity_counts: dict[str, int]
+    total_tasks: int
+    filters: dict[str, str]
     summary: str
 
 
@@ -1366,6 +1422,373 @@ def render_operations_action_status_sync_report(report: OperationsActionStatusSy
     return "\n".join(lines)
 
 
+def build_operations_compensation_tasks(
+    sessions: list[TravelContext] | None = None,
+    replay_jobs: list[OnCallWebhookReplayJob] | None = None,
+    action_items: list[OperationsActionItem] | None = None,
+    oncall_statuses: list[OnCallTicketStatus] | None = None,
+    persisted_tasks: list[OperationsCompensationTask] | None = None,
+    sla_report: OperationsActionSlaReport | None = None,
+    generated_at: str | None = None,
+    owner: str | None = None,
+    status: str | None = None,
+    source_type: str | None = None,
+    limit: int = 20,
+) -> OperationsCompensationTaskBoard:
+    generated_at = generated_at or datetime.now(timezone.utc).isoformat()
+    status_map = {item.ticket_id: item for item in oncall_statuses or []}
+    sla_map = {finding.action_id: finding for finding in (sla_report.findings if sla_report else [])}
+    tasks: list[OperationsCompensationTask] = []
+    for context in sessions or []:
+        tasks.extend(_compensation_tasks_from_session(context, generated_at))
+    for job in replay_jobs or []:
+        tasks.append(_compensation_task_from_replay_job(job, generated_at, status_map))
+    for item in action_items or []:
+        tasks.append(_compensation_task_from_action_item(item, generated_at, status_map, sla_map.get(item.action_id)))
+    merged = _merge_compensation_task_overrides(tasks, persisted_tasks or [])
+    filtered = [
+        task
+        for task in merged
+        if (owner is None or task.owner == owner)
+        and (status is None or task.status == status)
+        and (source_type is None or task.source_type == source_type)
+    ]
+    filtered.sort(key=lambda task: (_severity_rank(task.severity), _timestamp_sort_key(task.updated_at), task.task_id), reverse=True)
+    limited = filtered[: max(0, limit)]
+    status_counts = dict(Counter(task.status for task in filtered))
+    severity_counts = dict(Counter(task.severity for task in filtered))
+    filters = {key: value for key, value in {"owner": owner, "status": status, "source_type": source_type}.items() if value}
+    summary = f"compensation_tasks={len(limited)}/{len(filtered)} total={len(merged)} open={status_counts.get('OPEN', 0)} escalated={status_counts.get('ESCALATED', 0)}"
+    return OperationsCompensationTaskBoard(
+        generated_at=generated_at,
+        tasks=limited,
+        status_counts=status_counts,
+        severity_counts=severity_counts,
+        total_tasks=len(filtered),
+        filters=filters,
+        summary=summary,
+    )
+
+
+def close_operations_compensation_task(
+    task: OperationsCompensationTask,
+    closure_note: str,
+    updated_at: str | None = None,
+    actor: str | None = None,
+) -> OperationsCompensationTask:
+    updated_at = updated_at or datetime.now(timezone.utc).isoformat()
+    lifecycle = [
+        *task.lifecycle,
+        {
+            "status": "CLOSED",
+            "at": updated_at,
+            "actor": actor,
+            "detail": closure_note,
+        },
+    ]
+    return replace(
+        task,
+        status="CLOSED",
+        updated_at=updated_at,
+        lifecycle=lifecycle,
+        closure_note=closure_note,
+    )
+
+
+def operations_compensation_task_to_dict(task: OperationsCompensationTask) -> dict[str, Any]:
+    return {
+        "task_id": task.task_id,
+        "source_type": task.source_type,
+        "source_id": task.source_id,
+        "status": task.status,
+        "owner": task.owner,
+        "title": task.title,
+        "severity": task.severity,
+        "created_at": task.created_at,
+        "updated_at": task.updated_at,
+        "due_at": task.due_at,
+        "linked_ticket_id": task.linked_ticket_id,
+        "lifecycle": task.lifecycle,
+        "refs": task.refs,
+        "payload": task.payload,
+        "closure_note": task.closure_note,
+    }
+
+
+def operations_compensation_task_from_dict(payload: dict[str, Any]) -> OperationsCompensationTask:
+    return OperationsCompensationTask(
+        task_id=str(payload["task_id"]),
+        source_type=str(payload.get("source_type") or ""),
+        source_id=str(payload.get("source_id") or ""),
+        status=str(payload.get("status") or "OPEN"),
+        owner=str(payload.get("owner") or "travel-ops"),
+        title=str(payload.get("title") or ""),
+        severity=str(payload.get("severity") or "info"),
+        created_at=str(payload.get("created_at") or ""),
+        updated_at=str(payload.get("updated_at") or ""),
+        due_at=str(payload["due_at"]) if payload.get("due_at") is not None else None,
+        linked_ticket_id=str(payload["linked_ticket_id"]) if payload.get("linked_ticket_id") is not None else None,
+        lifecycle=[dict(item) for item in payload.get("lifecycle") or []],
+        refs=dict(payload.get("refs") or {}),
+        payload=dict(payload.get("payload") or {}),
+        closure_note=str(payload["closure_note"]) if payload.get("closure_note") is not None else None,
+    )
+
+
+def operations_compensation_task_board_to_dict(board: OperationsCompensationTaskBoard) -> dict[str, Any]:
+    return {
+        "generated_at": board.generated_at,
+        "tasks": [operations_compensation_task_to_dict(task) for task in board.tasks],
+        "status_counts": board.status_counts,
+        "severity_counts": board.severity_counts,
+        "total_tasks": board.total_tasks,
+        "filters": board.filters,
+        "summary": board.summary,
+    }
+
+
+def render_operations_compensation_tasks(tasks: list[OperationsCompensationTask]) -> str:
+    lines = ["Operations compensation tasks:"]
+    if not tasks:
+        lines.append("- none")
+        return "\n".join(lines)
+    for task in tasks:
+        lines.append(
+            f"- {task.task_id}: {task.status} severity={task.severity} owner={task.owner} "
+            f"source={task.source_type}/{task.source_id}"
+        )
+        lines.append(f"  title: {task.title}")
+        if task.linked_ticket_id:
+            lines.append(f"  ticket: {task.linked_ticket_id}")
+        if task.closure_note:
+            lines.append(f"  closure: {task.closure_note}")
+    return "\n".join(lines)
+
+
+def render_operations_compensation_task_board_json(board: OperationsCompensationTaskBoard) -> str:
+    return json.dumps({"operations_compensation_tasks": operations_compensation_task_board_to_dict(board)}, ensure_ascii=False)
+
+
+def _compensation_tasks_from_session(context: TravelContext, generated_at: str) -> list[OperationsCompensationTask]:
+    tasks: list[OperationsCompensationTask] = []
+    for label, compensation in (
+        ("approval_cancellation", context.approval_cancellation),
+        ("order_cancellation", context.order_cancellation),
+        ("transport_order_cancellation", context.transport_order_cancellation),
+        ("inventory_release", context.inventory_release),
+    ):
+        if compensation is not None:
+            tasks.append(_compensation_task_from_result(context, label, compensation, generated_at))
+    for index, compensation in enumerate(context.change_failure_compensations):
+        tasks.append(_compensation_task_from_result(context, f"change_failure_compensation_{index + 1}", compensation, generated_at))
+    for record in context.recovery_records:
+        execution = record.payload.get("strategy_execution")
+        if isinstance(execution, dict):
+            result = recovery_strategy_execution_result_from_dict(execution)
+            tasks.append(_compensation_task_from_recovery_execution(context, record, result, generated_at))
+    return tasks
+
+
+def _compensation_task_from_result(
+    context: TravelContext,
+    label: str,
+    compensation: CompensationResult,
+    generated_at: str,
+) -> OperationsCompensationTask:
+    normalized_status = _normalize_status_value(compensation.status)
+    status = "CLOSED" if normalized_status in {"SUCCESS", "COMPLETED", "DONE", "CANCELLED", "RELEASED"} else "ESCALATED"
+    severity = "info" if status == "CLOSED" else "critical"
+    task_id = _stable_id("OCT", context.session_id, label, compensation.action, compensation.target_id)
+    lifecycle = [
+        {
+            "status": status,
+            "at": generated_at,
+            "actor": "system",
+            "detail": f"{compensation.action} {compensation.status}",
+        }
+    ]
+    return OperationsCompensationTask(
+        task_id=task_id,
+        source_type="compensation_result",
+        source_id=f"{context.session_id}:{label}",
+        status=status,
+        owner="travel-ops",
+        title=f"{label} for {compensation.target_id}",
+        severity=severity,
+        created_at=generated_at,
+        updated_at=generated_at,
+        due_at=None,
+        linked_ticket_id=_ticket_id_from_payload(compensation.payload),
+        lifecycle=lifecycle,
+        refs={"session_id": context.session_id, "target_id": compensation.target_id, "action": compensation.action},
+        payload={"compensation": compensation.__dict__},
+    )
+
+
+def _compensation_task_from_recovery_execution(
+    context: TravelContext,
+    record: Any,
+    result: RecoveryStrategyExecutionResult,
+    generated_at: str,
+) -> OperationsCompensationTask:
+    status = "CLOSED" if result.status.upper() in {"SUCCESS", "SKIPPED"} else "ESCALATED"
+    if result.gate_status.upper() in {"BLOCKED", "REQUIRES_APPROVAL"} and not result.approval_override:
+        status = "OPEN"
+    severity = "critical" if status == "ESCALATED" else "warning" if status == "OPEN" else "info"
+    return OperationsCompensationTask(
+        task_id=_stable_id("OCT", context.session_id, record.recovery_id, result.execution_id),
+        source_type="recovery_strategy_execution",
+        source_id=result.execution_id,
+        status=status,
+        owner="travel-ops",
+        title=f"{result.action} recovery for {context.session_id}",
+        severity=severity,
+        created_at=result.created_at or record.created_at or generated_at,
+        updated_at=result.created_at or record.created_at or generated_at,
+        due_at=None,
+        linked_ticket_id=_ticket_id_from_payload(record.payload),
+        lifecycle=[
+            {
+                "status": status,
+                "at": result.created_at or generated_at,
+                "actor": "RecoveryStrategyExecutor",
+                "detail": result.detail,
+            }
+        ],
+        refs={"session_id": context.session_id, "recovery_id": record.recovery_id, "decision_id": result.decision_id},
+        payload={"recovery_record": record.__dict__, "strategy_execution": recovery_strategy_execution_result_to_dict(result)},
+    )
+
+
+def _compensation_task_from_replay_job(
+    job: OnCallWebhookReplayJob,
+    generated_at: str,
+    status_map: dict[str, OnCallTicketStatus],
+) -> OperationsCompensationTask:
+    status = "OPEN" if job.status == "PENDING" else "CLOSED" if job.status == "COMPLETED" else "ESCALATED"
+    linked_status = _status_for_replay_job(job, status_map)
+    if linked_status and linked_status.status.upper() in {"RESOLVED", "CLOSED", "DONE"}:
+        status = "CLOSED"
+    severity = "warning" if status == "OPEN" else "critical" if status == "ESCALATED" else "info"
+    ticket_id = linked_status.ticket_id if linked_status else None
+    return OperationsCompensationTask(
+        task_id=_stable_id("OCT", "replay_job", job.job_id),
+        source_type="replay_job",
+        source_id=job.job_id,
+        status=status,
+        owner=job.requested_by or "travel-ops",
+        title=f"Replay {len(job.event_ids)} webhook event(s)",
+        severity=severity,
+        created_at=job.created_at,
+        updated_at=str(job.audit.get("executed_at") or job.created_at),
+        due_at=None,
+        linked_ticket_id=ticket_id,
+        lifecycle=[
+            {"status": job.status, "at": job.created_at, "actor": job.requested_by, "detail": "replay job created"},
+            *(
+                [{"status": status, "at": str(job.audit.get("executed_at")), "actor": "replay_executor", "detail": "replay job executed"}]
+                if job.audit.get("executed_at")
+                else []
+            ),
+        ],
+        refs={"job_id": job.job_id, "event_ids": job.event_ids},
+        payload=oncall_webhook_replay_job_to_dict(job),
+    )
+
+
+def _compensation_task_from_action_item(
+    item: OperationsActionItem,
+    generated_at: str,
+    status_map: dict[str, OnCallTicketStatus],
+    sla_finding: OperationsActionSlaFinding | None,
+) -> OperationsCompensationTask:
+    linked_status = _matching_oncall_status(item, status_map)
+    status = "CLOSED" if item.status.upper() == "CLOSED" else "OPEN"
+    if linked_status and linked_status.status.upper() in {"RESOLVED", "CLOSED", "DONE"}:
+        status = "CLOSED"
+    elif sla_finding is not None:
+        status = "ESCALATED"
+    severity = sla_finding.severity if sla_finding is not None else "info" if status == "CLOSED" else "warning"
+    lifecycle = [
+        {"status": item.status, "at": item.created_at, "actor": item.owner, "detail": item.title},
+    ]
+    if sla_finding is not None:
+        lifecycle.append({"status": "ESCALATED", "at": generated_at, "actor": "action_sla", "detail": sla_finding.reason})
+    if item.closure_note:
+        lifecycle.append({"status": "CLOSED", "at": item.updated_at, "actor": item.owner, "detail": item.closure_note})
+    return OperationsCompensationTask(
+        task_id=_stable_id("OCT", "action_item", item.action_id),
+        source_type="action_item",
+        source_id=item.action_id,
+        status=status,
+        owner=item.owner,
+        title=item.title,
+        severity=severity,
+        created_at=item.created_at,
+        updated_at=item.updated_at or item.created_at or generated_at,
+        due_at=item.eta,
+        linked_ticket_id=linked_status.ticket_id if linked_status else _ticket_id_from_texts(item.evidence),
+        lifecycle=lifecycle,
+        refs={"action_id": item.action_id, "source_type": item.source_type, "source_id": item.source_id},
+        payload={"action_item": operations_action_item_to_dict(item), "sla_finding": sla_finding.__dict__ if sla_finding else None},
+        closure_note=item.closure_note,
+    )
+
+
+def _merge_compensation_task_overrides(
+    derived_tasks: list[OperationsCompensationTask],
+    persisted_tasks: list[OperationsCompensationTask],
+) -> list[OperationsCompensationTask]:
+    by_id = {task.task_id: task for task in derived_tasks}
+    for persisted in persisted_tasks:
+        existing = by_id.get(persisted.task_id)
+        if existing is None:
+            by_id[persisted.task_id] = persisted
+            continue
+        by_id[persisted.task_id] = replace(
+            existing,
+            status=persisted.status,
+            owner=persisted.owner or existing.owner,
+            updated_at=persisted.updated_at or existing.updated_at,
+            lifecycle=persisted.lifecycle or existing.lifecycle,
+            closure_note=persisted.closure_note,
+            payload={**existing.payload, "override": operations_compensation_task_to_dict(persisted)},
+        )
+    return list(by_id.values())
+
+
+def _status_for_replay_job(
+    job: OnCallWebhookReplayJob,
+    status_map: dict[str, OnCallTicketStatus],
+) -> OnCallTicketStatus | None:
+    for result in (job.batch_result.results if job.batch_result is not None else []):
+        ticket_id = result.ticket_id
+        if ticket_id and ticket_id in status_map:
+            return status_map[ticket_id]
+    return None
+
+
+def _ticket_id_from_payload(payload: dict[str, Any]) -> str | None:
+    for key in ("ticket_id", "incident_id", "oncall_ticket_id"):
+        value = payload.get(key)
+        if value:
+            return str(value)
+    ticket = payload.get("ticket")
+    if isinstance(ticket, dict):
+        for key in ("ticket_id", "id", "incident_id"):
+            if ticket.get(key):
+                return str(ticket[key])
+    return None
+
+
+def _ticket_id_from_texts(values: list[str]) -> str | None:
+    for value in values:
+        for token in value.replace(",", " ").split():
+            if token.startswith(("INC-", "TICKET-", "ISSUE-")):
+                return token.strip()
+    return None
+
+
 def decide_recovery_strategy(
     context: TravelContext,
     from_state: str,
@@ -1949,6 +2372,168 @@ def render_operations_console_action_audits(audits: list[OperationsConsoleAction
             f"status={audit.status} completed_at={audit.completed_at}"
         )
     return "\n".join(lines)
+
+
+def build_operations_audit_sink_delivery(
+    audit: OperationsConsoleActionAudit,
+    result: AuditSinkResult,
+    attempted_at: str | None = None,
+    previous: OperationsAuditSinkDelivery | None = None,
+) -> OperationsAuditSinkDelivery:
+    attempted_at = attempted_at or datetime.now(timezone.utc).isoformat()
+    attempts = (previous.attempts + 1) if previous is not None else 1
+    status = "DELIVERED" if result.ok and result.failed == 0 else "FAILED"
+    event = build_operations_console_action_audit_event(audit)
+    return OperationsAuditSinkDelivery(
+        delivery_id=_stable_id("OASD", audit.audit_id, event.event_type),
+        audit_id=audit.audit_id,
+        event_type=event.event_type,
+        status=status,
+        attempted_at=attempted_at,
+        delivered=result.delivered,
+        failed=result.failed,
+        detail=result.detail,
+        attempts=attempts,
+        last_error=None if status == "DELIVERED" else result.detail,
+        payload={
+            "event": {
+                "event_type": event.event_type,
+                "detail": event.detail,
+                "redacted_keys": event.redacted_keys,
+                "payload": event.redacted_payload,
+            },
+            "result": {
+                "ok": result.ok,
+                "delivered": result.delivered,
+                "failed": result.failed,
+                "detail": result.detail,
+            },
+        },
+    )
+
+
+def build_operations_console_action_audit_event(audit: OperationsConsoleActionAudit) -> Any:
+    return build_audit_event(
+        f"operations.console_action.{audit.action}",
+        {
+            "audit_id": audit.audit_id,
+            "action": audit.action,
+            "actor": audit.actor,
+            "roles": audit.roles,
+            "department": audit.department,
+            "status": audit.status,
+            "requested_at": audit.requested_at,
+            "completed_at": audit.completed_at,
+            "authorization": audit.authorization,
+            "request_summary": audit.request_summary,
+            "result_summary": audit.result_summary,
+        },
+    )
+
+
+def operations_audit_sink_delivery_to_dict(delivery: OperationsAuditSinkDelivery) -> dict[str, Any]:
+    return {
+        "delivery_id": delivery.delivery_id,
+        "audit_id": delivery.audit_id,
+        "event_type": delivery.event_type,
+        "status": delivery.status,
+        "attempted_at": delivery.attempted_at,
+        "delivered": delivery.delivered,
+        "failed": delivery.failed,
+        "detail": delivery.detail,
+        "attempts": delivery.attempts,
+        "last_error": delivery.last_error,
+        "payload": delivery.payload,
+    }
+
+
+def operations_audit_sink_delivery_from_dict(payload: dict[str, Any]) -> OperationsAuditSinkDelivery:
+    return OperationsAuditSinkDelivery(
+        delivery_id=str(payload["delivery_id"]),
+        audit_id=str(payload.get("audit_id") or ""),
+        event_type=str(payload.get("event_type") or ""),
+        status=str(payload.get("status") or "UNKNOWN"),
+        attempted_at=str(payload.get("attempted_at") or ""),
+        delivered=int(payload.get("delivered") or 0),
+        failed=int(payload.get("failed") or 0),
+        detail=str(payload.get("detail") or ""),
+        attempts=int(payload.get("attempts") or 1),
+        last_error=str(payload["last_error"]) if payload.get("last_error") is not None else None,
+        payload=dict(payload.get("payload") or {}),
+    )
+
+
+def retry_operations_audit_sink_deliveries(
+    audits: list[OperationsConsoleActionAudit],
+    deliveries: list[OperationsAuditSinkDelivery],
+    audit_sink: AuditSink,
+    limit: int = 20,
+    now: str | None = None,
+    status: str = "FAILED",
+) -> OperationsAuditSinkReplayReport:
+    generated_at = now or datetime.now(timezone.utc).isoformat()
+    audits_by_id = {audit.audit_id: audit for audit in audits}
+    candidates = [delivery for delivery in deliveries if delivery.status == status and delivery.audit_id in audits_by_id]
+    selected = candidates[: max(0, limit)]
+    updated: list[OperationsAuditSinkDelivery] = []
+    delivered_count = 0
+    failed_count = 0
+    for delivery in selected:
+        audit = audits_by_id[delivery.audit_id]
+        result = audit_sink.write([build_operations_console_action_audit_event(audit)])
+        next_delivery = build_operations_audit_sink_delivery(
+            audit,
+            result,
+            attempted_at=generated_at,
+            previous=delivery,
+        )
+        updated.append(next_delivery)
+        delivered_count += next_delivery.delivered
+        failed_count += next_delivery.failed
+    summary = f"audit_sink_replay attempted={len(updated)} delivered={delivered_count} failed={failed_count}"
+    return OperationsAuditSinkReplayReport(
+        generated_at=generated_at,
+        attempted=len(updated),
+        delivered=delivered_count,
+        failed=failed_count,
+        deliveries=updated,
+        summary=summary,
+    )
+
+
+def operations_audit_sink_replay_report_to_dict(report: OperationsAuditSinkReplayReport) -> dict[str, Any]:
+    return {
+        "generated_at": report.generated_at,
+        "attempted": report.attempted,
+        "delivered": report.delivered,
+        "failed": report.failed,
+        "deliveries": [operations_audit_sink_delivery_to_dict(item) for item in report.deliveries],
+        "summary": report.summary,
+    }
+
+
+def render_operations_audit_sink_deliveries(deliveries: list[OperationsAuditSinkDelivery]) -> str:
+    lines = ["Operations audit sink deliveries:"]
+    if not deliveries:
+        lines.append("- none")
+        return "\n".join(lines)
+    for delivery in deliveries:
+        lines.append(
+            f"- {delivery.delivery_id}: audit_id={delivery.audit_id} status={delivery.status} "
+            f"attempts={delivery.attempts} delivered={delivery.delivered} failed={delivery.failed}"
+        )
+    return "\n".join(lines)
+
+
+def render_operations_audit_sink_deliveries_json(deliveries: list[OperationsAuditSinkDelivery]) -> str:
+    return json.dumps(
+        {"operations_audit_sink_deliveries": [operations_audit_sink_delivery_to_dict(item) for item in deliveries]},
+        ensure_ascii=False,
+    )
+
+
+def render_operations_audit_sink_replay_report_json(report: OperationsAuditSinkReplayReport) -> str:
+    return json.dumps({"operations_audit_sink_replay": operations_audit_sink_replay_report_to_dict(report)}, ensure_ascii=False)
 
 
 def build_operations_audit_timeline(

@@ -12,7 +12,7 @@ from urllib.parse import parse_qs, urlsplit
 from .agent import build_default_agent
 from .acceptance import render_integration_acceptance_report, run_integration_acceptance_report
 from .config import IntegrationSettings
-from .data_governance import build_audit_sink
+from .data_governance import AuditSink, HttpAuditSink, build_audit_sink
 from .evaluation import render_evaluation_report, run_evaluation_suite
 from .governance import render_release_readiness_report, run_release_readiness_report
 from .models import DeadLetterCalendarSync, DeadLetterNotification, TravelContext, TravelRequest, WorkerRunRecord
@@ -43,6 +43,9 @@ from .operations import (
     build_operations_console_view,
     build_operations_console_action_audit,
     build_operations_audit_timeline,
+    build_operations_audit_sink_delivery,
+    build_operations_console_action_audit_event,
+    build_operations_compensation_tasks,
     build_operations_governance_policy_change,
     build_operations_multidimensional_view,
     build_operations_postmortem_report,
@@ -54,6 +57,7 @@ from .operations import (
     build_postmortem_action_items,
     build_trend_alert_action_items,
     close_operations_action_item,
+    close_operations_compensation_task,
     evaluate_operations_action_sla,
     evaluate_operations_closed_loop_quality,
     evaluate_operations_drill_gate,
@@ -87,6 +91,10 @@ from .operations import (
     operations_governance_policy_change_to_dict,
     operations_console_action_audit_from_dict,
     operations_console_action_audit_to_dict,
+    operations_audit_sink_delivery_from_dict,
+    operations_audit_sink_delivery_to_dict,
+    operations_compensation_task_from_dict,
+    operations_compensation_task_to_dict,
     operations_knowledge_entry_from_dict,
     operations_knowledge_entry_to_dict,
     operations_action_authorization_to_dict,
@@ -137,6 +145,9 @@ from .operations import (
     render_operations_console_view_html,
     render_operations_console_view_json,
     render_operations_audit_timeline_json,
+    render_operations_audit_sink_deliveries_json,
+    render_operations_audit_sink_replay_report_json,
+    render_operations_compensation_task_board_json,
     render_operations_scheduled_tasks,
     render_operations_scheduler_health_report,
     render_operations_scheduler_run_report,
@@ -158,6 +169,7 @@ from .operations import (
     render_operations_postmortem_report,
     render_operations_trend_alerts,
     render_operations_trend_alerts_json,
+    retry_operations_audit_sink_deliveries,
     search_operations_knowledge,
     sync_operations_action_items_from_oncall,
     render_oncall_ticket_status,
@@ -2286,6 +2298,7 @@ def main() -> None:
             port=args.operations_dashboard_port,
             limit=args.observability_limit,
             token=args.operations_dashboard_token or settings.operations_dashboard_token,
+            audit_sink=build_audit_sink(settings),
         )
         return
     if args.export_otlp:
@@ -2835,6 +2848,80 @@ def build_operations_audit_timeline_json(
     return render_operations_audit_timeline_json(timeline)
 
 
+def build_operations_audit_sink_deliveries_json(session_store: SessionStore, limit: int = 20) -> str:
+    deliveries = [
+        operations_audit_sink_delivery_from_dict(item)
+        for item in session_store.list_operations_audit_sink_deliveries(limit)
+    ]
+    return render_operations_audit_sink_deliveries_json(deliveries)
+
+
+def build_operations_compensation_tasks_json(
+    session_store: SessionStore,
+    limit: int = 20,
+    owner: str | None = None,
+    status: str | None = None,
+    source_type: str | None = None,
+) -> str:
+    read_limit = max(100, limit * 2)
+    sessions = session_store.list_recent(read_limit)
+    replay_jobs = [
+        oncall_webhook_replay_job_from_dict(item)
+        for item in session_store.list_oncall_webhook_replay_jobs(read_limit)
+    ]
+    action_items = [
+        operations_action_item_from_dict(item)
+        for item in session_store.list_operations_action_items(read_limit)
+    ]
+    oncall_statuses = [
+        oncall_ticket_status_from_dict(item)
+        for item in session_store.list_oncall_ticket_statuses(read_limit)
+    ]
+    persisted_tasks = [
+        operations_compensation_task_from_dict(item)
+        for item in session_store.list_operations_compensation_tasks(read_limit)
+    ]
+    sla_report = evaluate_operations_action_sla(action_items, policy=build_operations_action_sla_policy())
+    board = build_operations_compensation_tasks(
+        sessions=sessions,
+        replay_jobs=replay_jobs,
+        action_items=action_items,
+        oncall_statuses=oncall_statuses,
+        persisted_tasks=persisted_tasks,
+        sla_report=sla_report,
+        limit=limit,
+        owner=owner,
+        status=status,
+        source_type=source_type,
+    )
+    return render_operations_compensation_task_board_json(board)
+
+
+def retry_operations_audit_sink_deliveries_json(
+    session_store: SessionStore,
+    audit_sink: AuditSink,
+    limit: int = 20,
+) -> str:
+    read_limit = max(100, limit * 2)
+    audits = [
+        operations_console_action_audit_from_dict(item)
+        for item in session_store.list_operations_console_action_audits(read_limit)
+    ]
+    deliveries = [
+        operations_audit_sink_delivery_from_dict(item)
+        for item in session_store.list_operations_audit_sink_deliveries(read_limit)
+    ]
+    report = retry_operations_audit_sink_deliveries(
+        audits=audits,
+        deliveries=deliveries,
+        audit_sink=audit_sink,
+        limit=limit,
+    )
+    for delivery in report.deliveries:
+        session_store.record_operations_audit_sink_delivery(operations_audit_sink_delivery_to_dict(delivery))
+    return render_operations_audit_sink_replay_report_json(report)
+
+
 def build_operations_console_view_json(
     session_store: SessionStore,
     limit: int = 20,
@@ -2915,6 +3002,8 @@ def run_operations_console_action(
         "propose_governance_policy_change": "update_governance_policy",
         "approve_governance_policy_change": "update_governance_policy",
         "rollback_governance_policy_change": "update_governance_policy",
+        "retry_audit_sink_deliveries": "retry_audit_sink_delivery",
+        "close_compensation_task": "manage_compensation_task",
     }.get(action)
     if permission_action is None:
         return _finalize_operations_console_action(
@@ -2931,6 +3020,7 @@ def run_operations_console_action(
             payload,
             {},
             requested_at,
+            audit_sink,
         )
     authorization = authorize_operations_action(
         permission_action,
@@ -2957,6 +3047,7 @@ def run_operations_console_action(
             payload,
             authorization_payload,
             requested_at,
+            audit_sink,
         )
     if action == "create_replay_job":
         events = [
@@ -3041,7 +3132,7 @@ def run_operations_console_action(
             "change": operations_governance_policy_change_to_dict(change) if change is not None else None,
             "error": None if change is not None else "governance policy change not found",
         }
-    else:
+    elif action == "rollback_governance_policy_change":
         change = _rollback_governance_policy_change(session_store, payload, actor)
         body = {
             "ok": change is not None,
@@ -3050,6 +3141,61 @@ def run_operations_console_action(
             "change": operations_governance_policy_change_to_dict(change) if change is not None else None,
             "error": None if change is not None else "governance policy change not found",
         }
+    elif action == "retry_audit_sink_deliveries":
+        retry_sink = _audit_sink_from_console_payload(payload, audit_sink)
+        if retry_sink is None:
+            body = {
+                "ok": False,
+                "action": action,
+                "authorization": operations_action_authorization_to_dict(authorization),
+                "error": "audit sink endpoint is not configured",
+            }
+        else:
+            retry_payload = json.loads(retry_operations_audit_sink_deliveries_json(session_store, retry_sink, action_limit))
+            report = retry_payload["operations_audit_sink_replay"]
+            body = {
+                "ok": int(report.get("failed") or 0) == 0,
+                "action": action,
+                "authorization": operations_action_authorization_to_dict(authorization),
+                "audit_sink_replay": report,
+            }
+    else:
+        task_id = str(payload.get("task_id") or "")
+        if not task_id:
+            body = {
+                "ok": False,
+                "action": action,
+                "authorization": operations_action_authorization_to_dict(authorization),
+                "error": "task_id is required",
+            }
+        else:
+            board_payload = json.loads(build_operations_compensation_tasks_json(session_store, max(100, action_limit)))
+            tasks = [
+                operations_compensation_task_from_dict(item)
+                for item in board_payload["operations_compensation_tasks"]["tasks"]
+            ]
+            task = next((item for item in tasks if item.task_id == task_id), None)
+            if task is None:
+                body = {
+                    "ok": False,
+                    "action": action,
+                    "authorization": operations_action_authorization_to_dict(authorization),
+                    "error": "compensation task not found",
+                    "task_id": task_id,
+                }
+            else:
+                closed = close_operations_compensation_task(
+                    task,
+                    closure_note=str(payload.get("closure_note") or "closed from operations console"),
+                    actor=actor,
+                )
+                session_store.record_operations_compensation_task(operations_compensation_task_to_dict(closed))
+                body = {
+                    "ok": True,
+                    "action": action,
+                    "authorization": operations_action_authorization_to_dict(authorization),
+                    "task": operations_compensation_task_to_dict(closed),
+                }
     return _finalize_operations_console_action(
         session_store,
         body,
@@ -3060,7 +3206,17 @@ def run_operations_console_action(
         payload,
         body.get("authorization") if isinstance(body.get("authorization"), dict) else {},
         requested_at,
+        audit_sink,
     )
+
+
+def _audit_sink_from_console_payload(payload: dict[str, object], audit_sink: object | None) -> AuditSink | None:
+    if isinstance(audit_sink, AuditSink):
+        return audit_sink
+    endpoint = payload.get("endpoint") or payload.get("audit_sink_endpoint")
+    if endpoint is None:
+        return None
+    return HttpAuditSink(str(endpoint), str(payload["token"]) if payload.get("token") is not None else None)
 
 
 def _finalize_operations_console_action(
@@ -3073,6 +3229,7 @@ def _finalize_operations_console_action(
     payload: dict[str, object],
     authorization: dict[str, object],
     requested_at: str,
+    audit_sink: object | None = None,
 ) -> str:
     audit = build_operations_console_action_audit(
         action=action,
@@ -3092,6 +3249,17 @@ def _finalize_operations_console_action(
             "status": audit.status,
             "recorded": True,
         }
+        if isinstance(audit_sink, AuditSink):
+            result = audit_sink.write([build_operations_console_action_audit_event(audit)])
+            delivery = build_operations_audit_sink_delivery(audit, result)
+            session_store.record_operations_audit_sink_delivery(operations_audit_sink_delivery_to_dict(delivery))
+            body["action_audit"]["sink_delivery"] = {
+                "delivery_id": delivery.delivery_id,
+                "status": delivery.status,
+                "delivered": delivery.delivered,
+                "failed": delivery.failed,
+                "attempts": delivery.attempts,
+            }
     except Exception as exc:
         body["action_audit"] = {
             "audit_id": audit.audit_id,
@@ -3116,6 +3284,12 @@ def make_metrics_handler(
     operations_console_html_provider: Callable[[int | None, str, list[str], str | None], str] | None = None,
     operations_audit_timeline_provider: Callable[
         [int | None, str | None, str | None, str | None, str | None],
+        str,
+    ]
+    | None = None,
+    operations_audit_sink_deliveries_provider: Callable[[int | None], str] | None = None,
+    operations_compensation_tasks_provider: Callable[
+        [int | None, str | None, str | None, str | None],
         str,
     ]
     | None = None,
@@ -3273,6 +3447,41 @@ def make_metrics_handler(
                     "application/json; charset=utf-8",
                 )
                 return
+            if path == "/operations/console/audit-sink-deliveries":
+                if operations_audit_sink_deliveries_provider is None:
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                if not self._authorized():
+                    self.send_response(401)
+                    self.end_headers()
+                    return
+                query = parse_qs(parsed.query)
+                self._send_text(
+                    operations_audit_sink_deliveries_provider(_first_query_int(query, "limit")) + "\n",
+                    "application/json; charset=utf-8",
+                )
+                return
+            if path == "/operations/console/compensation-tasks":
+                if operations_compensation_tasks_provider is None:
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                if not self._authorized():
+                    self.send_response(401)
+                    self.end_headers()
+                    return
+                query = parse_qs(parsed.query)
+                self._send_text(
+                    operations_compensation_tasks_provider(
+                        _first_query_int(query, "limit"),
+                        _first_query_value(query, "owner"),
+                        _first_query_value(query, "status"),
+                        _first_query_value(query, "source_type"),
+                    ) + "\n",
+                    "application/json; charset=utf-8",
+                )
+                return
             if path == "/operations/console/ui":
                 if operations_console_html_provider is None:
                     self.send_response(404)
@@ -3359,6 +3568,7 @@ def create_operations_dashboard_server(
     port: int = 9110,
     limit: int = 20,
     token: str | None = None,
+    audit_sink: AuditSink | None = None,
 ) -> ThreadingHTTPServer:
     return ThreadingHTTPServer(
         (host, port),
@@ -3399,6 +3609,14 @@ def create_operations_dashboard_server(
                 action=action,
                 status=status,
             ),
+            lambda request_limit: build_operations_audit_sink_deliveries_json(session_store, request_limit or limit),
+            lambda request_limit, owner, status, source_type: build_operations_compensation_tasks_json(
+                session_store,
+                request_limit or limit,
+                owner=owner,
+                status=status,
+                source_type=source_type,
+            ),
             lambda action, actor, roles, department, payload: run_operations_console_action(
                 session_store,
                 action,
@@ -3406,6 +3624,7 @@ def create_operations_dashboard_server(
                 roles=roles,
                 department=department,
                 payload=payload,
+                audit_sink=audit_sink,
                 limit=limit,
             ),
             dashboard_token=token,
@@ -3436,13 +3655,23 @@ def serve_operations_dashboard(
     port: int = 9110,
     limit: int = 20,
     token: str | None = None,
+    audit_sink: AuditSink | None = None,
 ) -> None:
-    server = create_operations_dashboard_server(session_store, host=host, port=port, limit=limit, token=token)
+    server = create_operations_dashboard_server(
+        session_store,
+        host=host,
+        port=port,
+        limit=limit,
+        token=token,
+        audit_sink=audit_sink,
+    )
     actual_host, actual_port = server.server_address
     print(f"Serving operations dashboard on http://{actual_host}:{actual_port}/operations/closed-loop")
     print(f"Serving OnCall webhook ops on http://{actual_host}:{actual_port}/operations/oncall-webhook-ops")
     print(f"Serving operations console on http://{actual_host}:{actual_port}/operations/console")
     print(f"Serving operations audit timeline on http://{actual_host}:{actual_port}/operations/console/audit-timeline")
+    print(f"Serving operations audit sink deliveries on http://{actual_host}:{actual_port}/operations/console/audit-sink-deliveries")
+    print(f"Serving operations compensation tasks on http://{actual_host}:{actual_port}/operations/console/compensation-tasks")
     print(f"Serving operations console UI on http://{actual_host}:{actual_port}/operations/console/ui")
     try:
         server.serve_forever()

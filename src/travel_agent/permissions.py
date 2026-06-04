@@ -20,6 +20,8 @@ KNOWN_ACTIONS = {
     "run_operations_schedule",
     "publish_closed_loop_schema",
     "update_governance_policy",
+    "retry_audit_sink_delivery",
+    "manage_compensation_task",
 }
 
 

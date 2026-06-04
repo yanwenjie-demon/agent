@@ -39,7 +39,7 @@ from .models import (
 )
 
 
-SQLITE_SCHEMA_VERSION = 11
+SQLITE_SCHEMA_VERSION = 13
 
 
 class StoreConcurrencyError(RuntimeError):
@@ -173,6 +173,18 @@ class SessionStore(Protocol):
     def list_operations_console_action_audits(self, limit: int = 20) -> list[dict[str, Any]]:
         ...
 
+    def record_operations_audit_sink_delivery(self, delivery: dict[str, Any]) -> None:
+        ...
+
+    def list_operations_audit_sink_deliveries(self, limit: int = 20) -> list[dict[str, Any]]:
+        ...
+
+    def record_operations_compensation_task(self, task: dict[str, Any]) -> None:
+        ...
+
+    def list_operations_compensation_tasks(self, limit: int = 20) -> list[dict[str, Any]]:
+        ...
+
 
 class InMemorySessionStore:
     def __init__(self) -> None:
@@ -190,6 +202,8 @@ class InMemorySessionStore:
         self._operations_scheduler_runs: list[dict[str, Any]] = []
         self._operations_governance_policy_changes: list[dict[str, Any]] = []
         self._operations_console_action_audits: list[dict[str, Any]] = []
+        self._operations_audit_sink_deliveries: list[dict[str, Any]] = []
+        self._operations_compensation_tasks: list[dict[str, Any]] = []
 
     def save(self, context: TravelContext) -> None:
         self._sessions[context.session_id] = context
@@ -375,6 +389,28 @@ class InMemorySessionStore:
 
     def list_operations_console_action_audits(self, limit: int = 20) -> list[dict[str, Any]]:
         return list(reversed(self._operations_console_action_audits[-limit:]))
+
+    def record_operations_audit_sink_delivery(self, delivery: dict[str, Any]) -> None:
+        self._operations_audit_sink_deliveries = [
+            existing
+            for existing in self._operations_audit_sink_deliveries
+            if existing.get("delivery_id") != delivery.get("delivery_id")
+        ]
+        self._operations_audit_sink_deliveries.append(dict(delivery))
+
+    def list_operations_audit_sink_deliveries(self, limit: int = 20) -> list[dict[str, Any]]:
+        return list(reversed(self._operations_audit_sink_deliveries[-limit:]))
+
+    def record_operations_compensation_task(self, task: dict[str, Any]) -> None:
+        self._operations_compensation_tasks = [
+            existing
+            for existing in self._operations_compensation_tasks
+            if existing.get("task_id") != task.get("task_id")
+        ]
+        self._operations_compensation_tasks.append(dict(task))
+
+    def list_operations_compensation_tasks(self, limit: int = 20) -> list[dict[str, Any]]:
+        return list(reversed(self._operations_compensation_tasks[-limit:]))
 
 
 class SQLiteSessionStore:
@@ -1122,6 +1158,105 @@ class SQLiteSessionStore:
             ).fetchall()
         return [json.loads(row[0]) for row in rows]
 
+    def record_operations_audit_sink_delivery(self, delivery: dict[str, Any]) -> None:
+        delivery_id = str(delivery.get("delivery_id") or "")
+        if not delivery_id:
+            raise ValueError("Operations audit sink delivery requires delivery_id.")
+        payload = json.dumps(delivery, ensure_ascii=False, default=_json_default)
+        with closing(self._connect()) as connection:
+            connection.execute(
+                """
+                INSERT INTO operations_audit_sink_deliveries(
+                    delivery_id,
+                    audit_id,
+                    event_type,
+                    status,
+                    attempted_at,
+                    payload
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(delivery_id) DO UPDATE SET
+                    audit_id = excluded.audit_id,
+                    event_type = excluded.event_type,
+                    status = excluded.status,
+                    attempted_at = excluded.attempted_at,
+                    payload = excluded.payload
+                """,
+                (
+                    delivery_id,
+                    str(delivery.get("audit_id") or ""),
+                    str(delivery.get("event_type") or ""),
+                    str(delivery.get("status") or ""),
+                    str(delivery.get("attempted_at") or ""),
+                    payload,
+                ),
+            )
+            connection.commit()
+
+    def list_operations_audit_sink_deliveries(self, limit: int = 20) -> list[dict[str, Any]]:
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                """
+                SELECT payload
+                FROM operations_audit_sink_deliveries
+                ORDER BY attempted_at DESC, rowid DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [json.loads(row[0]) for row in rows]
+
+    def record_operations_compensation_task(self, task: dict[str, Any]) -> None:
+        task_id = str(task.get("task_id") or "")
+        if not task_id:
+            raise ValueError("Operations compensation task requires task_id.")
+        payload = json.dumps(task, ensure_ascii=False, default=_json_default)
+        with closing(self._connect()) as connection:
+            connection.execute(
+                """
+                INSERT INTO operations_compensation_tasks(
+                    task_id,
+                    source_type,
+                    source_id,
+                    status,
+                    owner,
+                    updated_at,
+                    payload
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(task_id) DO UPDATE SET
+                    source_type = excluded.source_type,
+                    source_id = excluded.source_id,
+                    status = excluded.status,
+                    owner = excluded.owner,
+                    updated_at = excluded.updated_at,
+                    payload = excluded.payload
+                """,
+                (
+                    task_id,
+                    str(task.get("source_type") or ""),
+                    str(task.get("source_id") or ""),
+                    str(task.get("status") or ""),
+                    str(task.get("owner") or ""),
+                    str(task.get("updated_at") or ""),
+                    payload,
+                ),
+            )
+            connection.commit()
+
+    def list_operations_compensation_tasks(self, limit: int = 20) -> list[dict[str, Any]]:
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                """
+                SELECT payload
+                FROM operations_compensation_tasks
+                ORDER BY updated_at DESC, rowid DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [json.loads(row[0]) for row in rows]
+
     def health_check(self) -> StorageHealth:
         details: dict[str, str] = {}
         try:
@@ -1165,6 +1300,12 @@ class SQLiteSessionStore:
                 console_action_audit_count = int(
                     connection.execute("SELECT COUNT(*) FROM operations_console_action_audits").fetchone()[0]
                 )
+                audit_sink_delivery_count = int(
+                    connection.execute("SELECT COUNT(*) FROM operations_audit_sink_deliveries").fetchone()[0]
+                )
+                compensation_task_count = int(
+                    connection.execute("SELECT COUNT(*) FROM operations_compensation_tasks").fetchone()[0]
+                )
                 integrity = str(connection.execute("PRAGMA integrity_check").fetchone()[0])
                 journal_mode = str(connection.execute("PRAGMA journal_mode").fetchone()[0])
             details["integrity_check"] = integrity
@@ -1181,6 +1322,8 @@ class SQLiteSessionStore:
             details["operations_scheduler_runs"] = str(scheduler_run_count)
             details["operations_governance_policy_changes"] = str(governance_policy_change_count)
             details["operations_console_action_audits"] = str(console_action_audit_count)
+            details["operations_audit_sink_deliveries"] = str(audit_sink_delivery_count)
+            details["operations_compensation_tasks"] = str(compensation_task_count)
             return StorageHealth(
                 backend="sqlite",
                 ok=integrity.lower() == "ok" and schema_version >= SQLITE_SCHEMA_VERSION,
@@ -1386,6 +1529,31 @@ class SQLiteSessionStore:
                 """
             )
             connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS operations_audit_sink_deliveries (
+                    delivery_id TEXT PRIMARY KEY,
+                    audit_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    attempted_at TEXT NOT NULL,
+                    payload TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS operations_compensation_tasks (
+                    task_id TEXT PRIMARY KEY,
+                    source_type TEXT NOT NULL,
+                    source_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    owner TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    payload TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_travel_sessions_state_updated ON travel_sessions(state, updated_at)"
             )
             connection.execute(
@@ -1429,6 +1597,12 @@ class SQLiteSessionStore:
             )
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_operations_console_action_audits_completed ON operations_console_action_audits(completed_at, action, actor)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_operations_audit_sink_deliveries_attempted ON operations_audit_sink_deliveries(attempted_at, status, audit_id)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_operations_compensation_tasks_updated ON operations_compensation_tasks(updated_at, status, owner)"
             )
             connection.execute(
                 """
@@ -1706,6 +1880,22 @@ class HttpSessionStore:
     def list_operations_console_action_audits(self, limit: int = 20) -> list[dict[str, Any]]:
         response = self._post("/operations/console-action-audits/list", {"limit": limit})
         records = response.get("audits") or response.get("records") or response.get("items") or []
+        return [dict(item) for item in records]
+
+    def record_operations_audit_sink_delivery(self, delivery: dict[str, Any]) -> None:
+        self._post("/operations/audit-sink-deliveries/record", {"delivery": delivery})
+
+    def list_operations_audit_sink_deliveries(self, limit: int = 20) -> list[dict[str, Any]]:
+        response = self._post("/operations/audit-sink-deliveries/list", {"limit": limit})
+        records = response.get("deliveries") or response.get("records") or response.get("items") or []
+        return [dict(item) for item in records]
+
+    def record_operations_compensation_task(self, task: dict[str, Any]) -> None:
+        self._post("/operations/compensation-tasks/record", {"task": task})
+
+    def list_operations_compensation_tasks(self, limit: int = 20) -> list[dict[str, Any]]:
+        response = self._post("/operations/compensation-tasks/list", {"limit": limit})
+        records = response.get("tasks") or response.get("records") or response.get("items") or []
         return [dict(item) for item in records]
 
     def health_check(self) -> StorageHealth:

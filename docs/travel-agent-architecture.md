@@ -179,8 +179,10 @@ Order Tool 创建订单
 - Web 控制台与 RBAC 视图已支持 `/operations/console/view` 和 `/operations/console/ui`，按 actor、roles、department 生成可见 sections、可执行 actions、权限状态和只读 HTML 控制台页面。
 - 控制台交互动作已支持 `/operations/console/actions`，可通过 token + RBAC 保护的 `create_replay_job`、`execute_replay_jobs`、`run_operations_schedule`、`publish_closed_loop_schema`、`propose_governance_policy_change`、`approve_governance_policy_change` 和 `rollback_governance_policy_change` POST action 创建/执行 replay job、手动触发 scheduler、发布 BI contract、提交/审批/回滚治理策略变更，并写回 replay job、webhook event、OnCall ticket status、scheduler run history、治理策略变更 diff/审批记录和控制台 action audit。
 - 审计回放查询视图已支持 `/operations/console/audit-timeline`，将已落库的控制台 action audit、治理策略变更、replay job 和 scheduler run 聚合成统一操作时间线，并可按 event type、actor、action、status 和 limit 查询。
+- 审计 sink 回放联动已支持控制台 action audit 外部投递状态落库、`/operations/console/audit-sink-deliveries` 查询和 `retry_audit_sink_deliveries` 失败投递重试；投递记录可持久化到内存、SQLite 或 HTTP store。
+- 补偿任务生命周期编排已支持 `/operations/console/compensation-tasks`，将恢复补偿、replay job、行动项 SLA 和 OnCall 状态聚合为统一任务板，并支持 `close_compensation_task` 人工验收关闭和持久化覆盖。
 
-第一阶段历史范围曾暂不包含真实库存、真实 OA、订单创建、补偿和多 Agent。当前实现已推进到真实系统适配、酒店 + 交通组合下单、异常恢复、通知死信、多 Agent 协作深化、改签/退订深化、日历同步重试/死信、Prometheus 文本指标出口、HTTP `/metrics` 服务、OTLP/HTTP 导出、内置评测集、生产化存储准备、外部生产存储适配、联调验收报告、真实端到端探活、发布准入门禁、灰度发布决策、权限策略检查、脱敏审计事件、外部权限/审计适配、CI/CD 发布 gate、生产运行 runbook、SLO 告警聚合、事故演练自动化、告警平台接入、演练流水线化、生产运行看板、告警规则模板、真实值班闭环、看板数据落库、工单状态回写、告警规则配置化、看板趋势分析、多维运行视图、事故复盘自动化、趋势阈值告警自动化、复盘行动项闭环、运营知识库沉淀、运营知识检索增强、行动项 SLA 与升级、运营闭环报表、知识检索接入 Agent 规划、SLA 自动通知联动、闭环指标外部导出、知识驱动异常恢复、SLA 回执与工单闭环、闭环报表 snapshot、恢复策略自动化决策、工单 webhook 摄入、闭环看板服务化、恢复策略执行门禁、webhook 安全幂等、看板鉴权过滤、恢复策略自动执行、Webhook 死信重放、闭环看板增量视图、自动恢复治理、Webhook 死信批处理、BI 契约深化、恢复治理外部化、Webhook 运营控制台、BI 契约发布、治理策略中心化、Webhook 控制台服务化、BI 发布自动化、运维自动化调度、运维权限审计深化、运营控制台聚合、持久化运维调度租约锁、调度运行历史健康告警、Web 控制台 RBAC 视图、控制台 replay job/scheduler/BI contract 交互动作、治理策略变更审批/回滚、控制台 action audit 落库和审计回放查询视图；下一阶段主线转为审计 sink 回放联动和补偿任务生命周期编排。
+第一阶段历史范围曾暂不包含真实库存、真实 OA、订单创建、补偿和多 Agent。当前实现已推进到真实系统适配、酒店 + 交通组合下单、异常恢复、通知死信、多 Agent 协作深化、改签/退订深化、日历同步重试/死信、Prometheus 文本指标出口、HTTP `/metrics` 服务、OTLP/HTTP 导出、内置评测集、生产化存储准备、外部生产存储适配、联调验收报告、真实端到端探活、发布准入门禁、灰度发布决策、权限策略检查、脱敏审计事件、外部权限/审计适配、CI/CD 发布 gate、生产运行 runbook、SLO 告警聚合、事故演练自动化、告警平台接入、演练流水线化、生产运行看板、告警规则模板、真实值班闭环、看板数据落库、工单状态回写、告警规则配置化、看板趋势分析、多维运行视图、事故复盘自动化、趋势阈值告警自动化、复盘行动项闭环、运营知识库沉淀、运营知识检索增强、行动项 SLA 与升级、运营闭环报表、知识检索接入 Agent 规划、SLA 自动通知联动、闭环指标外部导出、知识驱动异常恢复、SLA 回执与工单闭环、闭环报表 snapshot、恢复策略自动化决策、工单 webhook 摄入、闭环看板服务化、恢复策略执行门禁、webhook 安全幂等、看板鉴权过滤、恢复策略自动执行、Webhook 死信重放、闭环看板增量视图、自动恢复治理、Webhook 死信批处理、BI 契约深化、恢复治理外部化、Webhook 运营控制台、BI 契约发布、治理策略中心化、Webhook 控制台服务化、BI 发布自动化、运维自动化调度、运维权限审计深化、运营控制台聚合、持久化运维调度租约锁、调度运行历史健康告警、Web 控制台 RBAC 视图、控制台 replay job/scheduler/BI contract 交互动作、治理策略变更审批/回滚、控制台 action audit 落库、审计回放查询视图、审计 sink 回放联动和补偿任务生命周期编排；下一阶段主线转为补偿任务自动执行与外部工单联动。
 
 ## 4. 单 Agent 架构
 
@@ -690,5 +692,4 @@ python -m unittest discover -s tests
 
 下一阶段主线：
 
-- 审计 sink 回放联动：将本地 action audit 与外部审计 sink 投递状态联动，支持失败投递的重试、标记和告警。
-- 补偿任务生命周期编排：将恢复补偿、replay job、行动项 SLA 和 OnCall 状态联动，形成自动升级、人工接管和关闭验收。
+- 补偿任务自动执行与外部工单联动：在补偿任务板基础上接入自动执行策略、外部工单创建/同步和失败重试编排。
