@@ -681,6 +681,46 @@ class OperationsCompensationSloReport:
 
 
 @dataclass(frozen=True)
+class OperationsCompensationRemediationPolicy:
+    enabled: bool = True
+    create_action_items: bool = True
+    controlled_retry_enabled: bool = True
+    max_retry_tasks: int = 3
+    retry_statuses: set[str] = field(default_factory=lambda: {"OPEN", "ESCALATED"})
+    retry_severities: set[str] = field(default_factory=lambda: {"critical", "warning"})
+    action_owner: str = "travel-ops"
+    action_eta: str | None = None
+    runbook_owner: str = "travel-ops"
+    dry_run: bool = False
+
+
+@dataclass(frozen=True)
+class OperationsCompensationRunbookExecution:
+    runbook_id: str
+    title: str
+    status: str
+    trigger: str
+    owner: str
+    executed_at: str
+    action: str
+    evidence: list[str]
+
+
+@dataclass(frozen=True)
+class OperationsCompensationRemediationReport:
+    generated_at: str
+    ok: bool
+    policy: OperationsCompensationRemediationPolicy
+    slo_report: OperationsCompensationSloReport
+    action_items: list[OperationsActionItem]
+    runbook_executions: list[OperationsCompensationRunbookExecution]
+    retry_candidates: list[OperationsCompensationTask]
+    retry_task_ids: list[str]
+    retry_execution_report: OperationsCompensationTaskExecutionReport | None
+    summary: str
+
+
+@dataclass(frozen=True)
 class OnCallWebhookEvent:
     event_id: str
     ticket_id: str | None
@@ -934,6 +974,12 @@ def build_operations_runbook() -> OperationsRunbook:
                 title="人工补偿",
                 when="订单、库存或审批出现部分成功",
                 action="按 session_id 定位上下文，优先执行取消、释放库存、撤回审批和退款确认。",
+            ),
+            RunbookItem(
+                title="补偿 SLO 自动处置",
+                when="补偿执行 SLO burn rate、失败、重试等待或调度失败告警触发",
+                action="先创建或升级行动项，再按补偿执行策略触发受控重试；所有动作保留 runbook 执行记录和控制台审计。",
+                owner="travel-ops",
             ),
             RunbookItem(
                 title="权限中心不可用",
@@ -1747,6 +1793,14 @@ def _string_set(value: Any) -> set[str]:
     return {str(item).strip() for item in items if str(item).strip()}
 
 
+def _upper_string_set(value: Any) -> set[str]:
+    return {item.upper() for item in _string_set(value)}
+
+
+def _lower_string_set(value: Any) -> set[str]:
+    return {item.lower() for item in _string_set(value)}
+
+
 def operations_compensation_execution_gate_to_dict(
     gate: OperationsCompensationExecutionGate,
 ) -> dict[str, Any]:
@@ -2262,6 +2316,153 @@ def open_operations_compensation_slo_ticket_http(
     )
 
 
+def build_operations_compensation_remediation_policy(
+    config_json: str | None = None,
+) -> OperationsCompensationRemediationPolicy:
+    if not config_json:
+        return OperationsCompensationRemediationPolicy()
+    try:
+        payload = json.loads(config_json)
+    except (TypeError, ValueError):
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    return operations_compensation_remediation_policy_from_dict(payload)
+
+
+def operations_compensation_remediation_policy_to_dict(
+    policy: OperationsCompensationRemediationPolicy,
+) -> dict[str, Any]:
+    return {
+        "enabled": policy.enabled,
+        "create_action_items": policy.create_action_items,
+        "controlled_retry_enabled": policy.controlled_retry_enabled,
+        "max_retry_tasks": policy.max_retry_tasks,
+        "retry_statuses": sorted(policy.retry_statuses),
+        "retry_severities": sorted(policy.retry_severities),
+        "action_owner": policy.action_owner,
+        "action_eta": policy.action_eta,
+        "runbook_owner": policy.runbook_owner,
+        "dry_run": policy.dry_run,
+    }
+
+
+def operations_compensation_remediation_policy_from_dict(
+    payload: dict[str, Any] | None,
+) -> OperationsCompensationRemediationPolicy:
+    payload = dict(payload or {})
+    return OperationsCompensationRemediationPolicy(
+        enabled=_safe_bool(payload.get("enabled"), True),
+        create_action_items=_safe_bool(payload.get("create_action_items"), True),
+        controlled_retry_enabled=_safe_bool(payload.get("controlled_retry_enabled"), True),
+        max_retry_tasks=max(0, _safe_int(payload.get("max_retry_tasks"), 3)),
+        retry_statuses=_upper_string_set(payload.get("retry_statuses")) or {"OPEN", "ESCALATED"},
+        retry_severities=_lower_string_set(payload.get("retry_severities")) or {"critical", "warning"},
+        action_owner=str(payload.get("action_owner") or "travel-ops"),
+        action_eta=str(payload["action_eta"]) if payload.get("action_eta") is not None else None,
+        runbook_owner=str(payload.get("runbook_owner") or "travel-ops"),
+        dry_run=_safe_bool(payload.get("dry_run"), False),
+    )
+
+
+def build_operations_compensation_remediation_report(
+    slo_report: OperationsCompensationSloReport,
+    tasks: list[OperationsCompensationTask] | None = None,
+    retry_execution_report: OperationsCompensationTaskExecutionReport | None = None,
+    policy: OperationsCompensationRemediationPolicy | None = None,
+    generated_at: str | None = None,
+) -> OperationsCompensationRemediationReport:
+    generated_at = generated_at or datetime.now(timezone.utc).isoformat()
+    policy = policy or OperationsCompensationRemediationPolicy()
+    alerts = [_normalize_alert(alert) for alert in slo_report.alerts]
+    action_items = (
+        _compensation_remediation_action_items(alerts, policy, generated_at)
+        if policy.enabled and policy.create_action_items and alerts
+        else []
+    )
+    retry_candidates = (
+        _compensation_remediation_retry_candidates(tasks or [], policy)
+        if policy.enabled and policy.controlled_retry_enabled and alerts
+        else []
+    )
+    retry_task_ids = [task.task_id for task in retry_candidates[: policy.max_retry_tasks]]
+    runbook_executions = (
+        _compensation_remediation_runbooks(alerts, retry_task_ids, policy, generated_at)
+        if policy.enabled and alerts
+        else []
+    )
+    ok = slo_report.ok or (not alerts and not retry_candidates)
+    summary = (
+        f"compensation_remediation ok={ok} alerts={len(alerts)} "
+        f"action_items={len(action_items)} retry_candidates={len(retry_candidates)} "
+        f"retry_selected={len(retry_task_ids)} runbooks={len(runbook_executions)} dry_run={policy.dry_run}"
+    )
+    return OperationsCompensationRemediationReport(
+        generated_at=generated_at,
+        ok=ok,
+        policy=policy,
+        slo_report=slo_report,
+        action_items=action_items,
+        runbook_executions=runbook_executions,
+        retry_candidates=retry_candidates,
+        retry_task_ids=retry_task_ids,
+        retry_execution_report=retry_execution_report,
+        summary=summary,
+    )
+
+
+def operations_compensation_runbook_execution_to_dict(
+    execution: OperationsCompensationRunbookExecution,
+) -> dict[str, Any]:
+    return {
+        "runbook_id": execution.runbook_id,
+        "title": execution.title,
+        "status": execution.status,
+        "trigger": execution.trigger,
+        "owner": execution.owner,
+        "executed_at": execution.executed_at,
+        "action": execution.action,
+        "evidence": execution.evidence,
+    }
+
+
+def operations_compensation_remediation_report_to_dict(
+    report: OperationsCompensationRemediationReport,
+) -> dict[str, Any]:
+    return {
+        "generated_at": report.generated_at,
+        "ok": report.ok,
+        "policy": operations_compensation_remediation_policy_to_dict(report.policy),
+        "slo": operations_compensation_slo_report_to_dict(report.slo_report),
+        "action_items": [operations_action_item_to_dict(item) for item in report.action_items],
+        "runbook_executions": [
+            operations_compensation_runbook_execution_to_dict(item)
+            for item in report.runbook_executions
+        ],
+        "retry_candidates": [operations_compensation_task_to_dict(task) for task in report.retry_candidates],
+        "retry_task_ids": report.retry_task_ids,
+        "retry_execution": (
+            operations_compensation_task_execution_report_to_dict(report.retry_execution_report)
+            if report.retry_execution_report is not None
+            else None
+        ),
+        "summary": report.summary,
+    }
+
+
+def render_operations_compensation_remediation_report_json(
+    report: OperationsCompensationRemediationReport,
+) -> str:
+    return json.dumps(
+        {
+            "operations_compensation_remediation": (
+                operations_compensation_remediation_report_to_dict(report)
+            )
+        },
+        ensure_ascii=False,
+    )
+
+
 def open_compensation_task_ticket_http(
     task: OperationsCompensationTask,
     endpoint: str,
@@ -2528,6 +2729,91 @@ def _compensation_slo_alert(
         "generated_at": generated_at,
         **extra,
     }
+
+
+def _compensation_remediation_action_items(
+    alerts: list[dict[str, Any]],
+    policy: OperationsCompensationRemediationPolicy,
+    generated_at: str,
+) -> list[OperationsActionItem]:
+    items: list[OperationsActionItem] = []
+    for alert in alerts:
+        alert_type = str(alert.get("alert_type") or "unknown")
+        severity = str(alert.get("severity") or "warning")
+        owner = str(alert.get("route") or policy.action_owner or "travel-ops")
+        title = f"Remediate compensation SLO alert: {alert_type}"
+        evidence = [
+            f"alert_type={alert_type}",
+            f"severity={severity}",
+            f"value={alert.get('value')}",
+            f"message={alert.get('message')}",
+        ]
+        if alert.get("burn_rate") is not None:
+            evidence.append(f"burn_rate={alert.get('burn_rate')}")
+        if alert.get("escalation"):
+            evidence.append(f"escalation={alert.get('escalation')}")
+        items.append(
+            OperationsActionItem(
+                action_id=_stable_id("ACT", "compensation_slo", alert_type, severity, str(alert.get("generated_at") or generated_at)),
+                source_type="compensation_slo",
+                source_id=alert_type,
+                title=title,
+                owner=owner,
+                status="OPEN",
+                eta=policy.action_eta,
+                created_at=generated_at,
+                updated_at=generated_at,
+                evidence=evidence,
+            )
+        )
+    return items
+
+
+def _compensation_remediation_retry_candidates(
+    tasks: list[OperationsCompensationTask],
+    policy: OperationsCompensationRemediationPolicy,
+) -> list[OperationsCompensationTask]:
+    candidates = [
+        task
+        for task in tasks
+        if task.status.upper() in policy.retry_statuses
+        and task.severity.lower() in policy.retry_severities
+    ]
+    candidates.sort(key=lambda task: (_severity_rank(task.severity), _timestamp_sort_key(task.updated_at), task.task_id), reverse=True)
+    return candidates[: policy.max_retry_tasks]
+
+
+def _compensation_remediation_runbooks(
+    alerts: list[dict[str, Any]],
+    retry_task_ids: list[str],
+    policy: OperationsCompensationRemediationPolicy,
+    generated_at: str,
+) -> list[OperationsCompensationRunbookExecution]:
+    if not alerts:
+        return []
+    alert_types = [str(alert.get("alert_type") or "unknown") for alert in alerts]
+    status = "DRY_RUN" if policy.dry_run else "RECORDED"
+    action = (
+        "Create or update compensation SLO action items; trigger controlled compensation retry for selected tasks."
+        if retry_task_ids
+        else "Create or update compensation SLO action items; no retry candidate selected."
+    )
+    return [
+        OperationsCompensationRunbookExecution(
+            runbook_id=_stable_id("ORB", "compensation_slo_remediation", generated_at, ",".join(alert_types)),
+            title="补偿 SLO 自动处置",
+            status=status,
+            trigger=",".join(_dedupe(alert_types)),
+            owner=policy.runbook_owner,
+            executed_at=generated_at,
+            action=action,
+            evidence=[
+                f"alerts={len(alerts)}",
+                f"retry_task_ids={','.join(retry_task_ids) if retry_task_ids else '-'}",
+                f"dry_run={policy.dry_run}",
+            ],
+        )
+    ]
 
 
 def _compensation_tasks_from_session(context: TravelContext, generated_at: str) -> list[OperationsCompensationTask]:
