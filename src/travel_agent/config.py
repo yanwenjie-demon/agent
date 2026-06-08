@@ -45,6 +45,7 @@ class IntegrationSettings:
     recovery_approval_api_url: str | None = None
     recovery_governance_policy_json: str | None = None
     recovery_governance_policy_api_url: str | None = None
+    compensation_execution_policy_json: str | None = None
     operations_dashboard_token: str | None = None
     alert_rules_json: str | None = None
     trend_alert_rules_json: str | None = None
@@ -113,6 +114,7 @@ class IntegrationSettings:
             recovery_approval_api_url=_optional_env("TRAVEL_RECOVERY_APPROVAL_API_URL"),
             recovery_governance_policy_json=_optional_env("TRAVEL_RECOVERY_GOVERNANCE_POLICY_JSON"),
             recovery_governance_policy_api_url=_optional_env("TRAVEL_RECOVERY_GOVERNANCE_POLICY_API_URL"),
+            compensation_execution_policy_json=_optional_env("TRAVEL_COMPENSATION_EXECUTION_POLICY_JSON"),
             operations_dashboard_token=_optional_env("TRAVEL_OPERATIONS_DASHBOARD_TOKEN"),
             alert_rules_json=_optional_env("TRAVEL_ALERT_RULES_JSON"),
             trend_alert_rules_json=_optional_env("TRAVEL_TREND_ALERT_RULES_JSON"),

@@ -585,6 +585,26 @@ class OperationsCompensationTaskBoard:
 
 
 @dataclass(frozen=True)
+class OperationsCompensationExecutionPolicy:
+    enabled: bool = True
+    max_batch_size: int = 20
+    retry_window_seconds: int = 900
+    max_failures_per_task: int = 3
+    allowed_severities: set[str] = field(default_factory=lambda: {"critical", "warning", "info"})
+    require_oncall_endpoint_for_sources: set[str] = field(default_factory=set)
+    dry_run: bool = False
+
+
+@dataclass(frozen=True)
+class OperationsCompensationExecutionGate:
+    allowed: bool
+    task_id: str
+    status: str
+    reason: str
+    next_retry_at: str | None = None
+
+
+@dataclass(frozen=True)
 class OperationsCompensationTaskExecution:
     execution_id: str
     task_id: str
@@ -594,6 +614,7 @@ class OperationsCompensationTaskExecution:
     executed_at: str
     task: OperationsCompensationTask
     ticket_result: OnCallTicketResult | None = None
+    gate: OperationsCompensationExecutionGate | None = None
 
 
 @dataclass(frozen=True)
@@ -604,6 +625,30 @@ class OperationsCompensationTaskExecutionReport:
     failed: int
     skipped: int
     executions: list[OperationsCompensationTaskExecution]
+    summary: str
+    policy: OperationsCompensationExecutionPolicy = field(default_factory=OperationsCompensationExecutionPolicy)
+
+
+@dataclass(frozen=True)
+class OperationsCompensationExecutionObservabilityReport:
+    generated_at: str
+    task_count: int
+    attempted: int
+    succeeded: int
+    failed: int
+    skipped: int
+    success_rate: float
+    manual_interventions: int
+    retry_waiting: int
+    gate_counts: dict[str, int]
+    failure_reasons: dict[str, int]
+    action_counts: dict[str, int]
+    scheduler_runs: int
+    scheduler_attempted: int
+    scheduler_failed: int
+    console_actions: int
+    latest_attempt_at: str | None
+    slowest_retry_seconds: int | None
     summary: str
 
 
@@ -1592,6 +1637,93 @@ def render_operations_compensation_task_board_json(board: OperationsCompensation
     return json.dumps({"operations_compensation_tasks": operations_compensation_task_board_to_dict(board)}, ensure_ascii=False)
 
 
+def build_operations_compensation_execution_policy(
+    config_json: str | None = None,
+) -> OperationsCompensationExecutionPolicy:
+    if not config_json:
+        return OperationsCompensationExecutionPolicy()
+    try:
+        payload = json.loads(config_json)
+    except (TypeError, ValueError):
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    return operations_compensation_execution_policy_from_dict(payload)
+
+
+def operations_compensation_execution_policy_to_dict(
+    policy: OperationsCompensationExecutionPolicy,
+) -> dict[str, Any]:
+    return {
+        "enabled": policy.enabled,
+        "max_batch_size": policy.max_batch_size,
+        "retry_window_seconds": policy.retry_window_seconds,
+        "max_failures_per_task": policy.max_failures_per_task,
+        "allowed_severities": sorted(policy.allowed_severities),
+        "require_oncall_endpoint_for_sources": sorted(policy.require_oncall_endpoint_for_sources),
+        "dry_run": policy.dry_run,
+    }
+
+
+def operations_compensation_execution_policy_from_dict(
+    payload: dict[str, Any] | None,
+) -> OperationsCompensationExecutionPolicy:
+    payload = dict(payload or {})
+    return OperationsCompensationExecutionPolicy(
+        enabled=_safe_bool(payload.get("enabled"), True),
+        max_batch_size=max(0, _safe_int(payload.get("max_batch_size"), 20)),
+        retry_window_seconds=max(0, _safe_int(payload.get("retry_window_seconds"), 900)),
+        max_failures_per_task=max(0, _safe_int(payload.get("max_failures_per_task"), 3)),
+        allowed_severities=_string_set(payload.get("allowed_severities")) or {"critical", "warning", "info"},
+        require_oncall_endpoint_for_sources=_string_set(payload.get("require_oncall_endpoint_for_sources")),
+        dry_run=_safe_bool(payload.get("dry_run"), False),
+    )
+
+
+def _safe_int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_bool(value: Any, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
+
+
+def _string_set(value: Any) -> set[str]:
+    if value is None:
+        return set()
+    if isinstance(value, str):
+        items = value.split(",")
+    elif isinstance(value, (list, tuple, set)):
+        items = value
+    else:
+        return set()
+    return {str(item).strip() for item in items if str(item).strip()}
+
+
+def operations_compensation_execution_gate_to_dict(
+    gate: OperationsCompensationExecutionGate,
+) -> dict[str, Any]:
+    return {
+        "allowed": gate.allowed,
+        "task_id": gate.task_id,
+        "status": gate.status,
+        "reason": gate.reason,
+        "next_retry_at": gate.next_retry_at,
+    }
+
+
 def execute_operations_compensation_tasks(
     tasks: list[OperationsCompensationTask],
     limit: int = 20,
@@ -1600,11 +1732,33 @@ def execute_operations_compensation_tasks(
     http_client: Any | None = None,
     executed_at: str | None = None,
     actor: str = "operations",
+    policy: OperationsCompensationExecutionPolicy | None = None,
 ) -> OperationsCompensationTaskExecutionReport:
     executed_at = executed_at or datetime.now(timezone.utc).isoformat()
-    selected = [task for task in tasks if task.status in {"OPEN", "ESCALATED"}][: max(0, limit)]
+    policy = policy or OperationsCompensationExecutionPolicy()
+    policy_limit = min(max(0, limit), policy.max_batch_size)
+    candidates = [task for task in tasks if task.status in {"OPEN", "ESCALATED"}]
+    selected = candidates[:policy_limit]
     executions: list[OperationsCompensationTaskExecution] = []
     for task in selected:
+        gate = evaluate_operations_compensation_execution_gate(
+            task,
+            policy=policy,
+            oncall_endpoint=oncall_endpoint,
+            now=executed_at,
+        )
+        if not gate.allowed:
+            executions.append(_skipped_compensation_task_execution(task, gate, executed_at, actor))
+            continue
+        if policy.dry_run:
+            dry_run_gate = OperationsCompensationExecutionGate(
+                allowed=False,
+                task_id=task.task_id,
+                status="DRY_RUN",
+                reason="dry run policy",
+            )
+            executions.append(_skipped_compensation_task_execution(task, dry_run_gate, executed_at, actor))
+            continue
         execution = _execute_single_compensation_task(
             task,
             oncall_endpoint=oncall_endpoint,
@@ -1612,12 +1766,16 @@ def execute_operations_compensation_tasks(
             http_client=http_client,
             executed_at=executed_at,
             actor=actor,
+            gate=gate,
         )
         executions.append(execution)
     succeeded = sum(1 for item in executions if item.status == "SUCCESS")
     failed = sum(1 for item in executions if item.status == "FAILED")
     skipped = sum(1 for item in executions if item.status == "SKIPPED")
-    summary = f"compensation_task_executions attempted={len(executions)} succeeded={succeeded} failed={failed} skipped={skipped}"
+    summary = (
+        f"compensation_task_executions attempted={len(executions)} selected={len(selected)} "
+        f"candidates={len(candidates)} succeeded={succeeded} failed={failed} skipped={skipped}"
+    )
     return OperationsCompensationTaskExecutionReport(
         generated_at=executed_at,
         attempted=len(executions),
@@ -1626,7 +1784,44 @@ def execute_operations_compensation_tasks(
         skipped=skipped,
         executions=executions,
         summary=summary,
+        policy=policy,
     )
+
+
+def evaluate_operations_compensation_execution_gate(
+    task: OperationsCompensationTask,
+    policy: OperationsCompensationExecutionPolicy | None = None,
+    oncall_endpoint: str | None = None,
+    now: str | None = None,
+) -> OperationsCompensationExecutionGate:
+    policy = policy or OperationsCompensationExecutionPolicy()
+    now = now or datetime.now(timezone.utc).isoformat()
+    if not policy.enabled:
+        return OperationsCompensationExecutionGate(False, task.task_id, "POLICY_DISABLED", "compensation execution policy disabled")
+    if task.status not in {"OPEN", "ESCALATED"}:
+        return OperationsCompensationExecutionGate(False, task.task_id, "STATUS_NOT_ELIGIBLE", f"task status {task.status} is not executable")
+    if task.severity not in policy.allowed_severities:
+        return OperationsCompensationExecutionGate(False, task.task_id, "SEVERITY_BLOCKED", f"severity {task.severity} is not allowed")
+    if policy.require_oncall_endpoint_for_sources and task.source_type in policy.require_oncall_endpoint_for_sources and not oncall_endpoint and not task.linked_ticket_id:
+        return OperationsCompensationExecutionGate(False, task.task_id, "ONCALL_ENDPOINT_REQUIRED", "oncall endpoint is required by policy")
+    failures = _compensation_execution_failure_count(task)
+    if failures >= policy.max_failures_per_task:
+        return OperationsCompensationExecutionGate(False, task.task_id, "FAILURE_THRESHOLD_EXCEEDED", f"failure threshold exceeded: {failures}")
+    last_attempt_at = _last_compensation_execution_attempt_at(task)
+    if last_attempt_at and policy.retry_window_seconds > 0:
+        next_retry_at = datetime.fromtimestamp(
+            _parse_iso_datetime(last_attempt_at).timestamp() + policy.retry_window_seconds,
+            timezone.utc,
+        ).isoformat()
+        if _timestamp_sort_key(now) < _timestamp_sort_key(next_retry_at):
+            return OperationsCompensationExecutionGate(
+                False,
+                task.task_id,
+                "RETRY_WINDOW_ACTIVE",
+                "retry window is still active",
+                next_retry_at=next_retry_at,
+            )
+    return OperationsCompensationExecutionGate(True, task.task_id, "ALLOWED", "policy allowed")
 
 
 def operations_compensation_task_execution_to_dict(
@@ -1652,6 +1847,7 @@ def operations_compensation_task_execution_to_dict(
             if execution.ticket_result is not None
             else None
         ),
+        "gate": operations_compensation_execution_gate_to_dict(execution.gate) if execution.gate is not None else None,
     }
 
 
@@ -1666,6 +1862,7 @@ def operations_compensation_task_execution_report_to_dict(
         "skipped": report.skipped,
         "executions": [operations_compensation_task_execution_to_dict(item) for item in report.executions],
         "summary": report.summary,
+        "policy": operations_compensation_execution_policy_to_dict(report.policy),
     }
 
 
@@ -1674,6 +1871,155 @@ def render_operations_compensation_task_execution_report_json(
 ) -> str:
     return json.dumps(
         {"operations_compensation_task_execution": operations_compensation_task_execution_report_to_dict(report)},
+        ensure_ascii=False,
+    )
+
+
+def build_operations_compensation_execution_observability_report(
+    tasks: list[OperationsCompensationTask],
+    scheduler_runs: list[OperationsSchedulerRunReport] | None = None,
+    action_audits: list[OperationsConsoleActionAudit] | None = None,
+    generated_at: str | None = None,
+) -> OperationsCompensationExecutionObservabilityReport:
+    generated_at = generated_at or datetime.now(timezone.utc).isoformat()
+    attempted = 0
+    succeeded = 0
+    failed = 0
+    skipped = 0
+    retry_waiting = 0
+    manual_task_ids: set[str] = set()
+    gate_counts: Counter[str] = Counter()
+    failure_reasons: Counter[str] = Counter()
+    action_counts: Counter[str] = Counter()
+    latest_attempt_at: str | None = None
+    slowest_retry_seconds: int | None = None
+
+    for task in tasks:
+        if task.status == "PENDING_MANUAL":
+            manual_task_ids.add(task.task_id)
+        for event in task.lifecycle:
+            if not isinstance(event, dict):
+                continue
+            event_status = str(event.get("status") or "").upper()
+            if event_status == "EXECUTION_ATTEMPT":
+                attempted += 1
+                execution_status = str(event.get("execution_status") or "UNKNOWN").upper()
+                action = str(event.get("action") or "unknown")
+                action_counts[action] += 1
+                if execution_status == "SUCCESS":
+                    succeeded += 1
+                elif execution_status == "FAILED":
+                    failed += 1
+                    failure_reasons[_compensation_observability_reason_key(event.get("detail"))] += 1
+                elif execution_status == "SKIPPED":
+                    skipped += 1
+                if action == "mark_pending_manual":
+                    manual_task_ids.add(task.task_id)
+                attempt_at = str(event.get("at") or "")
+                if attempt_at and (
+                    latest_attempt_at is None
+                    or _timestamp_sort_key(attempt_at) >= _timestamp_sort_key(latest_attempt_at)
+                ):
+                    latest_attempt_at = attempt_at
+            elif event_status == "EXECUTION_GATE":
+                gate_status = str(event.get("gate_status") or "UNKNOWN").upper()
+                gate_counts[gate_status] += 1
+                if gate_status == "RETRY_WINDOW_ACTIVE":
+                    retry_waiting += 1
+                retry_seconds = _compensation_observability_retry_seconds(event)
+                if retry_seconds is not None and (
+                    slowest_retry_seconds is None or retry_seconds > slowest_retry_seconds
+                ):
+                    slowest_retry_seconds = retry_seconds
+
+    scheduler_run_count = 0
+    scheduler_attempted = 0
+    scheduler_failed = 0
+    for run in scheduler_runs or []:
+        has_compensation_result = False
+        for result in run.results:
+            if result.task_type != "compensation_task_execution":
+                continue
+            has_compensation_result = True
+            output = result.output or {}
+            scheduler_attempted += _safe_int(output.get("attempted"), 0)
+            scheduler_failed += _safe_int(
+                output.get("failed"),
+                1 if result.status == "FAILED" else 0,
+            )
+        if has_compensation_result:
+            scheduler_run_count += 1
+
+    console_actions = sum(
+        1
+        for audit in action_audits or []
+        if audit.action == "execute_compensation_tasks"
+    )
+    success_rate = round(succeeded / attempted, 4) if attempted else 0.0
+    summary = (
+        f"compensation_execution tasks={len(tasks)} attempted={attempted} "
+        f"success_rate={success_rate:.2%} failed={failed} skipped={skipped} "
+        f"retry_waiting={retry_waiting} manual_interventions={len(manual_task_ids)} "
+        f"scheduler_runs={scheduler_run_count} console_actions={console_actions}"
+    )
+    return OperationsCompensationExecutionObservabilityReport(
+        generated_at=generated_at,
+        task_count=len(tasks),
+        attempted=attempted,
+        succeeded=succeeded,
+        failed=failed,
+        skipped=skipped,
+        success_rate=success_rate,
+        manual_interventions=len(manual_task_ids),
+        retry_waiting=retry_waiting,
+        gate_counts=dict(sorted(gate_counts.items())),
+        failure_reasons=dict(sorted(failure_reasons.items(), key=lambda item: (-item[1], item[0]))),
+        action_counts=dict(sorted(action_counts.items())),
+        scheduler_runs=scheduler_run_count,
+        scheduler_attempted=scheduler_attempted,
+        scheduler_failed=scheduler_failed,
+        console_actions=console_actions,
+        latest_attempt_at=latest_attempt_at,
+        slowest_retry_seconds=slowest_retry_seconds,
+        summary=summary,
+    )
+
+
+def operations_compensation_execution_observability_report_to_dict(
+    report: OperationsCompensationExecutionObservabilityReport,
+) -> dict[str, Any]:
+    return {
+        "generated_at": report.generated_at,
+        "task_count": report.task_count,
+        "attempted": report.attempted,
+        "succeeded": report.succeeded,
+        "failed": report.failed,
+        "skipped": report.skipped,
+        "success_rate": report.success_rate,
+        "manual_interventions": report.manual_interventions,
+        "retry_waiting": report.retry_waiting,
+        "gate_counts": report.gate_counts,
+        "failure_reasons": report.failure_reasons,
+        "action_counts": report.action_counts,
+        "scheduler_runs": report.scheduler_runs,
+        "scheduler_attempted": report.scheduler_attempted,
+        "scheduler_failed": report.scheduler_failed,
+        "console_actions": report.console_actions,
+        "latest_attempt_at": report.latest_attempt_at,
+        "slowest_retry_seconds": report.slowest_retry_seconds,
+        "summary": report.summary,
+    }
+
+
+def render_operations_compensation_execution_observability_report_json(
+    report: OperationsCompensationExecutionObservabilityReport,
+) -> str:
+    return json.dumps(
+        {
+            "operations_compensation_execution_observability": (
+                operations_compensation_execution_observability_report_to_dict(report)
+            )
+        },
         ensure_ascii=False,
     )
 
@@ -1729,14 +2075,17 @@ def _execute_single_compensation_task(
     http_client: Any | None,
     executed_at: str,
     actor: str,
+    gate: OperationsCompensationExecutionGate | None = None,
 ) -> OperationsCompensationTaskExecution:
     if task.linked_ticket_id:
+        attempt_event = _compensation_execution_attempt_event("SUCCESS", "wait_oncall", executed_at, actor, f"waiting for ticket {task.linked_ticket_id}")
         updated = replace(
             task,
             status="WAITING_ONCALL",
             updated_at=executed_at,
             lifecycle=[
                 *task.lifecycle,
+                attempt_event,
                 {
                     "status": "WAITING_ONCALL",
                     "at": executed_at,
@@ -1753,14 +2102,17 @@ def _execute_single_compensation_task(
             detail=f"waiting for ticket {task.linked_ticket_id}",
             executed_at=executed_at,
             task=updated,
+            gate=gate,
         )
     if not oncall_endpoint:
+        attempt_event = _compensation_execution_attempt_event("SKIPPED", "mark_pending_manual", executed_at, actor, "oncall endpoint is not configured")
         updated = replace(
             task,
             status="PENDING_MANUAL",
             updated_at=executed_at,
             lifecycle=[
                 *task.lifecycle,
+                attempt_event,
                 {
                     "status": "PENDING_MANUAL",
                     "at": executed_at,
@@ -1777,9 +2129,12 @@ def _execute_single_compensation_task(
             detail="oncall endpoint is not configured",
             executed_at=executed_at,
             task=updated,
+            gate=gate,
         )
     ticket = open_compensation_task_ticket_http(task, oncall_endpoint, token=oncall_token, http_client=http_client)
     next_status = "WAITING_ONCALL" if ticket.ok and ticket.ticket_id else "ESCALATED"
+    execution_status = "SUCCESS" if ticket.ok and ticket.ticket_id else "FAILED"
+    attempt_event = _compensation_execution_attempt_event(execution_status, "open_oncall_ticket", executed_at, actor, ticket.detail)
     updated = replace(
         task,
         status=next_status,
@@ -1787,6 +2142,7 @@ def _execute_single_compensation_task(
         linked_ticket_id=ticket.ticket_id or task.linked_ticket_id,
         lifecycle=[
             *task.lifecycle,
+            attempt_event,
             {
                 "status": next_status,
                 "at": executed_at,
@@ -1811,12 +2167,108 @@ def _execute_single_compensation_task(
         execution_id=_stable_id("OCTX", task.task_id, executed_at, "ticket", ticket.ticket_id or ticket.detail),
         task_id=task.task_id,
         action="open_oncall_ticket",
-        status="SUCCESS" if ticket.ok else "FAILED",
+        status=execution_status,
         detail=ticket.detail,
         executed_at=executed_at,
         task=updated,
         ticket_result=ticket,
+        gate=gate,
     )
+
+
+def _skipped_compensation_task_execution(
+    task: OperationsCompensationTask,
+    gate: OperationsCompensationExecutionGate,
+    executed_at: str,
+    actor: str,
+) -> OperationsCompensationTaskExecution:
+    gate_event = {
+        "status": "EXECUTION_GATE",
+        "gate_status": gate.status,
+        "action": "policy_gate",
+        "at": executed_at,
+        "actor": actor,
+        "detail": gate.reason,
+        "next_retry_at": gate.next_retry_at,
+    }
+    updated = replace(
+        task,
+        updated_at=executed_at,
+        lifecycle=[*task.lifecycle, gate_event],
+        payload={**task.payload, "execution_gate": operations_compensation_execution_gate_to_dict(gate)},
+    )
+    return OperationsCompensationTaskExecution(
+        execution_id=_stable_id("OCTX", task.task_id, executed_at, "gate", gate.status),
+        task_id=task.task_id,
+        action="policy_gate",
+        status="SKIPPED",
+        detail=gate.reason,
+        executed_at=executed_at,
+        task=updated,
+        gate=gate,
+    )
+
+
+def _compensation_execution_attempt_event(
+    status: str,
+    action: str,
+    at: str,
+    actor: str,
+    detail: str,
+) -> dict[str, Any]:
+    return {
+        "status": "EXECUTION_ATTEMPT",
+        "execution_status": status,
+        "action": action,
+        "at": at,
+        "actor": actor,
+        "detail": detail,
+    }
+
+
+def _compensation_execution_failure_count(task: OperationsCompensationTask) -> int:
+    return sum(
+        1
+        for event in task.lifecycle
+        if str(event.get("status") or "").upper() == "EXECUTION_ATTEMPT"
+        and str(event.get("execution_status") or "").upper() == "FAILED"
+    )
+
+
+def _last_compensation_execution_attempt_at(task: OperationsCompensationTask) -> str | None:
+    attempts = [
+        str(event.get("at"))
+        for event in task.lifecycle
+        if str(event.get("status") or "").upper() == "EXECUTION_ATTEMPT" and event.get("at")
+    ]
+    if not attempts:
+        return None
+    attempts.sort(key=_timestamp_sort_key, reverse=True)
+    return attempts[0]
+
+
+def _compensation_observability_reason_key(detail: object) -> str:
+    normalized = str(detail or "").strip().lower()
+    if not normalized:
+        return "unknown"
+    if "timeout" in normalized:
+        return "timeout"
+    if "endpoint" in normalized or "configured" in normalized:
+        return "endpoint_unavailable"
+    if "ticket" in normalized and ("missing" in normalized or "not" in normalized):
+        return "ticket_missing"
+    if "http" in normalized or "status" in normalized:
+        return "http_failure"
+    return normalized[:80]
+
+
+def _compensation_observability_retry_seconds(event: dict[str, Any]) -> int | None:
+    at = str(event.get("at") or "")
+    next_retry_at = str(event.get("next_retry_at") or "")
+    if not at or not next_retry_at:
+        return None
+    seconds = int(_timestamp_sort_key(next_retry_at) - _timestamp_sort_key(at))
+    return seconds if seconds >= 0 else None
 
 
 def _compensation_tasks_from_session(context: TravelContext, generated_at: str) -> list[OperationsCompensationTask]:
@@ -4703,6 +5155,14 @@ def build_operations_scheduled_tasks(
             enabled=True,
             params={"max_pending_hours": 24.0},
         ),
+        OperationsScheduledTask(
+            task_id="OPS-SCHED-COMPENSATION-TASK-EXECUTION",
+            task_type="compensation_task_execution",
+            cadence="every_15_minutes",
+            next_run_at=now,
+            enabled=True,
+            params={"limit": 20},
+        ),
     ]
     if include_replay_job_runner:
         tasks.append(
@@ -5282,6 +5742,8 @@ def build_operations_console_view(
         "run_operations_schedule",
         "publish_closed_loop_schema",
         "update_governance_policy",
+        "manage_compensation_task",
+        "execute_compensation_task",
     ]
     permissions: dict[str, OperationsActionAuthorization] = {}
     for action in action_names:
@@ -5304,6 +5766,8 @@ def build_operations_console_view(
         ("run_operations_schedule", "Run scheduler", "Claim and run due persisted operations schedule tasks."),
         ("publish_closed_loop_schema", "Publish BI contract", "Publish closed-loop schema and OpenAPI contract."),
         ("update_governance_policy", "Update governance policy", "Change recovery governance or RBAC policy."),
+        ("manage_compensation_task", "Manage compensation tasks", "Close compensation tasks after manual verification."),
+        ("execute_compensation_task", "Execute compensation tasks", "Run governed compensation task execution batches."),
     ]
     actions = [
         {

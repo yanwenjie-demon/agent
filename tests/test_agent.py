@@ -20,6 +20,7 @@ from travel_agent.agent import build_default_agent, build_session_store
 from travel_agent.acceptance import render_integration_acceptance_report, run_integration_acceptance_report
 from travel_agent.cli import (
     build_operations_closed_loop_dashboard_json,
+    build_operations_compensation_observability_json,
     build_operations_console_overview_json,
     build_operations_console_view_html,
     build_operations_console_view_json,
@@ -69,6 +70,8 @@ from travel_agent.operations import (
     build_operations_console_overview,
     build_operations_console_view,
     build_operations_audit_timeline,
+    build_operations_compensation_execution_observability_report,
+    build_operations_compensation_execution_policy,
     build_operations_compensation_tasks,
     build_operations_closed_loop_dashboard,
     build_operations_dashboard_trend_report,
@@ -213,6 +216,7 @@ from travel_agent.operations import (
     operations_compensation_task_to_dict,
     render_operations_compensation_tasks,
     render_operations_compensation_task_board_json,
+    render_operations_compensation_execution_observability_report_json,
     render_operations_compensation_task_execution_report_json,
     render_recovery_approval_export_result,
     render_recovery_strategy_metrics_prometheus,
@@ -545,6 +549,92 @@ class MultiAgentStructureTest(unittest.TestCase):
             actor="ops",
         )
         external_execution = external_report.executions[0]
+        failed_task_payload = operations_compensation_task_to_dict(unlinked_task)
+        failed_task_payload["lifecycle"] = [
+            {
+                "status": "EXECUTION_ATTEMPT",
+                "execution_status": "FAILED",
+                "action": "open_oncall_ticket",
+                "at": "2026-05-23T02:00:00+00:00",
+                "actor": "ops",
+                "detail": "remote unavailable",
+            }
+        ]
+        failed_task = operations_compensation_task_from_dict(failed_task_payload)
+        retry_block_report = execute_operations_compensation_tasks(
+            [failed_task],
+            limit=1,
+            oncall_endpoint="https://oncall.example/compensation-tasks",
+            executed_at="2026-05-23T02:05:00+00:00",
+            actor="ops",
+            policy=build_operations_compensation_execution_policy(
+                json.dumps({"retry_window_seconds": 900, "max_failures_per_task": 3}, ensure_ascii=False)
+            ),
+        )
+        failure_threshold_report = execute_operations_compensation_tasks(
+            [failed_task],
+            limit=1,
+            oncall_endpoint="https://oncall.example/compensation-tasks",
+            executed_at="2026-05-23T03:00:00+00:00",
+            actor="ops",
+            policy=build_operations_compensation_execution_policy(
+                json.dumps({"max_failures_per_task": 1, "retry_window_seconds": 0}, ensure_ascii=False)
+            ),
+        )
+        dry_run_report = execute_operations_compensation_tasks(
+            [unlinked_task],
+            limit=1,
+            oncall_endpoint="https://oncall.example/compensation-tasks",
+            executed_at="2026-05-23T04:00:00+00:00",
+            actor="ops",
+            policy=build_operations_compensation_execution_policy(
+                json.dumps({"dry_run": True, "max_batch_size": 1}, ensure_ascii=False)
+            ),
+        )
+        scheduler_run = operations_scheduler_run_report_from_dict(
+            {
+                "run_id": "OSR-COMP-OBS",
+                "started_at": "2026-05-23T04:10:00+00:00",
+                "finished_at": "2026-05-23T04:11:00+00:00",
+                "due_count": 1,
+                "executed_count": 1,
+                "failed_count": 0,
+                "results": [
+                    {
+                        "task_id": "OPS-SCHED-COMP",
+                        "task_type": "compensation_task_execution",
+                        "status": "COMPLETED",
+                        "started_at": "2026-05-23T04:10:00+00:00",
+                        "finished_at": "2026-05-23T04:11:00+00:00",
+                        "detail": "compensation execution",
+                        "output": {"attempted": 3, "failed": 1},
+                    }
+                ],
+                "summary": "ok",
+            }
+        )
+        console_audit = build_operations_console_action_audit(
+            action="execute_compensation_tasks",
+            actor="ops",
+            roles=["ops"],
+            department="platform",
+            authorization={"allowed": True},
+            request_payload={"action": "execute_compensation_tasks", "limit": 3},
+            result_body={"ok": True, "action": "execute_compensation_tasks"},
+            requested_at="2026-05-23T04:12:00+00:00",
+            completed_at="2026-05-23T04:13:00+00:00",
+        )
+        observability_report = build_operations_compensation_execution_observability_report(
+            [
+                execution.task,
+                external_execution.task,
+                retry_block_report.executions[0].task,
+                dry_run_report.executions[0].task,
+            ],
+            scheduler_runs=[scheduler_run],
+            action_audits=[console_audit],
+            generated_at="2026-05-23T04:14:00+00:00",
+        )
 
         self.assertGreaterEqual(board.total_tasks, 4)
         self.assertEqual(action_task.status, "ESCALATED")
@@ -557,11 +647,31 @@ class MultiAgentStructureTest(unittest.TestCase):
         self.assertEqual(external_execution.task.linked_ticket_id, "INC-AUTO-COMP")
         self.assertEqual(http.calls[0][2], "oncall-token")
         self.assertEqual(http.calls[0][1]["task_id"], "OCT-UNLINKED")
+        self.assertEqual(external_execution.gate.status, "ALLOWED")
+        self.assertEqual(retry_block_report.executions[0].gate.status, "RETRY_WINDOW_ACTIVE")
+        self.assertEqual(failure_threshold_report.executions[0].gate.status, "FAILURE_THRESHOLD_EXCEEDED")
+        self.assertEqual(dry_run_report.executions[0].gate.status, "DRY_RUN")
+        self.assertEqual(dry_run_report.policy.max_batch_size, 1)
+        self.assertEqual(observability_report.attempted, 3)
+        self.assertEqual(observability_report.succeeded, 2)
+        self.assertEqual(observability_report.failed, 1)
+        self.assertEqual(observability_report.gate_counts["RETRY_WINDOW_ACTIVE"], 1)
+        self.assertEqual(observability_report.gate_counts["DRY_RUN"], 1)
+        self.assertEqual(observability_report.failure_reasons["remote unavailable"], 1)
+        self.assertEqual(observability_report.scheduler_runs, 1)
+        self.assertEqual(observability_report.scheduler_attempted, 3)
+        self.assertEqual(observability_report.scheduler_failed, 1)
+        self.assertEqual(observability_report.console_actions, 1)
+        self.assertEqual(observability_report.slowest_retry_seconds, 600)
         self.assertIn("Operations compensation tasks:", render_operations_compensation_tasks([closed]))
         self.assertIn("operations_compensation_tasks", render_operations_compensation_task_board_json(board))
         self.assertIn(
             "operations_compensation_task_execution",
             render_operations_compensation_task_execution_report_json(execution_report),
+        )
+        self.assertIn(
+            "operations_compensation_execution_observability",
+            render_operations_compensation_execution_observability_report_json(observability_report),
         )
 
 
@@ -4045,6 +4155,22 @@ class OperationsReadinessTest(unittest.TestCase):
 
     def test_runs_operations_console_scheduler_action(self) -> None:
         store = InMemorySessionStore()
+        action_item = operations_action_item_from_dict(
+            {
+                "action_id": "ACT-SCHED-COMP",
+                "source_type": "compensation",
+                "source_id": "SESSION-SCHED",
+                "title": "Execute scheduled compensation",
+                "owner": "ops",
+                "status": "OPEN",
+                "eta": "2026-05-20T00:00:00+00:00",
+                "created_at": "2026-05-19T00:00:00+00:00",
+                "updated_at": "2026-05-19T00:00:00+00:00",
+                "evidence": [],
+                "closure_note": None,
+            }
+        )
+        store.record_operations_action_item(operations_action_item_to_dict(action_item))
 
         result = json.loads(
             run_operations_console_action(
@@ -4052,14 +4178,29 @@ class OperationsReadinessTest(unittest.TestCase):
                 "run_operations_schedule",
                 actor="ops-user",
                 roles=["ops"],
-                payload={"limit": 10, "now": "2026-05-20T03:05:00+00:00"},
+                payload={
+                    "limit": 10,
+                    "now": "2026-05-20T03:05:00+00:00",
+                    "compensation_execution_policy": {
+                        "dry_run": True,
+                        "retry_window_seconds": 0,
+                    },
+                },
             )
         )
 
         action = result["operations_console_action"]
         self.assertTrue(action["ok"])
         self.assertEqual(action["authorization"]["action"], "run_operations_schedule")
-        self.assertEqual(action["scheduler_run"]["due_count"], 5)
+        self.assertEqual(action["scheduler_run"]["due_count"], 6)
+        compensation_result = next(
+            item
+            for item in action["scheduler_run"]["results"]
+            if item["task_type"] == "compensation_task_execution"
+        )
+        self.assertEqual(compensation_result["output"]["attempted"], 1)
+        self.assertEqual(compensation_result["output"]["skipped"], 1)
+        self.assertEqual(store.list_operations_compensation_tasks(1)[0]["payload"]["execution_gate"]["status"], "DRY_RUN")
         self.assertEqual(store.list_operations_scheduler_runs(1)[0]["run_id"], action["scheduler_run"]["run_id"])
 
     def test_records_and_retries_operations_console_audit_sink_delivery(self) -> None:
@@ -4160,14 +4301,15 @@ class OperationsReadinessTest(unittest.TestCase):
             {
                 "closed_loop_quality": _handler,
                 "webhook_replay_jobs": _handler,
+                "compensation_task_execution": _handler,
             },
             now="2026-05-20T03:05:00+00:00",
         )
 
-        self.assertEqual(report.due_count, 5)
-        self.assertEqual(report.executed_count, 2)
+        self.assertEqual(report.due_count, 6)
+        self.assertEqual(report.executed_count, 3)
         self.assertEqual(report.failed_count, 0)
-        self.assertEqual(calls, ["closed_loop_quality", "webhook_replay_jobs"])
+        self.assertEqual(calls, ["closed_loop_quality", "compensation_task_execution", "webhook_replay_jobs"])
         self.assertIn("Operations scheduled tasks:", render_operations_scheduled_tasks(tasks))
         self.assertIn("Operations scheduler run:", render_operations_scheduler_run_report(report))
 
@@ -4707,6 +4849,12 @@ class OperationsReadinessTest(unittest.TestCase):
             )
             with urlopen(close_compensation_request, timeout=5) as response:
                 close_compensation_payload = json.loads(response.read().decode("utf-8"))
+            compensation_observability_request = Request(
+                f"http://{host}:{port}/operations/console/compensation-observability?limit=10",
+                headers={"Authorization": "Bearer dash-token"},
+            )
+            with urlopen(compensation_observability_request, timeout=5) as response:
+                compensation_observability_payload = json.loads(response.read().decode("utf-8"))
         finally:
             server.shutdown()
             server.server_close()
@@ -4810,10 +4958,15 @@ class OperationsReadinessTest(unittest.TestCase):
         self.assertTrue(close_compensation["ok"])
         self.assertEqual(close_compensation["task"]["status"], "CLOSED")
         self.assertEqual(store.list_operations_compensation_tasks(1)[0]["closure_note"], "verified in console")
+        compensation_observability = compensation_observability_payload["operations_compensation_execution_observability"]
+        self.assertGreaterEqual(compensation_observability["attempted"], 1)
+        self.assertGreaterEqual(compensation_observability["console_actions"], 1)
+        self.assertIn("wait_oncall", compensation_observability["action_counts"])
         self.assertIn("oncall_webhook_ops_console", build_oncall_webhook_ops_console_json(store))
         self.assertIn("oncall_webhook_replay_jobs", build_oncall_webhook_replay_jobs_json(store))
         self.assertIn("operations_console_overview", build_operations_console_overview_json(store))
         self.assertIn("operations_console_view", build_operations_console_view_json(store, actor="ops-user", roles=["ops"]))
+        self.assertIn("operations_compensation_execution_observability", build_operations_compensation_observability_json(store))
         self.assertIn("Operations Console", build_operations_console_view_html(store, actor="ops-user", roles=["ops"]))
 
     def test_closed_loop_dashboard_supports_cursor_pagination(self) -> None:

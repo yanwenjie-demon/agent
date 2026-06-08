@@ -46,7 +46,9 @@ from .operations import (
     build_operations_audit_timeline,
     build_operations_audit_sink_delivery,
     build_operations_console_action_audit_event,
+    build_operations_compensation_execution_observability_report,
     build_operations_compensation_tasks,
+    build_operations_compensation_execution_policy,
     build_operations_governance_policy_change,
     build_operations_multidimensional_view,
     build_operations_postmortem_report,
@@ -149,6 +151,7 @@ from .operations import (
     render_operations_audit_timeline_json,
     render_operations_audit_sink_deliveries_json,
     render_operations_audit_sink_replay_report_json,
+    render_operations_compensation_execution_observability_report_json,
     render_operations_compensation_task_board_json,
     render_operations_compensation_task_execution_report_json,
     render_operations_scheduled_tasks,
@@ -600,6 +603,31 @@ def parse_args() -> argparse.Namespace:
         "--execute-oncall-webhook-replay-jobs",
         action="store_true",
         help="Execute persisted pending OnCall webhook replay jobs and write back results.",
+    )
+    parser.add_argument(
+        "--execute-operations-compensation-tasks",
+        action="store_true",
+        help="Execute persisted compensation tasks with governance policy and write back task status.",
+    )
+    parser.add_argument(
+        "--operations-compensation-observability",
+        action="store_true",
+        help="Render compensation task execution observability from persisted lifecycle, scheduler, and console audit data.",
+    )
+    parser.add_argument(
+        "--operations-compensation-execution-policy-json",
+        default=None,
+        help="Compensation execution policy JSON. Defaults to TRAVEL_COMPENSATION_EXECUTION_POLICY_JSON.",
+    )
+    parser.add_argument(
+        "--operations-compensation-oncall-endpoint",
+        default=None,
+        help="OnCall endpoint used when executing unlinked compensation tasks. Defaults to TRAVEL_ONCALL_API_URL.",
+    )
+    parser.add_argument(
+        "--operations-compensation-oncall-token",
+        default=None,
+        help="OnCall token used by --execute-operations-compensation-tasks. Defaults to TRAVEL_ONCALL_API_TOKEN.",
     )
     parser.add_argument(
         "--operations-actor",
@@ -1351,6 +1379,10 @@ def main() -> None:
         _require_persistent_session_store(settings, "--operations-console-overview")
         print(build_operations_console_overview_json(agent.session_store, limit=args.observability_limit))
         return
+    if args.operations_compensation_observability:
+        _require_persistent_session_store(settings, "--operations-compensation-observability")
+        print(build_operations_compensation_observability_json(agent.session_store, limit=args.observability_limit))
+        return
     if args.execute_oncall_webhook_replay_jobs:
         _require_persistent_session_store(settings, "--execute-oncall-webhook-replay-jobs")
         authorization = authorize_operations_action(
@@ -1371,6 +1403,33 @@ def main() -> None:
         if not executions:
             print("OnCall webhook replay job execution:\n- none")
         if any(execution.result.failed for execution in executions):
+            raise SystemExit(1)
+        return
+    if args.execute_operations_compensation_tasks:
+        _require_persistent_session_store(settings, "--execute-operations-compensation-tasks")
+        authorization = authorize_operations_action(
+            "execute_compensation_task",
+            user_id=args.operations_actor,
+            permission_policy=PermissionPolicy.from_env(),
+            department=args.operations_actor_department,
+            roles=args.operations_actor_role,
+            audit_sink=build_audit_sink(settings),
+            payload={"source": "cli", "limit": args.observability_limit},
+        )
+        print(render_operations_action_authorization(authorization))
+        if not authorization.allowed:
+            raise SystemExit(1)
+        report_json = execute_operations_compensation_tasks_json(
+            agent.session_store,
+            limit=args.observability_limit,
+            oncall_endpoint=args.operations_compensation_oncall_endpoint or settings.oncall_api_url,
+            oncall_token=args.operations_compensation_oncall_token or settings.oncall_api_token,
+            policy_json=args.operations_compensation_execution_policy_json or settings.compensation_execution_policy_json,
+            actor=args.operations_actor,
+        )
+        print(report_json)
+        report = json.loads(report_json)["operations_compensation_task_execution"]
+        if int(report.get("failed") or 0) > 0:
             raise SystemExit(1)
         return
     if args.run_operations_schedule or args.run_persisted_operations_schedule:
@@ -2900,12 +2959,43 @@ def build_operations_compensation_tasks_json(
     return render_operations_compensation_task_board_json(board)
 
 
+def build_operations_compensation_observability_json(
+    session_store: SessionStore,
+    limit: int = 20,
+) -> str:
+    read_limit = max(100, limit * 2)
+    tasks = [
+        operations_compensation_task_from_dict(item)
+        for item in session_store.list_operations_compensation_tasks(read_limit)
+    ]
+    scheduler_runs = [
+        operations_scheduler_run_report_from_dict(item)
+        for item in session_store.list_operations_scheduler_runs(read_limit)
+    ]
+    action_audits = [
+        operations_console_action_audit_from_dict(item)
+        for item in session_store.list_operations_console_action_audits(read_limit)
+    ]
+    report = build_operations_compensation_execution_observability_report(
+        tasks=tasks,
+        scheduler_runs=scheduler_runs,
+        action_audits=action_audits,
+    )
+    return render_operations_compensation_execution_observability_report_json(report)
+
+
 def execute_operations_compensation_tasks_json(
     session_store: SessionStore,
     limit: int = 20,
     oncall_endpoint: str | None = None,
     oncall_token: str | None = None,
+    policy_json: str | None = None,
+    actor: str = "operations_console",
 ) -> str:
+    settings = IntegrationSettings.from_env()
+    oncall_endpoint = oncall_endpoint or settings.oncall_api_url
+    oncall_token = oncall_token or settings.oncall_api_token
+    policy = build_operations_compensation_execution_policy(policy_json or settings.compensation_execution_policy_json)
     board_payload = json.loads(build_operations_compensation_tasks_json(session_store, max(100, limit * 2)))
     tasks = [
         operations_compensation_task_from_dict(item)
@@ -2916,7 +3006,8 @@ def execute_operations_compensation_tasks_json(
         limit=limit,
         oncall_endpoint=oncall_endpoint,
         oncall_token=oncall_token,
-        actor="operations_console",
+        actor=actor,
+        policy=policy,
     )
     for execution in report.executions:
         session_store.record_operations_compensation_task(operations_compensation_task_to_dict(execution.task))
@@ -3042,7 +3133,7 @@ def run_operations_console_action(
         "rollback_governance_policy_change": "update_governance_policy",
         "retry_audit_sink_deliveries": "retry_audit_sink_delivery",
         "close_compensation_task": "manage_compensation_task",
-        "execute_compensation_tasks": "manage_compensation_task",
+        "execute_compensation_tasks": "execute_compensation_task",
     }.get(action)
     if permission_action is None:
         return _finalize_operations_console_action(
@@ -3243,6 +3334,8 @@ def run_operations_console_action(
                 limit=action_limit,
                 oncall_endpoint=str(endpoint) if endpoint is not None else None,
                 oncall_token=str(payload["token"]) if payload.get("token") is not None else None,
+                policy_json=_payload_compensation_execution_policy_json(payload),
+                actor=actor,
             )
         )
         report = execution_payload["operations_compensation_task_execution"]
@@ -3349,6 +3442,7 @@ def make_metrics_handler(
         str,
     ]
     | None = None,
+    operations_compensation_observability_provider: Callable[[int | None], str] | None = None,
     operations_console_action_provider: Callable[[str, str, list[str], str | None, dict[str, object]], str] | None = None,
     dashboard_token: str | None = None,
 ) -> type[BaseHTTPRequestHandler]:
@@ -3538,6 +3632,21 @@ def make_metrics_handler(
                     "application/json; charset=utf-8",
                 )
                 return
+            if path == "/operations/console/compensation-observability":
+                if operations_compensation_observability_provider is None:
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                if not self._authorized():
+                    self.send_response(401)
+                    self.end_headers()
+                    return
+                query = parse_qs(parsed.query)
+                self._send_text(
+                    operations_compensation_observability_provider(_first_query_int(query, "limit")) + "\n",
+                    "application/json; charset=utf-8",
+                )
+                return
             if path == "/operations/console/ui":
                 if operations_console_html_provider is None:
                     self.send_response(404)
@@ -3673,6 +3782,10 @@ def create_operations_dashboard_server(
                 status=status,
                 source_type=source_type,
             ),
+            lambda request_limit: build_operations_compensation_observability_json(
+                session_store,
+                request_limit or limit,
+            ),
             lambda action, actor, roles, department, payload: run_operations_console_action(
                 session_store,
                 action,
@@ -3728,6 +3841,7 @@ def serve_operations_dashboard(
     print(f"Serving operations audit timeline on http://{actual_host}:{actual_port}/operations/console/audit-timeline")
     print(f"Serving operations audit sink deliveries on http://{actual_host}:{actual_port}/operations/console/audit-sink-deliveries")
     print(f"Serving operations compensation tasks on http://{actual_host}:{actual_port}/operations/console/compensation-tasks")
+    print(f"Serving operations compensation observability on http://{actual_host}:{actual_port}/operations/console/compensation-observability")
     print(f"Serving operations console UI on http://{actual_host}:{actual_port}/operations/console/ui")
     try:
         server.serve_forever()
@@ -3921,6 +4035,16 @@ def _payload_replay_patches(payload: dict[str, object]) -> dict[str, dict[str, A
     return {event_id: dict(patch) for event_id in ids} or None
 
 
+def _payload_compensation_execution_policy_json(payload: dict[str, object]) -> str | None:
+    for key in ("compensation_execution_policy", "execution_policy"):
+        value = payload.get(key)
+        if isinstance(value, dict):
+            return json.dumps(value, ensure_ascii=False, sort_keys=True)
+        if isinstance(value, str) and value.strip():
+            return value
+    return _payload_optional_str(payload, "compensation_execution_policy_json")
+
+
 def _run_operations_schedule_action(
     session_store: SessionStore,
     payload: dict[str, object],
@@ -3967,6 +4091,9 @@ def _operations_schedule_action_args(payload: dict[str, object], limit: int) -> 
         closed_loop_dashboard_checkpoint=_payload_optional_str(payload, "checkpoint"),
         recovery_approval_sla_policy_json=_payload_optional_str(payload, "recovery_approval_sla_policy_json"),
         recovery_approval_sla_now=_payload_optional_str(payload, "now"),
+        operations_compensation_execution_policy_json=_payload_compensation_execution_policy_json(payload),
+        operations_compensation_oncall_endpoint=_payload_optional_str(payload, "oncall_endpoint"),
+        operations_compensation_oncall_token=_payload_optional_str(payload, "oncall_token") or _payload_optional_str(payload, "token"),
     )
 
 
@@ -4215,6 +4342,36 @@ def _build_operations_schedule_handlers(session_store: SessionStore, args: argpa
             "failed_jobs": sum(1 for execution in executions if execution.result.failed),
         }
 
+    def _execute_compensation_tasks(task: object) -> dict[str, object]:
+        params = dict(getattr(task, "params", {}) or {})
+        task_limit = int(params.get("limit") or args.observability_limit)
+        policy_json = (
+            params.get("compensation_execution_policy_json")
+            or params.get("policy_json")
+            or params.get("policy")
+            or getattr(args, "operations_compensation_execution_policy_json", None)
+        )
+        if isinstance(policy_json, dict):
+            policy_json = json.dumps(policy_json, ensure_ascii=False, sort_keys=True)
+        report_payload = json.loads(
+            execute_operations_compensation_tasks_json(
+                session_store,
+                limit=task_limit,
+                oncall_endpoint=str(params.get("oncall_endpoint") or getattr(args, "operations_compensation_oncall_endpoint", None) or ""),
+                oncall_token=str(params.get("oncall_token") or getattr(args, "operations_compensation_oncall_token", None) or ""),
+                policy_json=str(policy_json) if policy_json else None,
+                actor="operations_scheduler",
+            )
+        )
+        report = report_payload["operations_compensation_task_execution"]
+        return {
+            "attempted": int(report.get("attempted") or 0),
+            "succeeded": int(report.get("succeeded") or 0),
+            "failed": int(report.get("failed") or 0),
+            "skipped": int(report.get("skipped") or 0),
+            "summary": str(report.get("summary") or ""),
+        }
+
     return {
         "closed_loop_snapshot": lambda task: _save_scheduled_closed_loop_snapshot(
             session_store,
@@ -4238,6 +4395,7 @@ def _build_operations_schedule_handlers(session_store: SessionStore, args: argpa
             )
         },
         "webhook_replay_jobs": _execute_replay_jobs,
+        "compensation_task_execution": _execute_compensation_tasks,
     }
 
 
