@@ -653,6 +653,34 @@ class OperationsCompensationExecutionObservabilityReport:
 
 
 @dataclass(frozen=True)
+class OperationsCompensationSloPolicy:
+    enabled: bool = True
+    min_attempts: int = 1
+    success_rate_target: float = 0.95
+    warning_burn_rate: float = 1.0
+    critical_burn_rate: float = 2.0
+    max_failed: int = 0
+    max_retry_waiting: int = 5
+    max_manual_interventions: int = 5
+    max_scheduler_failed: int = 0
+    max_retry_seconds: int = 1800
+    route: str = "travel-ops"
+    escalation: str = "page compensation owner"
+
+
+@dataclass(frozen=True)
+class OperationsCompensationSloReport:
+    generated_at: str
+    ok: bool
+    burn_rate: float
+    error_budget_remaining: float
+    policy: OperationsCompensationSloPolicy
+    observability: OperationsCompensationExecutionObservabilityReport
+    alerts: list[dict[str, Any]]
+    summary: str
+
+
+@dataclass(frozen=True)
 class OnCallWebhookEvent:
     event_id: str
     ticket_id: str | None
@@ -1687,6 +1715,13 @@ def _safe_int(value: Any, default: int) -> int:
         return default
 
 
+def _safe_float(value: Any, default: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _safe_bool(value: Any, default: bool) -> bool:
     if value is None:
         return default
@@ -2024,6 +2059,209 @@ def render_operations_compensation_execution_observability_report_json(
     )
 
 
+def build_operations_compensation_slo_policy(
+    config_json: str | None = None,
+) -> OperationsCompensationSloPolicy:
+    if not config_json:
+        return OperationsCompensationSloPolicy()
+    try:
+        payload = json.loads(config_json)
+    except (TypeError, ValueError):
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    return operations_compensation_slo_policy_from_dict(payload)
+
+
+def operations_compensation_slo_policy_to_dict(policy: OperationsCompensationSloPolicy) -> dict[str, Any]:
+    return {
+        "enabled": policy.enabled,
+        "min_attempts": policy.min_attempts,
+        "success_rate_target": policy.success_rate_target,
+        "warning_burn_rate": policy.warning_burn_rate,
+        "critical_burn_rate": policy.critical_burn_rate,
+        "max_failed": policy.max_failed,
+        "max_retry_waiting": policy.max_retry_waiting,
+        "max_manual_interventions": policy.max_manual_interventions,
+        "max_scheduler_failed": policy.max_scheduler_failed,
+        "max_retry_seconds": policy.max_retry_seconds,
+        "route": policy.route,
+        "escalation": policy.escalation,
+    }
+
+
+def operations_compensation_slo_policy_from_dict(payload: dict[str, Any] | None) -> OperationsCompensationSloPolicy:
+    payload = dict(payload or {})
+    return OperationsCompensationSloPolicy(
+        enabled=_safe_bool(payload.get("enabled"), True),
+        min_attempts=max(0, _safe_int(payload.get("min_attempts"), 1)),
+        success_rate_target=min(0.9999, max(0.0, _safe_float(payload.get("success_rate_target"), 0.95))),
+        warning_burn_rate=max(0.0, _safe_float(payload.get("warning_burn_rate"), 1.0)),
+        critical_burn_rate=max(0.0, _safe_float(payload.get("critical_burn_rate"), 2.0)),
+        max_failed=max(0, _safe_int(payload.get("max_failed"), 0)),
+        max_retry_waiting=max(0, _safe_int(payload.get("max_retry_waiting"), 5)),
+        max_manual_interventions=max(0, _safe_int(payload.get("max_manual_interventions"), 5)),
+        max_scheduler_failed=max(0, _safe_int(payload.get("max_scheduler_failed"), 0)),
+        max_retry_seconds=max(0, _safe_int(payload.get("max_retry_seconds"), 1800)),
+        route=str(payload.get("route") or "travel-ops"),
+        escalation=str(payload.get("escalation") or "page compensation owner"),
+    )
+
+
+def evaluate_operations_compensation_slo(
+    observability: OperationsCompensationExecutionObservabilityReport,
+    policy: OperationsCompensationSloPolicy | None = None,
+    generated_at: str | None = None,
+) -> OperationsCompensationSloReport:
+    generated_at = generated_at or datetime.now(timezone.utc).isoformat()
+    policy = policy or OperationsCompensationSloPolicy()
+    error_budget = max(0.0001, 1.0 - policy.success_rate_target)
+    has_enough_attempts = observability.attempted >= policy.min_attempts
+    actual_error_rate = 1.0 - observability.success_rate if has_enough_attempts else 0.0
+    burn_rate = round(actual_error_rate / error_budget, 4) if policy.enabled else 0.0
+    error_budget_remaining = round(max(0.0, 1.0 - burn_rate), 4)
+    alerts: list[dict[str, Any]] = []
+    if policy.enabled:
+        if has_enough_attempts and burn_rate >= policy.warning_burn_rate:
+            severity = "critical" if burn_rate >= policy.critical_burn_rate else "warning"
+            alerts.append(
+                _compensation_slo_alert(
+                    "compensation_slo_burn_rate",
+                    severity,
+                    f"compensation execution burn rate {burn_rate:.2f} exceeds {policy.warning_burn_rate:.2f}",
+                    int(round(burn_rate * 100)),
+                    policy,
+                    generated_at,
+                    burn_rate=burn_rate,
+                    success_rate=observability.success_rate,
+                )
+            )
+        if observability.failed > policy.max_failed:
+            alerts.append(
+                _compensation_slo_alert(
+                    "compensation_execution_failed",
+                    "critical",
+                    f"compensation execution failed={observability.failed} exceeds {policy.max_failed}",
+                    observability.failed,
+                    policy,
+                    generated_at,
+                )
+            )
+        if observability.retry_waiting > policy.max_retry_waiting:
+            alerts.append(
+                _compensation_slo_alert(
+                    "compensation_retry_waiting_high",
+                    "warning",
+                    f"compensation retry waiting={observability.retry_waiting} exceeds {policy.max_retry_waiting}",
+                    observability.retry_waiting,
+                    policy,
+                    generated_at,
+                )
+            )
+        if observability.manual_interventions > policy.max_manual_interventions:
+            alerts.append(
+                _compensation_slo_alert(
+                    "compensation_manual_intervention_high",
+                    "warning",
+                    f"compensation manual interventions={observability.manual_interventions} exceeds {policy.max_manual_interventions}",
+                    observability.manual_interventions,
+                    policy,
+                    generated_at,
+                )
+            )
+        if observability.scheduler_failed > policy.max_scheduler_failed:
+            alerts.append(
+                _compensation_slo_alert(
+                    "compensation_scheduler_failed",
+                    "critical",
+                    f"compensation scheduler failed={observability.scheduler_failed} exceeds {policy.max_scheduler_failed}",
+                    observability.scheduler_failed,
+                    policy,
+                    generated_at,
+                )
+            )
+        if (
+            observability.slowest_retry_seconds is not None
+            and observability.slowest_retry_seconds > policy.max_retry_seconds
+        ):
+            alerts.append(
+                _compensation_slo_alert(
+                    "compensation_retry_latency_high",
+                    "warning",
+                    f"compensation retry wait seconds={observability.slowest_retry_seconds} exceeds {policy.max_retry_seconds}",
+                    observability.slowest_retry_seconds,
+                    policy,
+                    generated_at,
+                )
+            )
+    ok = not alerts
+    summary = (
+        f"compensation_slo ok={ok} burn_rate={burn_rate:.2f} "
+        f"success_rate={observability.success_rate:.2%} alerts={len(alerts)}"
+    )
+    return OperationsCompensationSloReport(
+        generated_at=generated_at,
+        ok=ok,
+        burn_rate=burn_rate,
+        error_budget_remaining=error_budget_remaining,
+        policy=policy,
+        observability=observability,
+        alerts=alerts,
+        summary=summary,
+    )
+
+
+def operations_compensation_slo_report_to_dict(report: OperationsCompensationSloReport) -> dict[str, Any]:
+    return {
+        "generated_at": report.generated_at,
+        "ok": report.ok,
+        "burn_rate": report.burn_rate,
+        "error_budget_remaining": report.error_budget_remaining,
+        "policy": operations_compensation_slo_policy_to_dict(report.policy),
+        "observability": operations_compensation_execution_observability_report_to_dict(report.observability),
+        "alerts": [_normalize_alert(alert) for alert in report.alerts],
+        "summary": report.summary,
+    }
+
+
+def render_operations_compensation_slo_report_json(report: OperationsCompensationSloReport) -> str:
+    return json.dumps(
+        {"operations_compensation_slo": operations_compensation_slo_report_to_dict(report)},
+        ensure_ascii=False,
+    )
+
+
+def open_operations_compensation_slo_ticket_http(
+    report: OperationsCompensationSloReport,
+    endpoint: str,
+    token: str | None = None,
+    http_client: Any | None = None,
+) -> OnCallTicketResult:
+    from .integrations import JsonHttpClient
+
+    payload = {
+        "source": "travel-agent",
+        "summary": "Travel compensation execution SLO alert",
+        "slo": operations_compensation_slo_report_to_dict(report),
+        "alerts": [_normalize_alert(alert) for alert in report.alerts],
+    }
+    try:
+        client = http_client or JsonHttpClient()
+        response = client.post_json(endpoint, payload, token)
+    except Exception as exc:
+        return OnCallTicketResult(False, endpoint, None, 0, 1, str(exc))
+    ticket_id = response.get("ticket_id") or response.get("id") or response.get("incident_id")
+    ok = bool(response.get("ok", True))
+    return OnCallTicketResult(
+        ok=ok,
+        endpoint=endpoint,
+        ticket_id=str(ticket_id) if ticket_id is not None else None,
+        delivered=1 if ok else 0,
+        failed=0 if ok else 1,
+        detail=str(response.get("detail") or "compensation slo ticket opened"),
+    )
+
+
 def open_compensation_task_ticket_http(
     task: OperationsCompensationTask,
     endpoint: str,
@@ -2269,6 +2507,27 @@ def _compensation_observability_retry_seconds(event: dict[str, Any]) -> int | No
         return None
     seconds = int(_timestamp_sort_key(next_retry_at) - _timestamp_sort_key(at))
     return seconds if seconds >= 0 else None
+
+
+def _compensation_slo_alert(
+    alert_type: str,
+    severity: str,
+    message: str,
+    value: int,
+    policy: OperationsCompensationSloPolicy,
+    generated_at: str,
+    **extra: Any,
+) -> dict[str, Any]:
+    return {
+        "alert_type": alert_type,
+        "severity": severity,
+        "message": message,
+        "value": value,
+        "route": policy.route,
+        "escalation": policy.escalation,
+        "generated_at": generated_at,
+        **extra,
+    }
 
 
 def _compensation_tasks_from_session(context: TravelContext, generated_at: str) -> list[OperationsCompensationTask]:
@@ -5158,6 +5417,14 @@ def build_operations_scheduled_tasks(
         OperationsScheduledTask(
             task_id="OPS-SCHED-COMPENSATION-TASK-EXECUTION",
             task_type="compensation_task_execution",
+            cadence="every_15_minutes",
+            next_run_at=now,
+            enabled=True,
+            params={"limit": 20},
+        ),
+        OperationsScheduledTask(
+            task_id="OPS-SCHED-COMPENSATION-SLO",
+            task_type="compensation_slo_evaluation",
             cadence="every_15_minutes",
             next_run_at=now,
             enabled=True,
@@ -8115,12 +8382,22 @@ def _profile_name(settings: IntegrationSettings) -> str:
 
 
 def _normalize_alert(alert: dict[str, Any]) -> dict[str, Any]:
-    return {
+    normalized = {
         "alert_type": str(alert.get("alert_type") or "unknown"),
         "severity": str(alert.get("severity") or "warning"),
         "message": str(alert.get("message") or ""),
         "value": int(alert.get("value") or 0),
     }
+    for key, value in alert.items():
+        if key in normalized:
+            continue
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            normalized[str(key)] = value
+        elif isinstance(value, (list, dict)):
+            normalized[str(key)] = value
+        else:
+            normalized[str(key)] = str(value)
+    return normalized
 
 
 def _extract_oncall_webhook_ticket(payload: dict[str, Any]) -> dict[str, Any]:

@@ -47,6 +47,7 @@ from .operations import (
     build_operations_audit_sink_delivery,
     build_operations_console_action_audit_event,
     build_operations_compensation_execution_observability_report,
+    build_operations_compensation_slo_policy,
     build_operations_compensation_tasks,
     build_operations_compensation_execution_policy,
     build_operations_governance_policy_change,
@@ -63,6 +64,7 @@ from .operations import (
     close_operations_compensation_task,
     evaluate_operations_action_sla,
     evaluate_operations_closed_loop_quality,
+    evaluate_operations_compensation_slo,
     evaluate_operations_drill_gate,
     evaluate_operations_trend_alerts,
     evaluate_recovery_approval_sla,
@@ -74,6 +76,7 @@ from .operations import (
     fetch_recovery_governance_policy_http,
     fetch_oncall_ticket_status_http,
     open_oncall_ticket_http,
+    open_operations_compensation_slo_ticket_http,
     oncall_ticket_status_from_dict,
     oncall_ticket_status_from_webhook,
     oncall_ticket_status_to_dict,
@@ -152,6 +155,7 @@ from .operations import (
     render_operations_audit_sink_deliveries_json,
     render_operations_audit_sink_replay_report_json,
     render_operations_compensation_execution_observability_report_json,
+    render_operations_compensation_slo_report_json,
     render_operations_compensation_task_board_json,
     render_operations_compensation_task_execution_report_json,
     render_operations_scheduled_tasks,
@@ -613,6 +617,26 @@ def parse_args() -> argparse.Namespace:
         "--operations-compensation-observability",
         action="store_true",
         help="Render compensation task execution observability from persisted lifecycle, scheduler, and console audit data.",
+    )
+    parser.add_argument(
+        "--operations-compensation-slo",
+        action="store_true",
+        help="Evaluate compensation execution SLO and render alerts from persisted observability data.",
+    )
+    parser.add_argument(
+        "--operations-compensation-slo-policy-json",
+        default=None,
+        help="Compensation SLO policy JSON. Defaults to TRAVEL_COMPENSATION_SLO_POLICY_JSON.",
+    )
+    parser.add_argument(
+        "--export-operations-compensation-slo-alerts",
+        action="store_true",
+        help="POST compensation SLO alerts to the configured alert sink.",
+    )
+    parser.add_argument(
+        "--open-operations-compensation-slo-ticket",
+        action="store_true",
+        help="Open an OnCall ticket when compensation SLO alerts are active.",
     )
     parser.add_argument(
         "--operations-compensation-execution-policy-json",
@@ -1382,6 +1406,48 @@ def main() -> None:
     if args.operations_compensation_observability:
         _require_persistent_session_store(settings, "--operations-compensation-observability")
         print(build_operations_compensation_observability_json(agent.session_store, limit=args.observability_limit))
+        return
+    if (
+        args.operations_compensation_slo
+        or args.export_operations_compensation_slo_alerts
+        or args.open_operations_compensation_slo_ticket
+    ):
+        _require_persistent_session_store(settings, "--operations-compensation-slo")
+        policy_json = args.operations_compensation_slo_policy_json or settings.compensation_slo_policy_json
+        slo_report = build_operations_compensation_slo_report_from_store(
+            agent.session_store,
+            limit=args.observability_limit,
+            policy_json=policy_json,
+        )
+        print(render_operations_compensation_slo_report_json(slo_report))
+        if args.export_operations_compensation_slo_alerts:
+            endpoint = args.operations_alert_endpoint or settings.alert_api_url
+            if not endpoint:
+                raise SystemExit(
+                    "--export-operations-compensation-slo-alerts requires --operations-alert-endpoint or TRAVEL_ALERT_API_URL."
+                )
+            export_result = export_operations_alerts_http(
+                slo_report.alerts,
+                endpoint=endpoint,
+                token=settings.alert_api_token,
+            )
+            print(render_operations_alert_export_result(export_result))
+            if not export_result.ok:
+                raise SystemExit(1)
+        if args.open_operations_compensation_slo_ticket and slo_report.alerts:
+            endpoint = args.oncall_endpoint or settings.oncall_api_url
+            if not endpoint:
+                raise SystemExit(
+                    "--open-operations-compensation-slo-ticket requires --oncall-endpoint or TRAVEL_ONCALL_API_URL."
+                )
+            ticket_result = open_operations_compensation_slo_ticket_http(
+                slo_report,
+                endpoint=endpoint,
+                token=settings.oncall_api_token,
+            )
+            print(render_oncall_ticket_result(ticket_result))
+            if not ticket_result.ok:
+                raise SystemExit(1)
         return
     if args.execute_oncall_webhook_replay_jobs:
         _require_persistent_session_store(settings, "--execute-oncall-webhook-replay-jobs")
@@ -2959,10 +3025,10 @@ def build_operations_compensation_tasks_json(
     return render_operations_compensation_task_board_json(board)
 
 
-def build_operations_compensation_observability_json(
+def build_operations_compensation_observability_report_from_store(
     session_store: SessionStore,
     limit: int = 20,
-) -> str:
+) -> object:
     read_limit = max(100, limit * 2)
     tasks = [
         operations_compensation_task_from_dict(item)
@@ -2981,7 +3047,37 @@ def build_operations_compensation_observability_json(
         scheduler_runs=scheduler_runs,
         action_audits=action_audits,
     )
-    return render_operations_compensation_execution_observability_report_json(report)
+    return report
+
+
+def build_operations_compensation_observability_json(
+    session_store: SessionStore,
+    limit: int = 20,
+) -> str:
+    return render_operations_compensation_execution_observability_report_json(
+        build_operations_compensation_observability_report_from_store(session_store, limit)
+    )
+
+
+def build_operations_compensation_slo_report_from_store(
+    session_store: SessionStore,
+    limit: int = 20,
+    policy_json: str | None = None,
+) -> object:
+    settings = IntegrationSettings.from_env()
+    policy = build_operations_compensation_slo_policy(policy_json or settings.compensation_slo_policy_json)
+    observability = build_operations_compensation_observability_report_from_store(session_store, limit)
+    return evaluate_operations_compensation_slo(observability, policy=policy)
+
+
+def build_operations_compensation_slo_json(
+    session_store: SessionStore,
+    limit: int = 20,
+    policy_json: str | None = None,
+) -> str:
+    return render_operations_compensation_slo_report_json(
+        build_operations_compensation_slo_report_from_store(session_store, limit, policy_json)
+    )
 
 
 def execute_operations_compensation_tasks_json(
@@ -3443,6 +3539,7 @@ def make_metrics_handler(
     ]
     | None = None,
     operations_compensation_observability_provider: Callable[[int | None], str] | None = None,
+    operations_compensation_slo_provider: Callable[[int | None], str] | None = None,
     operations_console_action_provider: Callable[[str, str, list[str], str | None, dict[str, object]], str] | None = None,
     dashboard_token: str | None = None,
 ) -> type[BaseHTTPRequestHandler]:
@@ -3647,6 +3744,21 @@ def make_metrics_handler(
                     "application/json; charset=utf-8",
                 )
                 return
+            if path == "/operations/console/compensation-slo":
+                if operations_compensation_slo_provider is None:
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                if not self._authorized():
+                    self.send_response(401)
+                    self.end_headers()
+                    return
+                query = parse_qs(parsed.query)
+                self._send_text(
+                    operations_compensation_slo_provider(_first_query_int(query, "limit")) + "\n",
+                    "application/json; charset=utf-8",
+                )
+                return
             if path == "/operations/console/ui":
                 if operations_console_html_provider is None:
                     self.send_response(404)
@@ -3786,6 +3898,10 @@ def create_operations_dashboard_server(
                 session_store,
                 request_limit or limit,
             ),
+            lambda request_limit: build_operations_compensation_slo_json(
+                session_store,
+                request_limit or limit,
+            ),
             lambda action, actor, roles, department, payload: run_operations_console_action(
                 session_store,
                 action,
@@ -3842,6 +3958,7 @@ def serve_operations_dashboard(
     print(f"Serving operations audit sink deliveries on http://{actual_host}:{actual_port}/operations/console/audit-sink-deliveries")
     print(f"Serving operations compensation tasks on http://{actual_host}:{actual_port}/operations/console/compensation-tasks")
     print(f"Serving operations compensation observability on http://{actual_host}:{actual_port}/operations/console/compensation-observability")
+    print(f"Serving operations compensation SLO on http://{actual_host}:{actual_port}/operations/console/compensation-slo")
     print(f"Serving operations console UI on http://{actual_host}:{actual_port}/operations/console/ui")
     try:
         server.serve_forever()
@@ -3913,6 +4030,8 @@ def _replace_session_db(settings: IntegrationSettings, session_db_path: str) -> 
         recovery_approval_api_url=settings.recovery_approval_api_url,
         recovery_governance_policy_json=settings.recovery_governance_policy_json,
         recovery_governance_policy_api_url=settings.recovery_governance_policy_api_url,
+        compensation_execution_policy_json=settings.compensation_execution_policy_json,
+        compensation_slo_policy_json=settings.compensation_slo_policy_json,
         operations_dashboard_token=settings.operations_dashboard_token,
         alert_rules_json=settings.alert_rules_json,
         trend_alert_rules_json=settings.trend_alert_rules_json,
@@ -4045,6 +4164,19 @@ def _payload_compensation_execution_policy_json(payload: dict[str, object]) -> s
     return _payload_optional_str(payload, "compensation_execution_policy_json")
 
 
+def _payload_compensation_slo_policy_json(payload: dict[str, object]) -> str | None:
+    for key in ("compensation_slo_policy", "slo_policy"):
+        value = payload.get(key)
+        if isinstance(value, dict):
+            return json.dumps(value, ensure_ascii=False, sort_keys=True)
+        if isinstance(value, str) and value.strip():
+            return value
+    return (
+        _payload_optional_str(payload, "compensation_slo_policy_json")
+        or _payload_optional_str(payload, "operations_compensation_slo_policy_json")
+    )
+
+
 def _run_operations_schedule_action(
     session_store: SessionStore,
     payload: dict[str, object],
@@ -4092,6 +4224,7 @@ def _operations_schedule_action_args(payload: dict[str, object], limit: int) -> 
         recovery_approval_sla_policy_json=_payload_optional_str(payload, "recovery_approval_sla_policy_json"),
         recovery_approval_sla_now=_payload_optional_str(payload, "now"),
         operations_compensation_execution_policy_json=_payload_compensation_execution_policy_json(payload),
+        operations_compensation_slo_policy_json=_payload_compensation_slo_policy_json(payload),
         operations_compensation_oncall_endpoint=_payload_optional_str(payload, "oncall_endpoint"),
         operations_compensation_oncall_token=_payload_optional_str(payload, "oncall_token") or _payload_optional_str(payload, "token"),
     )
@@ -4372,6 +4505,32 @@ def _build_operations_schedule_handlers(session_store: SessionStore, args: argpa
             "summary": str(report.get("summary") or ""),
         }
 
+    def _evaluate_compensation_slo(task: object) -> dict[str, object]:
+        params = dict(getattr(task, "params", {}) or {})
+        task_limit = int(params.get("limit") or args.observability_limit)
+        policy_json = (
+            params.get("compensation_slo_policy_json")
+            or params.get("slo_policy_json")
+            or params.get("policy_json")
+            or getattr(args, "operations_compensation_slo_policy_json", None)
+        )
+        if isinstance(policy_json, dict):
+            policy_json = json.dumps(policy_json, ensure_ascii=False, sort_keys=True)
+        report_payload = json.loads(
+            build_operations_compensation_slo_json(
+                session_store,
+                limit=task_limit,
+                policy_json=str(policy_json) if policy_json else None,
+            )
+        )
+        report = report_payload["operations_compensation_slo"]
+        return {
+            "ok": bool(report.get("ok")),
+            "alerts": len(report.get("alerts") or []),
+            "burn_rate": float(report.get("burn_rate") or 0.0),
+            "summary": str(report.get("summary") or ""),
+        }
+
     return {
         "closed_loop_snapshot": lambda task: _save_scheduled_closed_loop_snapshot(
             session_store,
@@ -4396,6 +4555,7 @@ def _build_operations_schedule_handlers(session_store: SessionStore, args: argpa
         },
         "webhook_replay_jobs": _execute_replay_jobs,
         "compensation_task_execution": _execute_compensation_tasks,
+        "compensation_slo_evaluation": _evaluate_compensation_slo,
     }
 
 
