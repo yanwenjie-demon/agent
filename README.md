@@ -651,7 +651,7 @@ $env:PYTHONPATH = "src"
 python -m travel_agent.cli --session-db "D:\tmp\travel-agent.sqlite3" --storage-health
 ```
 
-健康检查会输出当前持久化后端、schema 版本、会话数、worker run 数和后端详情。SQLite 会包含 `PRAGMA integrity_check` 和 journal mode；HTTP 后端会调用 `/health`。。
+健康检查会输出当前持久化后端、schema 版本、会话数、worker run 数和后端详情。SQLite 会包含 `PRAGMA integrity_check` 和 journal mode；HTTP 后端会调用 `/health`。
 
 ## 下一阶段建议
 
