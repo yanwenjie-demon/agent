@@ -22,6 +22,7 @@ from travel_agent.cli import (
     build_operations_closed_loop_dashboard_json,
     build_operations_compensation_observability_json,
     build_operations_compensation_slo_json,
+    build_operations_compensation_remediation_json,
     build_operations_console_overview_json,
     build_operations_console_view_html,
     build_operations_console_view_json,
@@ -74,6 +75,8 @@ from travel_agent.operations import (
     build_operations_compensation_execution_observability_report,
     build_operations_compensation_execution_policy,
     build_operations_compensation_slo_policy,
+    build_operations_compensation_remediation_policy,
+    build_operations_compensation_remediation_report,
     build_operations_compensation_tasks,
     build_operations_closed_loop_dashboard,
     build_operations_dashboard_trend_report,
@@ -222,6 +225,7 @@ from travel_agent.operations import (
     render_operations_compensation_task_board_json,
     render_operations_compensation_execution_observability_report_json,
     render_operations_compensation_slo_report_json,
+    render_operations_compensation_remediation_report_json,
     render_operations_compensation_task_execution_report_json,
     render_recovery_approval_export_result,
     render_recovery_strategy_metrics_prometheus,
@@ -693,20 +697,48 @@ class MultiAgentStructureTest(unittest.TestCase):
             store.record_operations_compensation_task(operations_compensation_task_to_dict(task))
         store.record_operations_scheduler_run(operations_scheduler_run_report_to_dict(scheduler_run))
         store.record_operations_console_action_audit(operations_console_action_audit_to_dict(console_audit))
+        store_slo_policy_json = json.dumps(
+            {
+                "success_rate_target": 0.95,
+                "warning_burn_rate": 1.0,
+                "max_retry_waiting": 0,
+                "max_scheduler_failed": 0,
+                "max_retry_seconds": 300,
+            },
+            ensure_ascii=False,
+        )
         store_slo_payload = json.loads(
             build_operations_compensation_slo_json(
                 store,
                 limit=20,
-                policy_json=json.dumps(
-                    {
-                        "success_rate_target": 0.95,
-                        "warning_burn_rate": 1.0,
-                        "max_retry_waiting": 0,
-                        "max_scheduler_failed": 0,
-                        "max_retry_seconds": 300,
-                    },
+                policy_json=store_slo_policy_json,
+            )
+        )
+        remediation_report = build_operations_compensation_remediation_report(
+            slo_report,
+            [
+                execution.task,
+                external_execution.task,
+                retry_block_report.executions[0].task,
+                dry_run_report.executions[0].task,
+            ],
+            policy=build_operations_compensation_remediation_policy(
+                json.dumps({"max_retry_tasks": 1, "dry_run": True}, ensure_ascii=False)
+            ),
+            generated_at="2026-05-23T04:16:00+00:00",
+        )
+        remediation_payload = json.loads(render_operations_compensation_remediation_report_json(remediation_report))
+        store_remediation_payload = json.loads(
+            build_operations_compensation_remediation_json(
+                store,
+                limit=20,
+                slo_policy_json=store_slo_policy_json,
+                remediation_policy_json=json.dumps({"max_retry_tasks": 1}, ensure_ascii=False),
+                execution_policy_json=json.dumps(
+                    {"dry_run": True, "retry_window_seconds": 0, "max_batch_size": 1},
                     ensure_ascii=False,
                 ),
+                persist=True,
             )
         )
 
@@ -753,6 +785,16 @@ class MultiAgentStructureTest(unittest.TestCase):
         self.assertEqual(ticket_http.calls[0][2], "oncall-token")
         self.assertEqual(ticket_http.calls[0][1]["slo"]["alerts"][0]["route"], "compensation-oncall")
         self.assertIn("operations_compensation_slo", store_slo_payload)
+        self.assertTrue(remediation_report.ok)
+        self.assertGreaterEqual(len(remediation_report.action_items), 1)
+        self.assertEqual(remediation_report.action_items[0].source_type, "compensation_slo")
+        self.assertEqual(len(remediation_report.retry_task_ids), 1)
+        self.assertEqual(remediation_report.runbook_executions[0].title, "补偿 SLO 自动处置")
+        self.assertIn("operations_compensation_remediation", remediation_payload)
+        store_remediation = store_remediation_payload["operations_compensation_remediation"]
+        self.assertGreaterEqual(len(store_remediation["action_items"]), 1)
+        self.assertGreaterEqual(store_remediation["retry_execution"]["attempted"], 1)
+        self.assertEqual(store.list_operations_action_items(1)[0]["source_type"], "compensation_slo")
         self.assertIn("Operations compensation tasks:", render_operations_compensation_tasks([closed]))
         self.assertIn("operations_compensation_tasks", render_operations_compensation_task_board_json(board))
         self.assertIn(
@@ -4282,7 +4324,7 @@ class OperationsReadinessTest(unittest.TestCase):
         action = result["operations_console_action"]
         self.assertTrue(action["ok"])
         self.assertEqual(action["authorization"]["action"], "run_operations_schedule")
-        self.assertEqual(action["scheduler_run"]["due_count"], 7)
+        self.assertEqual(action["scheduler_run"]["due_count"], 8)
         compensation_result = next(
             item
             for item in action["scheduler_run"]["results"]
@@ -4293,9 +4335,15 @@ class OperationsReadinessTest(unittest.TestCase):
             for item in action["scheduler_run"]["results"]
             if item["task_type"] == "compensation_slo_evaluation"
         )
+        remediation_result = next(
+            item
+            for item in action["scheduler_run"]["results"]
+            if item["task_type"] == "compensation_remediation"
+        )
         self.assertEqual(compensation_result["output"]["attempted"], 1)
         self.assertEqual(compensation_result["output"]["skipped"], 1)
         self.assertIn("burn_rate", slo_result["output"])
+        self.assertIn("action_items", remediation_result["output"])
         self.assertEqual(store.list_operations_compensation_tasks(1)[0]["payload"]["execution_gate"]["status"], "DRY_RUN")
         self.assertEqual(store.list_operations_scheduler_runs(1)[0]["run_id"], action["scheduler_run"]["run_id"])
 
@@ -4399,12 +4447,13 @@ class OperationsReadinessTest(unittest.TestCase):
                 "webhook_replay_jobs": _handler,
                 "compensation_task_execution": _handler,
                 "compensation_slo_evaluation": _handler,
+                "compensation_remediation": _handler,
             },
             now="2026-05-20T03:05:00+00:00",
         )
 
-        self.assertEqual(report.due_count, 7)
-        self.assertEqual(report.executed_count, 4)
+        self.assertEqual(report.due_count, 8)
+        self.assertEqual(report.executed_count, 5)
         self.assertEqual(report.failed_count, 0)
         self.assertEqual(
             calls,
@@ -4412,6 +4461,7 @@ class OperationsReadinessTest(unittest.TestCase):
                 "closed_loop_quality",
                 "compensation_task_execution",
                 "compensation_slo_evaluation",
+                "compensation_remediation",
                 "webhook_replay_jobs",
             ],
         )
@@ -4966,6 +5016,37 @@ class OperationsReadinessTest(unittest.TestCase):
             )
             with urlopen(compensation_slo_request, timeout=5) as response:
                 compensation_slo_payload = json.loads(response.read().decode("utf-8"))
+            compensation_remediation_request = Request(
+                f"http://{host}:{port}/operations/console/compensation-remediation?limit=10",
+                headers={"Authorization": "Bearer dash-token"},
+            )
+            with urlopen(compensation_remediation_request, timeout=5) as response:
+                compensation_remediation_payload = json.loads(response.read().decode("utf-8"))
+            remediate_compensation_request = Request(
+                f"http://{host}:{port}/operations/console/actions",
+                data=json.dumps(
+                    {
+                        "action": "remediate_compensation_slo",
+                        "limit": 10,
+                        "compensation_slo_policy": {
+                            "min_attempts": 0,
+                            "warning_burn_rate": 0.0,
+                            "max_failed": 0,
+                        },
+                        "compensation_remediation_policy": {"dry_run": True, "max_retry_tasks": 1},
+                    },
+                    ensure_ascii=False,
+                ).encode("utf-8"),
+                headers={
+                    "Authorization": "Bearer dash-token",
+                    "Content-Type": "application/json",
+                    "X-Operations-Actor": "ops-user",
+                    "X-Operations-Roles": "ops",
+                },
+                method="POST",
+            )
+            with urlopen(remediate_compensation_request, timeout=5) as response:
+                remediate_compensation_payload = json.loads(response.read().decode("utf-8"))
         finally:
             server.shutdown()
             server.server_close()
@@ -5077,12 +5158,20 @@ class OperationsReadinessTest(unittest.TestCase):
         self.assertIn("burn_rate", compensation_slo)
         self.assertIn("alerts", compensation_slo)
         self.assertIn("observability", compensation_slo)
+        compensation_remediation = compensation_remediation_payload["operations_compensation_remediation"]
+        self.assertIn("runbook_executions", compensation_remediation)
+        remediate_compensation = remediate_compensation_payload["operations_console_action"]
+        self.assertTrue(remediate_compensation["ok"])
+        self.assertEqual(remediate_compensation["authorization"]["action"], "execute_compensation_task")
+        self.assertGreaterEqual(len(remediate_compensation["compensation_remediation"]["runbook_executions"]), 1)
+        self.assertTrue(remediate_compensation["action_audit"]["recorded"])
         self.assertIn("oncall_webhook_ops_console", build_oncall_webhook_ops_console_json(store))
         self.assertIn("oncall_webhook_replay_jobs", build_oncall_webhook_replay_jobs_json(store))
         self.assertIn("operations_console_overview", build_operations_console_overview_json(store))
         self.assertIn("operations_console_view", build_operations_console_view_json(store, actor="ops-user", roles=["ops"]))
         self.assertIn("operations_compensation_execution_observability", build_operations_compensation_observability_json(store))
         self.assertIn("operations_compensation_slo", build_operations_compensation_slo_json(store))
+        self.assertIn("operations_compensation_remediation", build_operations_compensation_remediation_json(store))
         self.assertIn("Operations Console", build_operations_console_view_html(store, actor="ops-user", roles=["ops"]))
 
     def test_closed_loop_dashboard_supports_cursor_pagination(self) -> None:

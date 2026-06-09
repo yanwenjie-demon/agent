@@ -6,7 +6,7 @@ from datetime import date, datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Thread
-from typing import Callable
+from typing import Any, Callable
 from urllib.parse import parse_qs, urlsplit
 
 from .agent import build_default_agent
@@ -48,6 +48,8 @@ from .operations import (
     build_operations_console_action_audit_event,
     build_operations_compensation_execution_observability_report,
     build_operations_compensation_slo_policy,
+    build_operations_compensation_remediation_policy,
+    build_operations_compensation_remediation_report,
     build_operations_compensation_tasks,
     build_operations_compensation_execution_policy,
     build_operations_governance_policy_change,
@@ -156,6 +158,7 @@ from .operations import (
     render_operations_audit_sink_replay_report_json,
     render_operations_compensation_execution_observability_report_json,
     render_operations_compensation_slo_report_json,
+    render_operations_compensation_remediation_report_json,
     render_operations_compensation_task_board_json,
     render_operations_compensation_task_execution_report_json,
     render_operations_scheduled_tasks,
@@ -627,6 +630,16 @@ def parse_args() -> argparse.Namespace:
         "--operations-compensation-slo-policy-json",
         default=None,
         help="Compensation SLO policy JSON. Defaults to TRAVEL_COMPENSATION_SLO_POLICY_JSON.",
+    )
+    parser.add_argument(
+        "--operations-compensation-remediation",
+        action="store_true",
+        help="Create or preview compensation SLO remediation action items, runbook executions, and controlled retries.",
+    )
+    parser.add_argument(
+        "--operations-compensation-remediation-policy-json",
+        default=None,
+        help="Compensation remediation policy JSON. Defaults to TRAVEL_COMPENSATION_REMEDIATION_POLICY_JSON.",
     )
     parser.add_argument(
         "--export-operations-compensation-slo-alerts",
@@ -1448,6 +1461,43 @@ def main() -> None:
             print(render_oncall_ticket_result(ticket_result))
             if not ticket_result.ok:
                 raise SystemExit(1)
+        return
+    if args.operations_compensation_remediation:
+        _require_persistent_session_store(settings, "--operations-compensation-remediation")
+        authorization = authorize_operations_action(
+            "execute_compensation_task",
+            user_id=args.operations_actor,
+            permission_policy=PermissionPolicy.from_env(),
+            department=args.operations_actor_department,
+            roles=args.operations_actor_role,
+            audit_sink=build_audit_sink(settings),
+            payload={"source": "cli", "limit": args.observability_limit},
+        )
+        print(render_operations_action_authorization(authorization))
+        if not authorization.allowed:
+            raise SystemExit(1)
+        report_json = build_operations_compensation_remediation_json(
+            agent.session_store,
+            limit=args.observability_limit,
+            slo_policy_json=args.operations_compensation_slo_policy_json or settings.compensation_slo_policy_json,
+            remediation_policy_json=(
+                args.operations_compensation_remediation_policy_json
+                or settings.compensation_remediation_policy_json
+            ),
+            execution_policy_json=(
+                args.operations_compensation_execution_policy_json
+                or settings.compensation_execution_policy_json
+            ),
+            oncall_endpoint=args.operations_compensation_oncall_endpoint or settings.oncall_api_url,
+            oncall_token=args.operations_compensation_oncall_token or settings.oncall_api_token,
+            actor=args.operations_actor,
+            persist=True,
+        )
+        print(report_json)
+        report = json.loads(report_json)["operations_compensation_remediation"]
+        retry_report = report.get("retry_execution") or {}
+        if not bool(report.get("ok", False)) or int(retry_report.get("failed") or 0) > 0:
+            raise SystemExit(1)
         return
     if args.execute_oncall_webhook_replay_jobs:
         _require_persistent_session_store(settings, "--execute-oncall-webhook-replay-jobs")
@@ -3080,32 +3130,22 @@ def build_operations_compensation_slo_json(
     )
 
 
-def execute_operations_compensation_tasks_json(
+def _operations_compensation_board_tasks(
     session_store: SessionStore,
-    limit: int = 20,
-    oncall_endpoint: str | None = None,
-    oncall_token: str | None = None,
-    policy_json: str | None = None,
-    actor: str = "operations_console",
-) -> str:
-    settings = IntegrationSettings.from_env()
-    oncall_endpoint = oncall_endpoint or settings.oncall_api_url
-    oncall_token = oncall_token or settings.oncall_api_token
-    policy = build_operations_compensation_execution_policy(policy_json or settings.compensation_execution_policy_json)
+    limit: int,
+) -> list[object]:
     board_payload = json.loads(build_operations_compensation_tasks_json(session_store, max(100, limit * 2)))
-    tasks = [
+    return [
         operations_compensation_task_from_dict(item)
         for item in board_payload["operations_compensation_tasks"]["tasks"]
     ]
-    report = execute_operations_compensation_tasks(
-        tasks,
-        limit=limit,
-        oncall_endpoint=oncall_endpoint,
-        oncall_token=oncall_token,
-        actor=actor,
-        policy=policy,
-    )
-    for execution in report.executions:
+
+
+def _persist_operations_compensation_execution_report(
+    session_store: SessionStore,
+    report: object,
+) -> None:
+    for execution in getattr(report, "executions", []):
         session_store.record_operations_compensation_task(operations_compensation_task_to_dict(execution.task))
         if execution.ticket_result is not None and execution.ticket_result.ticket_id:
             session_store.record_oncall_ticket_status(
@@ -3119,6 +3159,114 @@ def execute_operations_compensation_tasks_json(
                     )
                 )
             )
+
+
+def build_operations_compensation_remediation_report_from_store(
+    session_store: SessionStore,
+    limit: int = 20,
+    slo_policy_json: str | None = None,
+    remediation_policy_json: str | None = None,
+    execution_policy_json: str | None = None,
+    oncall_endpoint: str | None = None,
+    oncall_token: str | None = None,
+    actor: str = "operations_remediation",
+    persist: bool = False,
+) -> object:
+    settings = IntegrationSettings.from_env()
+    remediation_policy = build_operations_compensation_remediation_policy(
+        remediation_policy_json or settings.compensation_remediation_policy_json
+    )
+    slo_report = build_operations_compensation_slo_report_from_store(
+        session_store,
+        limit=limit,
+        policy_json=slo_policy_json,
+    )
+    tasks = _operations_compensation_board_tasks(session_store, limit)
+    report = build_operations_compensation_remediation_report(
+        slo_report,
+        tasks,
+        policy=remediation_policy,
+    )
+    if not persist or not remediation_policy.enabled or remediation_policy.dry_run:
+        return report
+    if remediation_policy.create_action_items:
+        for item in report.action_items:
+            session_store.record_operations_action_item(operations_action_item_to_dict(item))
+    retry_report = None
+    if remediation_policy.controlled_retry_enabled and report.retry_task_ids:
+        selected_ids = set(report.retry_task_ids)
+        retry_tasks = [task for task in report.retry_candidates if task.task_id in selected_ids]
+        execution_policy = build_operations_compensation_execution_policy(
+            execution_policy_json or settings.compensation_execution_policy_json
+        )
+        retry_report = execute_operations_compensation_tasks(
+            retry_tasks,
+            limit=len(report.retry_task_ids),
+            oncall_endpoint=oncall_endpoint or settings.oncall_api_url,
+            oncall_token=oncall_token or settings.oncall_api_token,
+            actor=actor,
+            policy=execution_policy,
+        )
+        _persist_operations_compensation_execution_report(session_store, retry_report)
+    if retry_report is None:
+        return report
+    return build_operations_compensation_remediation_report(
+        slo_report,
+        tasks,
+        retry_execution_report=retry_report,
+        policy=remediation_policy,
+        generated_at=report.generated_at,
+    )
+
+
+def build_operations_compensation_remediation_json(
+    session_store: SessionStore,
+    limit: int = 20,
+    slo_policy_json: str | None = None,
+    remediation_policy_json: str | None = None,
+    execution_policy_json: str | None = None,
+    oncall_endpoint: str | None = None,
+    oncall_token: str | None = None,
+    actor: str = "operations_remediation",
+    persist: bool = False,
+) -> str:
+    return render_operations_compensation_remediation_report_json(
+        build_operations_compensation_remediation_report_from_store(
+            session_store,
+            limit=limit,
+            slo_policy_json=slo_policy_json,
+            remediation_policy_json=remediation_policy_json,
+            execution_policy_json=execution_policy_json,
+            oncall_endpoint=oncall_endpoint,
+            oncall_token=oncall_token,
+            actor=actor,
+            persist=persist,
+        )
+    )
+
+
+def execute_operations_compensation_tasks_json(
+    session_store: SessionStore,
+    limit: int = 20,
+    oncall_endpoint: str | None = None,
+    oncall_token: str | None = None,
+    policy_json: str | None = None,
+    actor: str = "operations_console",
+) -> str:
+    settings = IntegrationSettings.from_env()
+    oncall_endpoint = oncall_endpoint or settings.oncall_api_url
+    oncall_token = oncall_token or settings.oncall_api_token
+    policy = build_operations_compensation_execution_policy(policy_json or settings.compensation_execution_policy_json)
+    tasks = _operations_compensation_board_tasks(session_store, limit)
+    report = execute_operations_compensation_tasks(
+        tasks,
+        limit=limit,
+        oncall_endpoint=oncall_endpoint,
+        oncall_token=oncall_token,
+        actor=actor,
+        policy=policy,
+    )
+    _persist_operations_compensation_execution_report(session_store, report)
     return render_operations_compensation_task_execution_report_json(report)
 
 
@@ -3230,6 +3378,7 @@ def run_operations_console_action(
         "retry_audit_sink_deliveries": "retry_audit_sink_delivery",
         "close_compensation_task": "manage_compensation_task",
         "execute_compensation_tasks": "execute_compensation_task",
+        "remediate_compensation_slo": "execute_compensation_task",
     }.get(action)
     if permission_action is None:
         return _finalize_operations_console_action(
@@ -3422,6 +3571,29 @@ def run_operations_console_action(
                     "authorization": operations_action_authorization_to_dict(authorization),
                     "task": operations_compensation_task_to_dict(closed),
                 }
+    elif action == "remediate_compensation_slo":
+        endpoint = payload.get("endpoint") or payload.get("oncall_endpoint")
+        report_payload = json.loads(
+            build_operations_compensation_remediation_json(
+                session_store,
+                limit=action_limit,
+                slo_policy_json=_payload_compensation_slo_policy_json(payload),
+                remediation_policy_json=_payload_compensation_remediation_policy_json(payload),
+                execution_policy_json=_payload_compensation_execution_policy_json(payload),
+                oncall_endpoint=str(endpoint) if endpoint is not None else None,
+                oncall_token=str(payload["token"]) if payload.get("token") is not None else None,
+                actor=actor,
+                persist=True,
+            )
+        )
+        report = report_payload["operations_compensation_remediation"]
+        retry_report = report.get("retry_execution") or {}
+        body = {
+            "ok": bool(report.get("ok")) and int(retry_report.get("failed") or 0) == 0,
+            "action": action,
+            "authorization": operations_action_authorization_to_dict(authorization),
+            "compensation_remediation": report,
+        }
     else:
         endpoint = payload.get("endpoint") or payload.get("oncall_endpoint")
         execution_payload = json.loads(
@@ -3540,6 +3712,7 @@ def make_metrics_handler(
     | None = None,
     operations_compensation_observability_provider: Callable[[int | None], str] | None = None,
     operations_compensation_slo_provider: Callable[[int | None], str] | None = None,
+    operations_compensation_remediation_provider: Callable[[int | None], str] | None = None,
     operations_console_action_provider: Callable[[str, str, list[str], str | None, dict[str, object]], str] | None = None,
     dashboard_token: str | None = None,
 ) -> type[BaseHTTPRequestHandler]:
@@ -3759,6 +3932,21 @@ def make_metrics_handler(
                     "application/json; charset=utf-8",
                 )
                 return
+            if path == "/operations/console/compensation-remediation":
+                if operations_compensation_remediation_provider is None:
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                if not self._authorized():
+                    self.send_response(401)
+                    self.end_headers()
+                    return
+                query = parse_qs(parsed.query)
+                self._send_text(
+                    operations_compensation_remediation_provider(_first_query_int(query, "limit")) + "\n",
+                    "application/json; charset=utf-8",
+                )
+                return
             if path == "/operations/console/ui":
                 if operations_console_html_provider is None:
                     self.send_response(404)
@@ -3902,6 +4090,12 @@ def create_operations_dashboard_server(
                 session_store,
                 request_limit or limit,
             ),
+            lambda request_limit: build_operations_compensation_remediation_json(
+                session_store,
+                request_limit or limit,
+                remediation_policy_json=json.dumps({"dry_run": True}, ensure_ascii=False),
+                persist=False,
+            ),
             lambda action, actor, roles, department, payload: run_operations_console_action(
                 session_store,
                 action,
@@ -3959,6 +4153,7 @@ def serve_operations_dashboard(
     print(f"Serving operations compensation tasks on http://{actual_host}:{actual_port}/operations/console/compensation-tasks")
     print(f"Serving operations compensation observability on http://{actual_host}:{actual_port}/operations/console/compensation-observability")
     print(f"Serving operations compensation SLO on http://{actual_host}:{actual_port}/operations/console/compensation-slo")
+    print(f"Serving operations compensation remediation on http://{actual_host}:{actual_port}/operations/console/compensation-remediation")
     print(f"Serving operations console UI on http://{actual_host}:{actual_port}/operations/console/ui")
     try:
         server.serve_forever()
@@ -4032,6 +4227,7 @@ def _replace_session_db(settings: IntegrationSettings, session_db_path: str) -> 
         recovery_governance_policy_api_url=settings.recovery_governance_policy_api_url,
         compensation_execution_policy_json=settings.compensation_execution_policy_json,
         compensation_slo_policy_json=settings.compensation_slo_policy_json,
+        compensation_remediation_policy_json=settings.compensation_remediation_policy_json,
         operations_dashboard_token=settings.operations_dashboard_token,
         alert_rules_json=settings.alert_rules_json,
         trend_alert_rules_json=settings.trend_alert_rules_json,
@@ -4177,6 +4373,19 @@ def _payload_compensation_slo_policy_json(payload: dict[str, object]) -> str | N
     )
 
 
+def _payload_compensation_remediation_policy_json(payload: dict[str, object]) -> str | None:
+    for key in ("compensation_remediation_policy", "remediation_policy"):
+        value = payload.get(key)
+        if isinstance(value, dict):
+            return json.dumps(value, ensure_ascii=False, sort_keys=True)
+        if isinstance(value, str) and value.strip():
+            return value
+    return (
+        _payload_optional_str(payload, "compensation_remediation_policy_json")
+        or _payload_optional_str(payload, "operations_compensation_remediation_policy_json")
+    )
+
+
 def _run_operations_schedule_action(
     session_store: SessionStore,
     payload: dict[str, object],
@@ -4225,6 +4434,7 @@ def _operations_schedule_action_args(payload: dict[str, object], limit: int) -> 
         recovery_approval_sla_now=_payload_optional_str(payload, "now"),
         operations_compensation_execution_policy_json=_payload_compensation_execution_policy_json(payload),
         operations_compensation_slo_policy_json=_payload_compensation_slo_policy_json(payload),
+        operations_compensation_remediation_policy_json=_payload_compensation_remediation_policy_json(payload),
         operations_compensation_oncall_endpoint=_payload_optional_str(payload, "oncall_endpoint"),
         operations_compensation_oncall_token=_payload_optional_str(payload, "oncall_token") or _payload_optional_str(payload, "token"),
     )
@@ -4531,6 +4741,56 @@ def _build_operations_schedule_handlers(session_store: SessionStore, args: argpa
             "summary": str(report.get("summary") or ""),
         }
 
+    def _remediate_compensation_slo(task: object) -> dict[str, object]:
+        params = dict(getattr(task, "params", {}) or {})
+        task_limit = int(params.get("limit") or args.observability_limit)
+        slo_policy_json = (
+            params.get("compensation_slo_policy_json")
+            or params.get("slo_policy_json")
+            or getattr(args, "operations_compensation_slo_policy_json", None)
+        )
+        remediation_policy_json = (
+            params.get("compensation_remediation_policy_json")
+            or params.get("remediation_policy_json")
+            or params.get("policy_json")
+            or getattr(args, "operations_compensation_remediation_policy_json", None)
+        )
+        execution_policy_json = (
+            params.get("compensation_execution_policy_json")
+            or params.get("execution_policy_json")
+            or getattr(args, "operations_compensation_execution_policy_json", None)
+        )
+        if isinstance(slo_policy_json, dict):
+            slo_policy_json = json.dumps(slo_policy_json, ensure_ascii=False, sort_keys=True)
+        if isinstance(remediation_policy_json, dict):
+            remediation_policy_json = json.dumps(remediation_policy_json, ensure_ascii=False, sort_keys=True)
+        if isinstance(execution_policy_json, dict):
+            execution_policy_json = json.dumps(execution_policy_json, ensure_ascii=False, sort_keys=True)
+        report_payload = json.loads(
+            build_operations_compensation_remediation_json(
+                session_store,
+                limit=task_limit,
+                slo_policy_json=str(slo_policy_json) if slo_policy_json else None,
+                remediation_policy_json=str(remediation_policy_json) if remediation_policy_json else None,
+                execution_policy_json=str(execution_policy_json) if execution_policy_json else None,
+                oncall_endpoint=str(params.get("oncall_endpoint") or getattr(args, "operations_compensation_oncall_endpoint", None) or "") or None,
+                oncall_token=str(params.get("oncall_token") or getattr(args, "operations_compensation_oncall_token", None) or "") or None,
+                actor="operations_scheduler",
+                persist=True,
+            )
+        )
+        report = report_payload["operations_compensation_remediation"]
+        retry_report = report.get("retry_execution") or {}
+        return {
+            "ok": bool(report.get("ok")),
+            "alerts": int(report.get("alert_count") or 0),
+            "action_items": len(report.get("action_items") or []),
+            "retry_selected": len(report.get("retry_task_ids") or []),
+            "retry_attempted": int(retry_report.get("attempted") or 0),
+            "runbook_executions": len(report.get("runbook_executions") or []),
+            "summary": str(report.get("summary") or ""),
+        }
+
     return {
         "closed_loop_snapshot": lambda task: _save_scheduled_closed_loop_snapshot(
             session_store,
@@ -4556,6 +4816,7 @@ def _build_operations_schedule_handlers(session_store: SessionStore, args: argpa
         "webhook_replay_jobs": _execute_replay_jobs,
         "compensation_task_execution": _execute_compensation_tasks,
         "compensation_slo_evaluation": _evaluate_compensation_slo,
+        "compensation_remediation": _remediate_compensation_slo,
     }
 
 

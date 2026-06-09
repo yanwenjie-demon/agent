@@ -2391,9 +2391,10 @@ def build_operations_compensation_remediation_report(
         if policy.enabled and alerts
         else []
     )
-    ok = slo_report.ok or (not alerts and not retry_candidates)
+    retry_failed = retry_execution_report is not None and retry_execution_report.failed > 0
+    ok = (not alerts or policy.enabled) and not retry_failed
     summary = (
-        f"compensation_remediation ok={ok} alerts={len(alerts)} "
+        f"compensation_remediation ok={ok} slo_ok={slo_report.ok} alerts={len(alerts)} "
         f"action_items={len(action_items)} retry_candidates={len(retry_candidates)} "
         f"retry_selected={len(retry_task_ids)} runbooks={len(runbook_executions)} dry_run={policy.dry_run}"
     )
@@ -2432,6 +2433,8 @@ def operations_compensation_remediation_report_to_dict(
     return {
         "generated_at": report.generated_at,
         "ok": report.ok,
+        "slo_ok": report.slo_report.ok,
+        "alert_count": len(report.slo_report.alerts),
         "policy": operations_compensation_remediation_policy_to_dict(report.policy),
         "slo": operations_compensation_slo_report_to_dict(report.slo_report),
         "action_items": [operations_action_item_to_dict(item) for item in report.action_items],
@@ -5711,6 +5714,14 @@ def build_operations_scheduled_tasks(
         OperationsScheduledTask(
             task_id="OPS-SCHED-COMPENSATION-SLO",
             task_type="compensation_slo_evaluation",
+            cadence="every_15_minutes",
+            next_run_at=now,
+            enabled=True,
+            params={"limit": 20},
+        ),
+        OperationsScheduledTask(
+            task_id="OPS-SCHED-COMPENSATION-REMEDIATION",
+            task_type="compensation_remediation",
             cadence="every_15_minutes",
             next_run_at=now,
             enabled=True,
